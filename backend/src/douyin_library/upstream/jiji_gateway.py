@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import inspect
+import json
 import logging
 import re
 from collections.abc import AsyncIterator, Awaitable, Callable
@@ -47,11 +48,13 @@ class JijiGateway:
         from control import RateLimiter
         from core.api_client import DouyinAPIClient
 
-        return cls(
+        gateway = cls(
             DouyinAPIClient(_parse_cookie_header(cookie_header)),
             upstream_version=version("douyin-downloader"),
             rate_limiter=RateLimiter(max_per_second=1.5),
         )
+        gateway.download_handler = gateway._download_with_pinned_jiji
+        return gateway
 
     def assert_compatible(self) -> None:
         if self.upstream_version and self.upstream_version != EXPECTED_UPSTREAM_VERSION:
@@ -234,6 +237,108 @@ class JijiGateway:
                 error_detail="The jiji downloader adapter is not configured",
             )
         return await self.download_handler(work, target)
+
+    async def _download_with_pinned_jiji(
+        self, work: DiscoveredWork, target: Path
+    ) -> DownloadResult:
+        """Download one video through the pinned jiji implementation.
+
+        The gateway owns the application-facing contract while jiji supplies
+        the signed API request, playable URL ordering, CDN fallback, and
+        cookie-aware HTTP session. Raw source videos are kept at the caller's
+        target path; downstream media processing can then verify and remove
+        them after extracting audio.
+        """
+        try:
+            from auth import CookieManager
+            from config import ConfigLoader
+            from core.metadata import extract_video_cover_urls
+            from core.video_downloader import VideoDownloader
+            from storage import FileManager
+
+            self.assert_compatible()
+            detail = await self.api_client.get_video_detail(work.aweme_id)
+            if not isinstance(detail, dict):
+                return DownloadResult(
+                    status="failed",
+                    error_code="video_detail_unavailable",
+                    error_detail=f"No detail returned for aweme {work.aweme_id}",
+                )
+
+            video_path = (
+                target
+                if target.suffix.lower() == ".mp4"
+                else target / f"{work.aweme_id}.mp4"
+            )
+            video_path.parent.mkdir(parents=True, exist_ok=True)
+            config = ConfigLoader()
+            config.update(
+                path=str(video_path.parent),
+                video_quality="highest",
+                video=True,
+                cover=True,
+                json=True,
+                music=False,
+                avatar=False,
+                folderstyle=False,
+            )
+            file_manager = FileManager(str(video_path.parent))
+            downloader = VideoDownloader(
+                config,
+                self.api_client,
+                file_manager,
+                CookieManager(),
+                rate_limiter=self.rate_limiter,
+            )
+            candidates = downloader._build_video_url_candidates(detail)
+            if not candidates:
+                return DownloadResult(
+                    status="failed",
+                    error_code="video_url_unavailable",
+                    error_detail=f"No playable URL for aweme {work.aweme_id}",
+                )
+            session = await self.api_client.get_session()
+            if not await downloader._download_video_with_fallback(candidates, video_path, session):
+                return DownloadResult(
+                    status="failed",
+                    error_code="video_download_failed",
+                    error_detail=f"All playable URLs failed for aweme {work.aweme_id}",
+                )
+
+            cover_path: Path | None = None
+            cover_urls = extract_video_cover_urls(detail)
+            if cover_urls:
+                cover_path = video_path.with_name(f"{video_path.stem}_cover.jpg")
+                saved = await downloader._download_first_available(
+                    cover_urls,
+                    cover_path,
+                    session,
+                    headers=downloader._download_headers(),
+                    optional=True,
+                    return_saved_path=True,
+                )
+                if isinstance(saved, Path):
+                    cover_path = saved
+                elif not saved:
+                    cover_path = None
+
+            metadata_path = video_path.with_name(f"{video_path.stem}_data.json")
+            metadata_path.write_text(
+                json.dumps(detail, ensure_ascii=False, indent=2), encoding="utf-8"
+            )
+            return DownloadResult(
+                status="succeeded",
+                video_path=video_path,
+                cover_path=cover_path,
+                metadata_path=metadata_path,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("jiji video download failed for %s", work.aweme_id)
+            return DownloadResult(
+                status="failed",
+                error_code="jiji_download_exception",
+                error_detail=str(exc),
+            )
 
     async def validate_account(self) -> dict[str, object]:
         self.assert_compatible()
