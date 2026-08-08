@@ -1,0 +1,25 @@
+{
+  "status_code": 0,
+  "has_more": true,
+  "max_cursor": 20,
+  "aweme_list": [
+    {
+      "aweme_id": "7310000000000000001",
+      "desc": "用一个例子理解认知负荷",
+      "create_time": 1700000000,
+      "share_url": "https://www.douyin.com/video/7310000000000000001",
+      "author": {
+        "sec_uid": "MS4wLjABAAAAtestcreator",
+        "nickname": "知识主播",
+        "unique_id": "knowledge_host",
+        "avatar_thumb": {"url_list": ["https://example.test/avatar.jpg"]}
+      },
+      "video": {
+        "duration": 42000,
+        "cover": {"url_list": ["https://example.test/cover.jpg"]},
+        "play_addr": {"url_list": ["https://example.test/video.mp4"]}
+      },
+      "statistics": {"digg_count": 12, "comment_count": 3, "share_count": 2}
+    }
+  ]
+}

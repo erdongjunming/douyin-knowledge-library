@@ -1,0 +1,24 @@
+{
+  "status_code": 0,
+  "has_more": false,
+  "max_cursor": 0,
+  "aweme_list": [
+    {
+      "aweme_id": "7370000000000000000",
+      "desc": "收藏的心理学图集",
+      "create_time": 1700000100,
+      "author": {
+        "sec_uid": "MS4wLjABAAAAtestfavorite",
+        "nickname": "心理学讲解",
+        "unique_id": "psychology_host",
+        "avatar_thumb": {"url_list": ["https://example.test/favorite-avatar.jpg"]}
+      },
+      "images": [
+        {"display_image": {"url_list": ["https://example.test/page-1.jpg"]}},
+        {"display_image": {"url_list": ["https://example.test/page-2.jpg"]}}
+      ],
+      "statistics": {"digg_count": 8, "comment_count": 1, "share_count": 0}
+    },
+    {"desc": "缺少作品 ID 的异常项目"}
+  ]
+}
