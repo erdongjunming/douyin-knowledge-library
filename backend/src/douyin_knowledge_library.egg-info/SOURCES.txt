@@ -1,7 +1,0 @@
-pyproject.toml
-src/douyin_knowledge_library.egg-info/PKG-INFO
-src/douyin_knowledge_library.egg-info/SOURCES.txt
-src/douyin_knowledge_library.egg-info/dependency_links.txt
-src/douyin_knowledge_library.egg-info/requires.txt
-src/douyin_knowledge_library.egg-info/top_level.txt
-src/douyin_library/__init__.py
