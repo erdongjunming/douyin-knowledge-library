@@ -39,6 +39,7 @@ class DiscoveryPage:
     cursor: str
     has_more: bool
     source_external_id: str
+    source_name: str | None = None
     raw_summary: dict[str, Any] = field(default_factory=dict)
 
 

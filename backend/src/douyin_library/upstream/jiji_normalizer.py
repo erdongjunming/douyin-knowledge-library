@@ -142,7 +142,12 @@ def normalize_work(payload: Any) -> DiscoveredWork | None:
     )
 
 
-def normalize_page(payload: Any, *, source_external_id: str) -> DiscoveryPage:
+def normalize_page(
+    payload: Any,
+    *,
+    source_external_id: str,
+    source_name: str | None = None,
+) -> DiscoveryPage:
     response = _as_dict(payload)
     raw_items = response.get("items")
     if not isinstance(raw_items, list):
@@ -159,6 +164,7 @@ def normalize_page(payload: Any, *, source_external_id: str) -> DiscoveryPage:
         cursor=str(cursor_value),
         has_more=bool(response.get("has_more")),
         source_external_id=source_external_id,
+        source_name=source_name,
         raw_summary={
             "status_code": response.get("status_code"),
             "item_count": len(raw_items),
