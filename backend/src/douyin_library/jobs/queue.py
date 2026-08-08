@@ -1,0 +1,138 @@
+from __future__ import annotations
+
+from datetime import UTC, datetime, timedelta
+
+from sqlalchemy import select
+from sqlalchemy.orm import Session
+
+from douyin_library.models import Job
+
+
+class JobTransitionError(ValueError):
+    pass
+
+
+class DuplicateActiveJobError(ValueError):
+    pass
+
+
+TERMINAL_STATUSES = {"succeeded", "failed", "cancelled"}
+ALLOWED_TRANSITIONS = {
+    "pending": {"running", "cancelled"},
+    "running": {"pending", "succeeded", "failed", "cancelled"},
+}
+RETRY_LIMITS = {
+    "download_work": 3,
+    "transcribe_work": 2,
+    "analyze_work": 2,
+}
+RETRY_DELAYS = {
+    "download_work": (60, 300, 1800),
+    "transcribe_work": (60, 300),
+    "analyze_work": (60, 300),
+}
+
+
+class JobQueue:
+    def __init__(self, session: Session) -> None:
+        self.session = session
+
+    def create(
+        self,
+        *,
+        kind: str,
+        work_id: int | None = None,
+        sync_run_id: int | None = None,
+        status: str = "pending",
+        attempts: int = 0,
+    ) -> Job:
+        if status not in {"pending", "running"}:
+            raise JobTransitionError(f"cannot create job in status {status}")
+        if work_id is not None:
+            active = self.session.scalar(
+                select(Job).where(
+                    Job.work_id == work_id,
+                    Job.kind == kind,
+                    Job.status.not_in(TERMINAL_STATUSES),
+                )
+            )
+            if active is not None:
+                raise DuplicateActiveJobError("active_job_already_exists")
+        job = Job(
+            kind=kind,
+            work_id=work_id,
+            sync_run_id=sync_run_id,
+            status=status,
+            attempts=attempts,
+        )
+        self.session.add(job)
+        self.session.commit()
+        self.session.refresh(job)
+        return job
+
+    def get(self, job_id: int) -> Job:
+        job = self.session.get(Job, job_id)
+        if job is None:
+            raise KeyError(f"job_not_found:{job_id}")
+        return job
+
+    def claim_next(self) -> Job | None:
+        now = datetime.now(UTC)
+        job = self.session.scalar(
+            select(Job)
+            .where(
+                Job.status == "pending",
+                (Job.next_retry_at.is_(None)) | (Job.next_retry_at <= now),
+            )
+            .order_by(Job.created_at, Job.id)
+        )
+        if job is None:
+            return None
+        job.status = "running"
+        job.started_at = now
+        self.session.commit()
+        self.session.refresh(job)
+        return job
+
+    def transition(self, job_id: int, status: str) -> Job:
+        job = self.get(job_id)
+        allowed = ALLOWED_TRANSITIONS.get(job.status, set())
+        if status not in allowed:
+            raise JobTransitionError(f"invalid_transition:{job.status}->{status}")
+        job.status = status
+        if status in TERMINAL_STATUSES:
+            job.finished_at = datetime.now(UTC)
+        self.session.commit()
+        self.session.refresh(job)
+        return job
+
+    def fail(self, job_id: int, *, error_code: str, error_detail: str) -> Job:
+        job = self.get(job_id)
+        if job.status != "running":
+            raise JobTransitionError(f"cannot_fail:{job.status}")
+        job.error_code = error_code
+        job.error_detail = error_detail[:500]
+        job.attempts += 1
+        limit = RETRY_LIMITS.get(job.kind, 1)
+        if job.attempts < limit:
+            delay_values = RETRY_DELAYS.get(job.kind, (60,))
+            delay = delay_values[min(job.attempts - 1, len(delay_values) - 1)]
+            job.status = "pending"
+            job.next_retry_at = datetime.now(UTC) + timedelta(seconds=delay)
+        else:
+            job.status = "failed"
+            job.finished_at = datetime.now(UTC)
+        self.session.commit()
+        self.session.refresh(job)
+        return job
+
+    def recover_stale_jobs(self, *, stale_after: timedelta = timedelta(minutes=15)) -> int:
+        cutoff = datetime.now(UTC) - stale_after
+        stale_jobs = self.session.scalars(
+            select(Job).where(Job.status == "running", Job.started_at < cutoff)
+        ).all()
+        for job in stale_jobs:
+            job.status = "pending"
+            job.started_at = None
+        self.session.commit()
+        return len(stale_jobs)
