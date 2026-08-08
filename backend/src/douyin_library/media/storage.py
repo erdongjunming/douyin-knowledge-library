@@ -95,7 +95,9 @@ class MediaPipeline:
             "loudness": loudness,
             "verified_at": verified_at.isoformat() if verified_at else None,
         }
-        metadata_path.write_text(json.dumps(metadata, ensure_ascii=False, indent=2), encoding="utf-8")
+        metadata_path.write_text(
+            json.dumps(metadata, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
 
         if can_delete_source_video(
             source_duration=source_duration,

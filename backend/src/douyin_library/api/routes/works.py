@@ -1,16 +1,17 @@
 from __future__ import annotations
 
+import json
 from collections.abc import AsyncIterator, Iterator
 from typing import Annotated, Any
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy import create_engine, select
 from sqlalchemy.orm import Session
 
 from douyin_library.config import Settings
 from douyin_library.media.service import WorkMediaService
 from douyin_library.media.storage import StorageLayout
-from douyin_library.models import Work
+from douyin_library.models import Analysis, Asset, Creator, Work
 from douyin_library.security.cookie_store import CookieStore
 from douyin_library.upstream.jiji_gateway import JijiGateway
 
@@ -67,4 +68,66 @@ async def process_work(
         "audio": str(result.audio.path),
         "cover": str(result.cover),
         "metadata": str(result.metadata),
+    }
+
+
+@router.get("")
+def list_works(
+    session: Annotated[Session, Depends(get_work_session)],
+    limit: int = Query(default=100, ge=1, le=500),
+    query: str | None = Query(default=None),
+) -> dict[str, Any]:
+    statement = (
+        select(Work, Creator.nickname)
+        .outerjoin(Creator, Work.creator_id == Creator.id)
+        .order_by(Work.published_at.desc().nullslast(), Work.id.desc())
+        .limit(limit)
+    )
+    if query and query.strip():
+        pattern = f"%{query.strip()}%"
+        statement = statement.where(Work.description.ilike(pattern))
+
+    rows = session.execute(statement).all()
+    work_ids = [work.id for work, _ in rows]
+    assets = (
+        session.scalars(select(Asset).where(Asset.work_id.in_(work_ids))).all()
+        if work_ids
+        else []
+    )
+    assets_by_work: dict[int, list[str]] = {}
+    for asset in assets:
+        assets_by_work.setdefault(asset.work_id, []).append(asset.kind)
+
+    analyses = session.scalars(
+        select(Analysis).where(
+            Analysis.work_id.in_(work_ids),
+            Analysis.status == "succeeded",
+        )
+    ).all() if work_ids else []
+    topics_by_work: dict[int, list[str]] = {}
+    for analysis in analyses:
+        try:
+            topics = json.loads(analysis.topics_json or "[]")
+        except json.JSONDecodeError:
+            topics = []
+        if isinstance(topics, list):
+            topics_by_work.setdefault(analysis.work_id, []).extend(
+                str(topic) for topic in topics if str(topic).strip()
+            )
+
+    return {
+        "items": [
+            {
+                "id": work.id,
+                "aweme_id": work.aweme_id,
+                "description": work.description,
+                "media_type": work.media_type,
+                "availability": work.availability,
+                "asset_kinds": sorted(set(assets_by_work.get(work.id, []))),
+                "creator_nickname": nickname,
+                "published_at": work.published_at.isoformat() if work.published_at else None,
+                "topics": sorted(set(topics_by_work.get(work.id, []))),
+            }
+            for work, nickname in rows
+        ]
     }
