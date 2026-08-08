@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import inspect
 import logging
+import re
 from collections.abc import AsyncIterator, Awaitable, Callable
 from importlib.metadata import version
 from pathlib import Path
@@ -109,6 +110,37 @@ class JijiGateway:
             source_external_id=sec_uid,
         ):
             yield page
+
+    async def resolve_creator(self, reference: str) -> dict[str, str | None]:
+        self.assert_compatible()
+        resolved = reference.strip()
+        match = re.search(r"/user/([A-Za-z0-9_-]+)", resolved)
+        if resolved.startswith(("http://", "https://")) and match is None:
+            await self._acquire()
+            final_url = await self.api_client.resolve_short_url(resolved)
+            if not final_url:
+                raise ValueError("creator_short_url_unresolved")
+            resolved = final_url
+            match = re.search(r"/user/([A-Za-z0-9_-]+)", resolved)
+        sec_uid = match.group(1) if match else resolved
+        if not sec_uid or sec_uid.startswith(("http://", "https://")):
+            raise ValueError("creator_profile_url_invalid")
+        await self._acquire()
+        profile = await self.api_client.get_user_info(sec_uid)
+        if not isinstance(profile, dict):
+            raise ValueError("creator_profile_unavailable")
+        stable_sec_uid = str(profile.get("sec_uid") or sec_uid).strip()
+        return {
+            "sec_uid": stable_sec_uid,
+            "nickname": _optional_text(profile.get("nickname")),
+            "unique_id": _optional_text(profile.get("unique_id") or profile.get("short_id")),
+            "profile_url": f"https://www.douyin.com/user/{stable_sec_uid}",
+            "avatar_url": _nested_first_url(
+                profile.get("avatar_larger")
+                or profile.get("avatar_medium")
+                or profile.get("avatar_thumb")
+            ),
+        }
 
     async def all_favorites(self) -> AsyncIterator[DiscoveryPage]:
         self.assert_compatible()
@@ -236,3 +268,19 @@ def _parse_cookie_header(cookie_header: str) -> dict[str, str]:
         if separator and name and value:
             cookies[name] = value
     return cookies
+
+
+def _optional_text(value: Any) -> str | None:
+    if value is None:
+        return None
+    result = str(value).strip()
+    return result or None
+
+
+def _nested_first_url(value: Any) -> str | None:
+    if not isinstance(value, dict):
+        return None
+    urls = value.get("url_list")
+    if not isinstance(urls, list):
+        return None
+    return next((url for url in urls if isinstance(url, str) and url.strip()), None)
