@@ -1,0 +1,4 @@
+[submodule "upstream/jiji"]
+	path = upstream/jiji
+	url = https://github.com/jiji262/douyin-downloader.git
+
