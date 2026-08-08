@@ -1,0 +1,154 @@
+:root {
+  color: #18211f;
+  background: #ffffff;
+  font-family:
+    Inter, "Noto Sans SC", "Microsoft YaHei", system-ui, sans-serif;
+  font-synthesis: none;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  min-width: 320px;
+  min-height: 100vh;
+}
+
+button {
+  font: inherit;
+}
+
+.app-shell {
+  display: grid;
+  grid-template-columns: 184px minmax(0, 1fr);
+  min-height: 100vh;
+}
+
+.sidebar {
+  border-right: 1px solid #dde3e1;
+  padding: 20px 14px;
+  background: #f7f9f8;
+}
+
+.brand-mark {
+  display: grid;
+  width: 34px;
+  height: 34px;
+  margin: 0 8px 26px;
+  place-items: center;
+  border-radius: 6px;
+  background: #176b62;
+  color: #ffffff;
+  font-size: 16px;
+  font-weight: 700;
+}
+
+.sidebar nav {
+  display: grid;
+  gap: 4px;
+}
+
+.nav-item {
+  display: flex;
+  width: 100%;
+  min-height: 40px;
+  align-items: center;
+  gap: 10px;
+  border: 0;
+  border-radius: 6px;
+  padding: 0 10px;
+  background: transparent;
+  color: #52615e;
+  cursor: pointer;
+  font-size: 14px;
+  text-align: left;
+}
+
+.nav-item:hover,
+.nav-item.is-active {
+  background: #e5f0ed;
+  color: #155f57;
+}
+
+.workspace {
+  min-width: 0;
+}
+
+.topbar {
+  display: flex;
+  min-height: 68px;
+  align-items: center;
+  justify-content: space-between;
+  border-bottom: 1px solid #e3e8e6;
+  padding: 0 28px;
+}
+
+.topbar h1 {
+  margin: 0;
+  font-size: 18px;
+  font-weight: 650;
+}
+
+.connection-status {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  color: #50605c;
+  font-size: 13px;
+}
+
+.status-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: #27845f;
+}
+
+.empty-workspace {
+  padding: 36px 28px;
+}
+
+.empty-workspace h2 {
+  margin: 0 0 8px;
+  font-size: 22px;
+}
+
+.empty-workspace p {
+  margin: 0;
+  color: #6a7774;
+  font-size: 14px;
+}
+
+@media (max-width: 720px) {
+  .app-shell {
+    grid-template-columns: 64px minmax(0, 1fr);
+  }
+
+  .sidebar {
+    padding-inline: 9px;
+  }
+
+  .brand-mark {
+    margin-inline: 6px;
+  }
+
+  .nav-item {
+    justify-content: center;
+    padding: 0;
+  }
+
+  .nav-item span {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    overflow: hidden;
+    clip: rect(0 0 0 0);
+  }
+
+  .topbar {
+    padding-inline: 18px;
+  }
+}
+
