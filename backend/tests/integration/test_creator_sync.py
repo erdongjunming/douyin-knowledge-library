@@ -76,6 +76,9 @@ async def test_creator_sync_updates_nickname_without_changing_identity(tmp_path:
         gateway.nickname = "新昵称"
         second = await service.sync(first.creator.id)
 
+        assert len(first.new_work_ids) == 1
+        assert first.new_work_ids[0] == session.scalar(select(Work.id))
+        assert second.new_work_ids == ()
         assert second.creator.id == first.creator.id
         assert second.creator.nickname == "新昵称"
         assert second.new_work_count == 0

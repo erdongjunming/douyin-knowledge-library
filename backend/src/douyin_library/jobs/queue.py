@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+from collections.abc import Mapping
 from datetime import UTC, datetime, timedelta
 
 from sqlalchemy import select
@@ -22,11 +24,15 @@ ALLOWED_TRANSITIONS = {
     "running": {"pending", "succeeded", "failed", "cancelled"},
 }
 RETRY_LIMITS = {
+    "sync_creator": 3,
+    "sync_favorites": 3,
     "download_work": 3,
     "transcribe_work": 2,
     "analyze_work": 2,
 }
 RETRY_DELAYS = {
+    "sync_creator": (60, 300, 1800),
+    "sync_favorites": (60, 300, 1800),
     "download_work": (60, 300, 1800),
     "transcribe_work": (60, 300),
     "analyze_work": (60, 300),
@@ -43,11 +49,17 @@ class JobQueue:
         kind: str,
         work_id: int | None = None,
         sync_run_id: int | None = None,
+        payload: Mapping[str, object] | None = None,
         status: str = "pending",
         attempts: int = 0,
     ) -> Job:
         if status not in {"pending", "running"}:
             raise JobTransitionError(f"cannot create job in status {status}")
+        payload_json = (
+            json.dumps(dict(payload), ensure_ascii=False, sort_keys=True)
+            if payload is not None
+            else None
+        )
         if work_id is not None:
             active = self.session.scalar(
                 select(Job).where(
@@ -58,10 +70,22 @@ class JobQueue:
             )
             if active is not None:
                 raise DuplicateActiveJobError("active_job_already_exists")
+        elif payload_json is not None:
+            active = self.session.scalar(
+                select(Job).where(
+                    Job.kind == kind,
+                    Job.work_id.is_(None),
+                    Job.payload_json == payload_json,
+                    Job.status.not_in(TERMINAL_STATUSES),
+                )
+            )
+            if active is not None:
+                raise DuplicateActiveJobError("active_job_already_exists")
         job = Job(
             kind=kind,
             work_id=work_id,
             sync_run_id=sync_run_id,
+            payload_json=payload_json,
             status=status,
             attempts=attempts,
         )
@@ -100,6 +124,9 @@ class JobQueue:
         if status not in allowed:
             raise JobTransitionError(f"invalid_transition:{job.status}->{status}")
         job.status = status
+        if status == "succeeded":
+            job.stage = "complete"
+            job.progress = 1.0
         if status in TERMINAL_STATUSES:
             job.finished_at = datetime.now(UTC)
         self.session.commit()

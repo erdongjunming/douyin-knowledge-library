@@ -1,3 +1,4 @@
+import json
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -8,6 +9,19 @@ from sqlalchemy.orm import Session
 from douyin_library.db import create_schema
 from douyin_library.jobs.queue import DuplicateActiveJobError, JobQueue, JobTransitionError
 from douyin_library.models import Work
+
+
+def test_job_queue_persists_json_payload(tmp_path: Path) -> None:
+    engine = create_engine(f"sqlite:///{tmp_path / 'library.db'}")
+    create_schema(engine)
+
+    with Session(engine) as session:
+        job = JobQueue(session).create(
+            kind="sync_creator",
+            payload={"reference": "sec-731"},
+        )
+
+        assert json.loads(job.payload_json or "{}") == {"reference": "sec-731"}
 
 
 def test_job_state_machine_and_active_deduplication(tmp_path: Path) -> None:

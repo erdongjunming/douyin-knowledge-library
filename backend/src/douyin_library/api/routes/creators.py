@@ -1,16 +1,14 @@
 from __future__ import annotations
 
-from collections.abc import AsyncIterator, Iterator
+from collections.abc import AsyncIterator
 from typing import Annotated, Any
 
 from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel, Field
-from sqlalchemy import create_engine
-from sqlalchemy.orm import Session
 
-from douyin_library.config import Settings
+from douyin_library.api.routes.jobs import get_job_queue, serialize_job
+from douyin_library.jobs.queue import DuplicateActiveJobError, JobQueue
 from douyin_library.security.cookie_store import CookieStore
-from douyin_library.sync.creator_sync import CreatorSyncService
 from douyin_library.upstream.jiji_gateway import JijiGateway
 
 router = APIRouter(prefix="/api/creators", tags=["creators"])
@@ -38,20 +36,6 @@ async def get_creator_gateway() -> AsyncIterator[JijiGateway]:
         await gateway.close()
 
 
-def get_creator_sync_service(
-    gateway: Annotated[JijiGateway, Depends(get_creator_gateway)],
-) -> Iterator[CreatorSyncService]:
-    database_path = Settings().storage_root / "data" / "library.db"
-    if not database_path.is_file():
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="storage_not_initialized",
-        )
-    engine = create_engine(f"sqlite:///{database_path.resolve().as_posix()}")
-    with Session(engine) as session:
-        yield CreatorSyncService(session, gateway)
-
-
 @router.post("/preview")
 async def preview_creator(
     payload: CreatorReferenceRequest,
@@ -60,21 +44,21 @@ async def preview_creator(
     return await gateway.resolve_creator(payload.reference)
 
 
-@router.post("/sync")
-async def sync_creator(
+@router.post("/sync", status_code=status.HTTP_202_ACCEPTED)
+def sync_creator(
     payload: CreatorSyncRequest,
-    service: Annotated[CreatorSyncService, Depends(get_creator_sync_service)],
+    queue: Annotated[JobQueue, Depends(get_job_queue)],
 ) -> dict[str, Any]:
     if not payload.confirmed:
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
             detail="creator_confirmation_required",
         )
-    result = await service.sync(payload.reference)
-    return {
-        "creator_id": result.creator.id,
-        "status": result.status,
-        "complete": result.complete,
-        "new_work_count": result.new_work_count,
-        "discovered_count": result.discovered_count,
-    }
+    try:
+        job = queue.create(
+            kind="sync_creator",
+            payload={"reference": payload.reference.strip()},
+        )
+    except DuplicateActiveJobError as exc:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
+    return serialize_job(job)

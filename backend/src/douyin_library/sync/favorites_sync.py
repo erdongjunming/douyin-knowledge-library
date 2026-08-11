@@ -24,6 +24,7 @@ class FavoritesSyncResult:
     default_count: int
     folder_count: int
     unique_work_count: int
+    new_work_ids: tuple[int, ...]
     status: str
 
     @property
@@ -50,6 +51,7 @@ class FavoritesSyncService:
         seen_by_source: dict[int, set[int]] = {}
         seen_folder_ids: set[str] = set()
         unique_work_ids: set[int] = set()
+        new_work_ids: set[int] = set()
         default_count = 0
         folder_count = 0
         try:
@@ -64,7 +66,9 @@ class FavoritesSyncService:
 
                 for item in page.items:
                     creator_id = self._creator_id(item.author)
-                    work = self._work(item, creator_id)
+                    work, is_new = self._work(item, creator_id)
+                    if is_new:
+                        new_work_ids.add(work.id)
                     relation = self.session.scalar(
                         select(WorkSource).where(
                             WorkSource.work_id == work.id,
@@ -105,6 +109,7 @@ class FavoritesSyncService:
                 default_count=default_count,
                 folder_count=folder_count,
                 unique_work_count=len(unique_work_ids),
+                new_work_ids=tuple(sorted(new_work_ids)),
                 status="incomplete",
             )
 
@@ -125,6 +130,7 @@ class FavoritesSyncService:
             default_count=default_count,
             folder_count=folder_count,
             unique_work_count=len(unique_work_ids),
+            new_work_ids=tuple(sorted(new_work_ids)),
             status="complete",
         )
 
@@ -168,8 +174,9 @@ class FavoritesSyncService:
                 setattr(creator, field, value)
         return creator.id
 
-    def _work(self, item: Any, creator_id: int | None) -> Work:
+    def _work(self, item: Any, creator_id: int | None) -> tuple[Work, bool]:
         work = self.session.scalar(select(Work).where(Work.aweme_id == item.aweme_id))
+        is_new = work is None
         if work is None:
             work = Work(aweme_id=item.aweme_id)
             self.session.add(work)
@@ -184,4 +191,4 @@ class FavoritesSyncService:
         work.availability = "available"
         work.stats_json = json.dumps(item.stats, ensure_ascii=False)
         work.raw_metadata_json = json.dumps(item.raw_payload, ensure_ascii=False)
-        return work
+        return work, is_new

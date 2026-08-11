@@ -58,6 +58,7 @@ async def test_full_favorites_sync_deduplicates_across_folders(tmp_path: Path) -
         assert result.default_count == 2
         assert result.folder_count == 2
         assert result.unique_work_count == 3
+        assert set(result.new_work_ids) == set(session.scalars(select(Work.id)))
         assert result.complete is True
         assert session.scalar(select(func.count()).select_from(Work)) == 3
         assert session.scalar(select(func.count()).select_from(Source)) == 2

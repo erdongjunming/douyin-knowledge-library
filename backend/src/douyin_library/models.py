@@ -176,6 +176,7 @@ class Job(Base):
     kind: Mapped[str] = mapped_column(String(64), index=True)
     work_id: Mapped[int | None] = mapped_column(ForeignKey("work.id"))
     sync_run_id: Mapped[int | None] = mapped_column(ForeignKey("sync_run.id"))
+    payload_json: Mapped[str | None] = mapped_column(Text)
     status: Mapped[str] = mapped_column(String(24), default="pending", index=True)
     stage: Mapped[str] = mapped_column(String(24), default="discover")
     progress: Mapped[float] = mapped_column(Float, default=0.0)

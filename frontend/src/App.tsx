@@ -137,11 +137,12 @@ function CreatorView() {
     setBusy("sync")
     setMessage(null)
     try {
-      const result = await apiJson<{ status: string; discovered_count: number }>("/api/creators/sync", {
+      const result = await apiJson<Job>("/api/creators/sync", {
         method: "POST",
         body: JSON.stringify({ reference, confirmed: true }),
       })
-      setMessage({ tone: "success", text: `同步${result.status === "complete" ? "完成" : "未完整完成"}，发现 ${result.discovered_count} 条作品` })
+      if (result.status !== "pending") throw new Error("同步任务未能加入队列")
+      setMessage({ tone: "success", text: "主播同步任务已加入队列，可前往任务中心查看进度。" })
     } catch (error) {
       setMessage({ tone: "error", text: error instanceof Error ? error.message : "同步失败" })
     } finally {
@@ -209,8 +210,9 @@ function FavoritesView() {
     setBusy(true)
     setMessage(null)
     try {
-      const result = await apiJson<{ status: string; unique_work_count: number }>("/api/favorites/sync", { method: "POST" })
-      setMessage({ tone: "success", text: `收藏同步${result.status === "complete" ? "完成" : "未完整完成"}，共 ${result.unique_work_count} 条去重作品` })
+      const result = await apiJson<Job>("/api/favorites/sync", { method: "POST" })
+      if (result.status !== "pending") throw new Error("收藏同步任务未能加入队列")
+      setMessage({ tone: "success", text: "收藏同步任务已加入队列，可前往任务中心查看进度。" })
     } catch (error) {
       setMessage({ tone: "error", text: error instanceof Error ? error.message : "收藏同步失败" })
     } finally {

@@ -15,6 +15,7 @@ from douyin_library.models import Creator, Source, SyncRun, Work, WorkSource
 class CreatorSyncResult:
     creator: Creator
     new_work_count: int
+    new_work_ids: tuple[int, ...]
     discovered_count: int
     status: str
 
@@ -81,6 +82,7 @@ class CreatorSyncService:
         self.session.commit()
 
         seen_work_ids: set[int] = set()
+        new_work_ids: list[int] = []
         new_work_count = 0
         discovered_count = 0
         try:
@@ -93,6 +95,7 @@ class CreatorSyncService:
                         work = Work(aweme_id=item.aweme_id)
                         self.session.add(work)
                         self.session.flush()
+                        new_work_ids.append(work.id)
                         new_work_count += 1
                     self._update_work(work, item, creator.id)
                     relation = self.session.scalar(
@@ -121,6 +124,7 @@ class CreatorSyncService:
             return CreatorSyncResult(
                 creator=creator,
                 new_work_count=new_work_count,
+                new_work_ids=tuple(new_work_ids),
                 discovered_count=discovered_count,
                 status="incomplete",
             )
@@ -139,6 +143,7 @@ class CreatorSyncService:
         return CreatorSyncResult(
             creator=creator,
             new_work_count=new_work_count,
+            new_work_ids=tuple(new_work_ids),
             discovered_count=discovered_count,
             status="complete",
         )

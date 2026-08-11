@@ -51,17 +51,30 @@ it("uses an actionable message for an empty non-json error", async () => {
 })
 
 it("previews a creator and enables confirmed synchronization", async () => {
-  vi.spyOn(globalThis, "fetch").mockImplementation(
-    async () => new Response(
-      JSON.stringify({
-        sec_uid: "sec-731",
-        nickname: "知识主播",
-        unique_id: "knowledge731",
-        profile_url: "https://www.douyin.com/user/sec-731",
-      }),
-      { status: 200, headers: { "Content-Type": "application/json" } },
-    ),
-  )
+  vi.spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
+    const path = String(input)
+    if (path === "/api/creators/preview") {
+      return new Response(
+        JSON.stringify({
+          sec_uid: "sec-731",
+          nickname: "知识主播",
+          unique_id: "knowledge731",
+          profile_url: "https://www.douyin.com/user/sec-731",
+        }),
+        { status: 200, headers: { "Content-Type": "application/json" } },
+      )
+    }
+    if (path === "/api/creators/sync" && init?.method === "POST") {
+      return new Response(
+        JSON.stringify({ id: 9, kind: "sync_creator", status: "pending" }),
+        { status: 202, headers: { "Content-Type": "application/json" } },
+      )
+    }
+    return new Response(JSON.stringify({ status: "ok" }), {
+      status: 200,
+      headers: { "Content-Type": "application/json" },
+    })
+  })
 
   render(<App />)
   fireEvent.change(screen.getByLabelText("主播主页或 sec_uid"), {
@@ -70,7 +83,32 @@ it("previews a creator and enables confirmed synchronization", async () => {
   fireEvent.click(screen.getByRole("button", { name: "预览主播" }))
 
   expect(await screen.findByText("知识主播")).toBeVisible()
-  expect(screen.getByRole("button", { name: "确认并同步主播" })).toBeEnabled()
+  const syncButton = screen.getByRole("button", { name: "确认并同步主播" })
+  expect(syncButton).toBeEnabled()
+  fireEvent.click(syncButton)
+  expect(await screen.findByText("主播同步任务已加入队列，可前往任务中心查看进度。")).toBeVisible()
+})
+
+it("queues a favorites sync instead of claiming it completed inline", async () => {
+  vi.spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
+    const path = String(input)
+    if (path === "/api/favorites/sync" && init?.method === "POST") {
+      return new Response(
+        JSON.stringify({ id: 10, kind: "sync_favorites", status: "pending" }),
+        { status: 202, headers: { "Content-Type": "application/json" } },
+      )
+    }
+    return new Response(JSON.stringify({ status: "ok" }), {
+      status: 200,
+      headers: { "Content-Type": "application/json" },
+    })
+  })
+
+  render(<App />)
+  fireEvent.click(screen.getByRole("button", { name: "我的收藏" }))
+  fireEvent.click(screen.getByRole("button", { name: "同步全部收藏" }))
+
+  expect(await screen.findByText("收藏同步任务已加入队列，可前往任务中心查看进度。")).toBeVisible()
 })
 
 it("switches to the jobs view and loads progress records", async () => {
