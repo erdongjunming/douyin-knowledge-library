@@ -14,3 +14,4 @@ vite.config.d.ts
 *.sqlite3
 coverage.xml
 htmlcov/
+.superpowers/
