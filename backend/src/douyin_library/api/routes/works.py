@@ -1,13 +1,14 @@
 from __future__ import annotations
 
 import json
-from collections.abc import AsyncIterator, Iterator
+from collections.abc import AsyncIterator
 from typing import Annotated, Any
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
-from sqlalchemy import create_engine, select
+from sqlalchemy import select
 from sqlalchemy.orm import Session
 
+from douyin_library.api.dependencies import get_runtime_session
 from douyin_library.config import Settings
 from douyin_library.media.service import WorkMediaService
 from douyin_library.media.storage import StorageLayout
@@ -32,16 +33,10 @@ async def get_work_gateway() -> AsyncIterator[JijiGateway]:
         await gateway.close()
 
 
-def get_work_session() -> Iterator[Session]:
-    database_path = Settings().storage_root / "data" / "library.db"
-    if not database_path.is_file():
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="storage_not_initialized",
-        )
-    engine = create_engine(f"sqlite:///{database_path.resolve().as_posix()}")
-    with Session(engine) as session:
-        yield session
+def get_work_session(
+    session: Annotated[Session, Depends(get_runtime_session)],
+) -> Session:
+    return session
 
 
 @router.post("/{work_id}/process")

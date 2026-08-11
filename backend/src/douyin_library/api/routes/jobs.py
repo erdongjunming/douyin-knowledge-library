@@ -1,14 +1,13 @@
 from __future__ import annotations
 
-from collections.abc import Iterator
 from typing import Annotated, Any
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
-from sqlalchemy import create_engine, select
+from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from douyin_library.config import Settings
+from douyin_library.api.dependencies import get_runtime_session
 from douyin_library.jobs.queue import JobQueue, JobTransitionError
 from douyin_library.models import Job
 
@@ -20,16 +19,10 @@ class JobCreateRequest(BaseModel):
     work_id: int | None = None
 
 
-def get_job_queue() -> Iterator[JobQueue]:
-    database_path = Settings().storage_root / "data" / "library.db"
-    if not database_path.is_file():
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="storage_not_initialized",
-        )
-    engine = create_engine(f"sqlite:///{database_path.resolve().as_posix()}")
-    with Session(engine) as session:
-        yield JobQueue(session)
+def get_job_queue(
+    session: Annotated[Session, Depends(get_runtime_session)],
+) -> JobQueue:
+    return JobQueue(session)
 
 
 @router.get("")
