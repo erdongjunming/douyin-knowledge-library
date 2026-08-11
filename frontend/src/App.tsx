@@ -17,6 +17,7 @@ import { useEffect, useMemo, useState } from "react"
 import "./styles.css"
 
 type ViewKey = "creator" | "favorites" | "jobs" | "library" | "settings"
+type ConnectionState = "connecting" | "connected" | "disconnected"
 
 type CreatorPreview = {
   sec_uid: string
@@ -81,11 +82,22 @@ async function apiJson<T>(path: string, init?: RequestInit): Promise<T> {
     headers: { "Content-Type": "application/json" },
     ...init,
   })
-  const body = (await response.json()) as T & { detail?: string }
-  if (!response.ok) {
-    throw new Error(body.detail || `请求失败 (${response.status})`)
+  const responseText = await response.text()
+  let body: unknown = null
+  if (responseText.trim()) {
+    try {
+      body = JSON.parse(responseText)
+    } catch {
+      if (response.ok) {
+        throw new Error("本地服务返回了无法解析的数据")
+      }
+    }
   }
-  return body
+  if (!response.ok) {
+    const detail = body && typeof body === "object" && "detail" in body ? body.detail : null
+    throw new Error(typeof detail === "string" ? detail : `本地服务请求失败 (${response.status})`)
+  }
+  return body as T
 }
 
 function StatusMessage({ tone, children }: { tone: "success" | "error"; children: string }) {
@@ -398,6 +410,33 @@ function SettingsView() {
 
 export function App() {
   const [activeView, setActiveView] = useState<ViewKey>("creator")
+  const [connectionState, setConnectionState] = useState<ConnectionState>("connecting")
+
+  useEffect(() => {
+    let active = true
+    let timer: number | undefined
+    const checkHealth = async () => {
+      try {
+        const result = await apiJson<{ status: string }>("/api/health")
+        if (active) setConnectionState(result.status === "ok" ? "connected" : "disconnected")
+      } catch {
+        if (active) setConnectionState("disconnected")
+      } finally {
+        if (active) timer = window.setTimeout(() => void checkHealth(), 5000)
+      }
+    }
+    void checkHealth()
+    return () => {
+      active = false
+      if (timer !== undefined) window.clearTimeout(timer)
+    }
+  }, [])
+
   const content = { creator: <CreatorView />, favorites: <FavoritesView />, jobs: <JobsView />, library: <LibraryView />, settings: <SettingsView /> }[activeView]
-  return <div className="app-shell"><aside className="sidebar"><div className="brand-mark" aria-hidden="true">知</div><nav aria-label="主要导航">{navigation.map(({ key, label, icon: Icon }) => <button className={activeView === key ? "nav-item is-active" : "nav-item"} key={key} type="button" onClick={() => setActiveView(key)}><Icon aria-hidden="true" size={18} /><span>{label}</span></button>)}</nav></aside><main className="workspace"><header className="topbar"><div><p className="topbar-kicker">{viewTitles[activeView]}</p><h1>抖音知识资料库</h1></div><span className="connection-status"><span aria-hidden="true" className="status-dot" />本地服务已连接</span></header><div className="page-content">{content}</div></main></div>
+  const connectionLabel = {
+    connecting: "正在连接本地服务",
+    connected: "本地服务已连接",
+    disconnected: "本地服务未连接",
+  }[connectionState]
+  return <div className="app-shell"><aside className="sidebar"><div className="brand-mark" aria-hidden="true">知</div><nav aria-label="主要导航">{navigation.map(({ key, label, icon: Icon }) => <button className={activeView === key ? "nav-item is-active" : "nav-item"} key={key} type="button" onClick={() => setActiveView(key)}><Icon aria-hidden="true" size={18} /><span>{label}</span></button>)}</nav></aside><main className="workspace"><header className="topbar"><div><p className="topbar-kicker">{viewTitles[activeView]}</p><h1>抖音知识资料库</h1></div><span className={`connection-status is-${connectionState}`} aria-live="polite"><span aria-hidden="true" className="status-dot" />{connectionLabel}</span></header><div className="page-content">{content}</div></main></div>
 }

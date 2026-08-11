@@ -23,7 +23,10 @@ button:disabled { cursor: not-allowed; opacity: 0.55; }
 .topbar-kicker, .section-kicker, .eyebrow { margin: 0; color: #6d7c76; font-size: 11px; font-weight: 750; letter-spacing: 0.08em; }
 .topbar h1 { margin: 2px 0 0; font-size: 20px; font-weight: 700; }
 .connection-status { display: inline-flex; align-items: center; gap: 7px; color: #52635d; font-size: 13px; }
-.status-dot { width: 7px; height: 7px; border-radius: 50%; background: #27845f; }
+.status-dot { width: 7px; height: 7px; border-radius: 50%; background: #a5b0ab; }
+.connection-status.is-connected .status-dot { background: #27845f; }
+.connection-status.is-disconnected { color: #9c3f3f; }
+.connection-status.is-disconnected .status-dot { background: #c84f4f; }
 .page-content { max-width: 1180px; padding: 42px; }
 .content-grid { display: grid; grid-template-columns: minmax(260px, 0.74fr) minmax(0, 1.26fr); gap: 24px; align-items: start; }
 .wide-grid { grid-template-columns: 1fr; }

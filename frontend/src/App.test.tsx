@@ -11,16 +11,48 @@ beforeEach(() => {
   vi.restoreAllMocks()
 })
 
-it("shows the local knowledge library identity", () => {
+it("shows the local knowledge library identity and a successful health check", async () => {
+  vi.spyOn(globalThis, "fetch").mockResolvedValue(
+    new Response(JSON.stringify({ status: "ok" }), {
+      status: 200,
+      headers: { "Content-Type": "application/json" },
+    }),
+  )
+
   render(<App />)
 
   expect(screen.getByRole("heading", { name: "抖音知识资料库" })).toBeVisible()
-  expect(screen.getByText("本地服务已连接")).toBeVisible()
+  expect(await screen.findByText("本地服务已连接")).toBeVisible()
+})
+
+it("shows connecting while the health check is pending", () => {
+  vi.spyOn(globalThis, "fetch").mockImplementation(() => new Promise<Response>(() => undefined))
+
+  render(<App />)
+
+  expect(screen.getByText("正在连接本地服务")).toBeVisible()
+})
+
+it("shows disconnected when the health check fails", async () => {
+  vi.spyOn(globalThis, "fetch").mockRejectedValue(new TypeError("fetch failed"))
+
+  render(<App />)
+
+  expect(await screen.findByText("本地服务未连接")).toBeVisible()
+})
+
+it("uses an actionable message for an empty non-json error", async () => {
+  vi.spyOn(globalThis, "fetch").mockImplementation(async () => new Response(null, { status: 502 }))
+
+  render(<App />)
+  fireEvent.click(screen.getByRole("button", { name: "任务中心" }))
+
+  expect(await screen.findByText("本地服务请求失败 (502)")).toBeVisible()
 })
 
 it("previews a creator and enables confirmed synchronization", async () => {
-  vi.spyOn(globalThis, "fetch").mockResolvedValue(
-    new Response(
+  vi.spyOn(globalThis, "fetch").mockImplementation(
+    async () => new Response(
       JSON.stringify({
         sec_uid: "sec-731",
         nickname: "知识主播",
@@ -42,8 +74,8 @@ it("previews a creator and enables confirmed synchronization", async () => {
 })
 
 it("switches to the jobs view and loads progress records", async () => {
-  vi.spyOn(globalThis, "fetch").mockResolvedValue(
-    new Response(
+  vi.spyOn(globalThis, "fetch").mockImplementation(
+    async () => new Response(
       JSON.stringify({
         items: [
           {
