@@ -7,6 +7,8 @@ import subprocess
 from pathlib import Path
 from typing import Any
 
+from douyin_library.config import Settings, resolve_tool
+
 
 class MediaExtractionError(RuntimeError):
     """Raised when FFmpeg cannot create a valid media asset."""
@@ -16,6 +18,15 @@ class FfmpegMediaTool:
     def __init__(self, ffmpeg: str | None = None, ffprobe: str | None = None) -> None:
         self.ffmpeg = ffmpeg or shutil.which("ffmpeg") or "ffmpeg"
         self.ffprobe = ffprobe or shutil.which("ffprobe") or "ffprobe"
+
+    @classmethod
+    def from_settings(cls, settings: Settings) -> FfmpegMediaTool:
+        ffmpeg = resolve_tool(settings, "ffmpeg")
+        ffprobe = resolve_tool(settings, "ffprobe")
+        return cls(
+            ffmpeg=str(ffmpeg) if ffmpeg else None,
+            ffprobe=str(ffprobe) if ffprobe else None,
+        )
 
     def extract_audio(self, source: Path, target: Path) -> dict[str, Any]:
         target.parent.mkdir(parents=True, exist_ok=True)

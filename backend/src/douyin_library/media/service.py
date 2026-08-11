@@ -8,6 +8,7 @@ from typing import Any
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
+from douyin_library.config import Settings
 from douyin_library.models import Asset, Work
 from douyin_library.upstream.contracts import Collector
 
@@ -28,7 +29,7 @@ class WorkMediaService:
         self.session = session
         self.collector = collector
         self.layout = layout
-        self.media_tool = media_tool or FfmpegMediaTool()
+        self.media_tool = media_tool or FfmpegMediaTool.from_settings(Settings())
 
     async def process(self, work: Work) -> MediaProcessResult:
         self.layout.initialize()
