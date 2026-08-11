@@ -10,6 +10,8 @@ class KeyringBackend(Protocol):
 
     def get_password(self, service_name: str, username: str) -> str | None: ...
 
+    def delete_password(self, service_name: str, username: str) -> None: ...
+
 
 class CookieStore:
     service_name = "douyin-knowledge-library"
@@ -24,3 +26,8 @@ class CookieStore:
     def read(self) -> str | None:
         return self._keyring.get_password(self.service_name, self.username)
 
+    def delete(self) -> None:
+        try:
+            self._keyring.delete_password(self.service_name, self.username)
+        except keyring.errors.PasswordDeleteError:
+            pass

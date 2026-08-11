@@ -3,12 +3,14 @@ import {
   BookOpenText,
   CheckCircle2,
   CircleAlert,
+  KeyRound,
   ListChecks,
   LoaderCircle,
   Radio,
   RefreshCw,
   Search,
   Settings,
+  Trash2,
 } from "lucide-react"
 import { useEffect, useMemo, useState } from "react"
 
@@ -45,6 +47,17 @@ type Work = {
   creator_nickname: string | null
   published_at: string | null
   topics: string[]
+}
+
+type CookieStatus = {
+  configured: boolean
+}
+
+type CookieSaveResult = CookieStatus & {
+  valid: boolean
+  account_nickname: string | null
+  expires_or_unknown: string
+  risk_controlled: boolean
 }
 
 const navigation: Array<{ key: ViewKey; label: string; icon: typeof Radio }> = [
@@ -276,8 +289,111 @@ function LibraryView() {
 
 function SettingsView() {
   const [diagnostics, setDiagnostics] = useState<Record<string, { status: string; path?: string }> | null>(null)
-  useEffect(() => { void apiJson<Record<string, { status: string; path?: string }>>("/api/settings/diagnostics").then(setDiagnostics).catch(() => setDiagnostics(null)) }, [])
-  return <div className="content-grid"><section className="intro-panel"><p className="section-kicker">SYSTEM</p><h2>本地优先，数据留在你的机器上。</h2><p className="muted-copy">Cookie 通过本地凭据存储读取；运行数据默认写入 D 盘，不会静默回退到 C 盘。</p></section><section className="panel diagnostics-panel"><div className="panel-heading"><div><p className="eyebrow">运行诊断</p><h3>处理环境</h3></div><Settings size={20} aria-hidden="true" /></div>{diagnostics ? Object.entries(diagnostics).map(([name, item]) => <div className="diagnostic-row" key={name}><span>{name}</span><strong className={item.status === "ok" ? "ok" : "warning"}>{item.status === "ok" ? "正常" : "未就绪"}</strong>{item.path && <small>{item.path}</small>}</div>) : <p className="empty-copy">诊断信息暂不可用。</p>}</section></div>
+  const [cookie, setCookie] = useState("")
+  const [cookieConfigured, setCookieConfigured] = useState<boolean | null>(null)
+  const [cookieBusy, setCookieBusy] = useState(false)
+  const [cookieMessage, setCookieMessage] = useState<{ tone: "success" | "error"; text: string } | null>(null)
+
+  useEffect(() => {
+    void apiJson<Record<string, { status: string; path?: string }>>("/api/settings/diagnostics")
+      .then(setDiagnostics)
+      .catch(() => setDiagnostics(null))
+    void apiJson<CookieStatus>("/api/settings/douyin-cookie")
+      .then((result) => setCookieConfigured(result.configured))
+      .catch(() => setCookieConfigured(null))
+  }, [])
+
+  const saveCookie = async () => {
+    setCookieBusy(true)
+    setCookieMessage(null)
+    try {
+      const result = await apiJson<CookieSaveResult>("/api/settings/douyin-cookie", {
+        method: "PUT",
+        body: JSON.stringify({ cookie }),
+      })
+      setCookie("")
+      setCookieConfigured(result.configured)
+      setCookieMessage({
+        tone: "success",
+        text: result.account_nickname ? `抖音账号已连接：${result.account_nickname}` : "抖音账号已连接",
+      })
+    } catch (error) {
+      setCookieMessage({ tone: "error", text: error instanceof Error ? error.message : "Cookie 保存失败" })
+    } finally {
+      setCookieBusy(false)
+    }
+  }
+
+  const removeCookie = async () => {
+    setCookieBusy(true)
+    setCookieMessage(null)
+    try {
+      const result = await apiJson<CookieStatus>("/api/settings/douyin-cookie", { method: "DELETE" })
+      setCookie("")
+      setCookieConfigured(result.configured)
+      setCookieMessage({ tone: "success", text: "抖音凭据已移除" })
+    } catch (error) {
+      setCookieMessage({ tone: "error", text: error instanceof Error ? error.message : "凭据移除失败" })
+    } finally {
+      setCookieBusy(false)
+    }
+  }
+
+  return (
+    <div className="content-grid settings-grid">
+      <section className="intro-panel">
+        <p className="section-kicker">SYSTEM</p>
+        <h2>本地优先，数据留在你的机器上。</h2>
+        <p className="muted-copy">Cookie 通过本地凭据存储读取；运行数据默认写入 D 盘，不会静默回退到 C 盘。</p>
+      </section>
+      <div className="settings-stack">
+        <section className="panel credential-panel" aria-labelledby="cookie-title">
+          <div className="panel-heading">
+            <div>
+              <p className="eyebrow">抖音授权</p>
+              <h3 id="cookie-title">账号凭据</h3>
+            </div>
+            <KeyRound size={20} aria-hidden="true" />
+          </div>
+          <div className="credential-status-row">
+            <p className="credential-status">
+              <span className={`status-dot ${cookieConfigured ? "is-ok" : "is-idle"}`} aria-hidden="true" />
+              {cookieConfigured === null ? "凭据状态未知" : cookieConfigured ? "已配置抖音 Cookie" : "尚未配置抖音 Cookie"}
+            </p>
+            {cookieConfigured ? (
+              <button className="button subtle" type="button" disabled={cookieBusy} onClick={removeCookie}>
+                <Trash2 size={15} aria-hidden="true" />
+                移除凭据
+              </button>
+            ) : null}
+          </div>
+          <label htmlFor="douyin-cookie">抖音 Cookie</label>
+          <div className="input-row">
+            <input
+              id="douyin-cookie"
+              type="password"
+              autoComplete="new-password"
+              value={cookie}
+              onChange={(event) => setCookie(event.target.value)}
+              placeholder="粘贴当前登录会话的 Cookie"
+            />
+            <button className="button primary" type="button" disabled={!cookie.trim() || cookieBusy} onClick={saveCookie}>
+              {cookieBusy ? <LoaderCircle className="spin" size={16} aria-hidden="true" /> : <CheckCircle2 size={16} aria-hidden="true" />}
+              {cookieBusy ? "验证中" : "验证并保存"}
+            </button>
+          </div>
+          {cookieMessage && <StatusMessage tone={cookieMessage.tone}>{cookieMessage.text}</StatusMessage>}
+        </section>
+        <section className="panel diagnostics-panel">
+          <div className="panel-heading">
+            <div><p className="eyebrow">运行诊断</p><h3>处理环境</h3></div>
+            <Settings size={20} aria-hidden="true" />
+          </div>
+          {diagnostics ? Object.entries(diagnostics).map(([name, item]) => <div className="diagnostic-row" key={name}><span>{name}</span><strong className={item.status === "ok" ? "ok" : "warning"}>{item.status === "ok" ? "正常" : "未就绪"}</strong>{item.path && <small>{item.path}</small>}</div>) : <p className="empty-copy">诊断信息暂不可用。</p>}
+        </section>
+      </div>
+    </div>
+  )
 }
 
 export function App() {
