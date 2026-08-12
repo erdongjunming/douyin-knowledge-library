@@ -49,6 +49,16 @@ class UnavailableCookieStore(MemoryCookieStore):
         raise CookieStoreUnavailableError("Windows credential store is unavailable")
 
 
+class UnavailableReadCookieStore(MemoryCookieStore):
+    def read(self) -> str | None:
+        raise CookieStoreUnavailableError("Windows credential store is unavailable")
+
+
+class UnavailableDeleteCookieStore(MemoryCookieStore):
+    def delete(self) -> None:
+        raise CookieStoreUnavailableError("Windows credential store is unavailable")
+
+
 @pytest.mark.asyncio
 async def test_cookie_validation_returns_safe_account_status(caplog) -> None:
     app.dependency_overrides[get_cookie_validator] = lambda: FakeCookieValidator()
@@ -156,3 +166,31 @@ async def test_cookie_status_and_delete_do_not_expose_secret() -> None:
     assert delete_response.json() == {"configured": False}
     assert store.read() is None
     assert "super-secret" not in status_response.text
+
+
+@pytest.mark.asyncio
+async def test_cookie_status_store_failure_returns_safe_service_error() -> None:
+    app.dependency_overrides[get_cookie_store] = lambda: UnavailableReadCookieStore()
+    try:
+        transport = httpx.ASGITransport(app=app, raise_app_exceptions=False)
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            response = await client.get("/api/settings/douyin-cookie")
+    finally:
+        app.dependency_overrides.clear()
+
+    assert response.status_code == 503
+    assert response.json() == {"detail": "douyin_cookie_store_unavailable"}
+
+
+@pytest.mark.asyncio
+async def test_cookie_delete_store_failure_returns_safe_service_error() -> None:
+    app.dependency_overrides[get_cookie_store] = lambda: UnavailableDeleteCookieStore()
+    try:
+        transport = httpx.ASGITransport(app=app, raise_app_exceptions=False)
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            response = await client.delete("/api/settings/douyin-cookie")
+    finally:
+        app.dependency_overrides.clear()
+
+    assert response.status_code == 503
+    assert response.json() == {"detail": "douyin_cookie_store_unavailable"}

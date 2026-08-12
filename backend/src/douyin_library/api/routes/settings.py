@@ -90,7 +90,13 @@ async def validate_douyin_cookie(
 async def get_douyin_cookie_status(
     store: Annotated[CookieStore, Depends(get_cookie_store)],
 ) -> dict[str, bool]:
-    return {"configured": bool(store.read())}
+    try:
+        return {"configured": bool(store.read())}
+    except CookieStoreUnavailableError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="douyin_cookie_store_unavailable",
+        ) from exc
 
 
 @router.put(
@@ -126,5 +132,11 @@ async def save_douyin_cookie(
 async def delete_douyin_cookie(
     store: Annotated[CookieStore, Depends(get_cookie_store)],
 ) -> dict[str, bool]:
-    store.delete()
+    try:
+        store.delete()
+    except CookieStoreUnavailableError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="douyin_cookie_store_unavailable",
+        ) from exc
     return {"configured": False}
