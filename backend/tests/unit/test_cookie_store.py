@@ -1,4 +1,6 @@
-from douyin_library.security.cookie_store import CookieStore
+import pytest
+
+from douyin_library.security.cookie_store import CookieStore, CookieStoreUnavailableError
 
 
 class FakeKeyring:
@@ -13,6 +15,11 @@ class FakeKeyring:
 
     def delete_password(self, service_name: str, username: str) -> None:
         self.values.pop((service_name, username), None)
+
+
+class UnavailableKeyring(FakeKeyring):
+    def set_password(self, service_name: str, username: str, password: str) -> None:
+        raise OSError(1312, "credential store unavailable")
 
 
 def test_cookie_is_only_available_from_keyring() -> None:
@@ -33,3 +40,13 @@ def test_cookie_can_be_deleted_from_keyring() -> None:
     store.delete()
 
     assert store.read() is None
+
+
+def test_cookie_write_failure_is_wrapped_without_exposing_secret() -> None:
+    store = CookieStore(keyring_backend=UnavailableKeyring())
+
+    with pytest.raises(CookieStoreUnavailableError) as error:
+        store.save("sessionid=super-secret")
+
+    assert str(error.value) == "Windows credential store is unavailable"
+    assert "super-secret" not in str(error.value)

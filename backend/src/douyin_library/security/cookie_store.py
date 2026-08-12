@@ -5,6 +5,10 @@ from typing import Protocol
 import keyring
 
 
+class CookieStoreUnavailableError(RuntimeError):
+    pass
+
+
 class KeyringBackend(Protocol):
     def set_password(self, service_name: str, username: str, password: str) -> None: ...
 
@@ -21,7 +25,12 @@ class CookieStore:
         self._keyring = keyring_backend or keyring
 
     def save(self, cookie: str) -> None:
-        self._keyring.set_password(self.service_name, self.username, cookie)
+        try:
+            self._keyring.set_password(self.service_name, self.username, cookie)
+        except Exception as exc:  # noqa: BLE001
+            raise CookieStoreUnavailableError(
+                "Windows credential store is unavailable"
+            ) from exc
 
     def read(self) -> str | None:
         return self._keyring.get_password(self.service_name, self.username)

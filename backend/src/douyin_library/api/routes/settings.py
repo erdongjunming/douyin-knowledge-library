@@ -1,13 +1,15 @@
+import logging
 from typing import Annotated, Protocol
 
 from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel, Field
 
 from douyin_library.config import Settings, diagnostics
-from douyin_library.security.cookie_store import CookieStore
+from douyin_library.security.cookie_store import CookieStore, CookieStoreUnavailableError
 from douyin_library.upstream.jiji_gateway import JijiGateway
 
 router = APIRouter(prefix="/api/settings", tags=["settings"])
+logger = logging.getLogger(__name__)
 
 
 class CookieValidationRequest(BaseModel):
@@ -106,7 +108,14 @@ async def save_douyin_cookie(
             status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
             detail="douyin_cookie_invalid",
         )
-    store.save(payload.cookie)
+    try:
+        store.save(payload.cookie)
+    except CookieStoreUnavailableError as exc:
+        logger.warning("Douyin credential store unavailable: %s", type(exc.__cause__).__name__)
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="douyin_cookie_store_unavailable",
+        ) from exc
     return {"configured": True, **result}
 
 

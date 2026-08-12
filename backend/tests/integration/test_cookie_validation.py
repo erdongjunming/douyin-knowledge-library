@@ -5,6 +5,7 @@ import pytest
 
 from douyin_library.api.routes.settings import get_cookie_store, get_cookie_validator
 from douyin_library.main import app
+from douyin_library.security.cookie_store import CookieStoreUnavailableError
 
 
 class FakeCookieValidator:
@@ -41,6 +42,11 @@ class MemoryCookieStore:
 
     def delete(self) -> None:
         self.value = None
+
+
+class UnavailableCookieStore(MemoryCookieStore):
+    def save(self, cookie: str) -> None:
+        raise CookieStoreUnavailableError("Windows credential store is unavailable")
 
 
 @pytest.mark.asyncio
@@ -92,6 +98,25 @@ async def test_valid_cookie_is_saved_only_after_validation() -> None:
     }
     assert store.read() == "sessionid=super-secret; ttwid=opaque"
     assert "cookie" not in response.text.lower()
+
+
+@pytest.mark.asyncio
+async def test_cookie_store_failure_returns_safe_service_error() -> None:
+    app.dependency_overrides[get_cookie_validator] = lambda: FakeCookieValidator()
+    app.dependency_overrides[get_cookie_store] = lambda: UnavailableCookieStore()
+    try:
+        transport = httpx.ASGITransport(app=app, raise_app_exceptions=False)
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            response = await client.put(
+                "/api/settings/douyin-cookie",
+                json={"cookie": "sessionid=super-secret; ttwid=opaque"},
+            )
+    finally:
+        app.dependency_overrides.clear()
+
+    assert response.status_code == 503
+    assert response.json() == {"detail": "douyin_cookie_store_unavailable"}
+    assert "super-secret" not in response.text
 
 
 @pytest.mark.asyncio

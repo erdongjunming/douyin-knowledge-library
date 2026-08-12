@@ -189,6 +189,38 @@ it("validates and saves a douyin cookie without retaining the secret", async () 
   )
 })
 
+it("explains when the Windows credential store is unavailable", async () => {
+  vi.spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
+    const path = String(input)
+    if (path === "/api/settings/douyin-cookie" && init?.method === "PUT") {
+      return new Response(JSON.stringify({ detail: "douyin_cookie_store_unavailable" }), {
+        status: 503,
+        headers: { "Content-Type": "application/json" },
+      })
+    }
+    if (path === "/api/settings/douyin-cookie") {
+      return new Response(JSON.stringify({ configured: false }), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      })
+    }
+    return new Response(JSON.stringify({ status: "ok" }), {
+      status: 200,
+      headers: { "Content-Type": "application/json" },
+    })
+  })
+
+  render(<App />)
+  fireEvent.click(screen.getByRole("button", { name: "设置" }))
+  fireEvent.change(await screen.findByLabelText("抖音 Cookie"), {
+    target: { value: "sessionid=super-secret" },
+  })
+  fireEvent.click(screen.getByRole("button", { name: "验证并保存" }))
+
+  expect(await screen.findByText("Windows 凭据库当前不可用，请在普通用户会话中启动后端后重试。")).toBeVisible()
+  expect(screen.queryByText(/super-secret/)).not.toBeInTheDocument()
+})
+
 it("removes a configured douyin cookie", async () => {
   const fetchMock = vi.spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
     const path = String(input)

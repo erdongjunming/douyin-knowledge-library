@@ -77,6 +77,10 @@ const viewTitles: Record<ViewKey, string> = {
   settings: "运行设置",
 }
 
+const apiErrorMessages: Record<string, string> = {
+  douyin_cookie_store_unavailable: "Windows 凭据库当前不可用，请在普通用户会话中启动后端后重试。",
+}
+
 async function apiJson<T>(path: string, init?: RequestInit): Promise<T> {
   const response = await fetch(path, {
     headers: { "Content-Type": "application/json" },
@@ -95,7 +99,8 @@ async function apiJson<T>(path: string, init?: RequestInit): Promise<T> {
   }
   if (!response.ok) {
     const detail = body && typeof body === "object" && "detail" in body ? body.detail : null
-    throw new Error(typeof detail === "string" ? detail : `本地服务请求失败 (${response.status})`)
+    const message = typeof detail === "string" ? apiErrorMessages[detail] || detail : null
+    throw new Error(message || `本地服务请求失败 (${response.status})`)
   }
   return body as T
 }
