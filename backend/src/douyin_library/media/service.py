@@ -42,11 +42,32 @@ class WorkMediaService:
             raise RuntimeError(download.error_detail or download.error_code or "download_failed")
 
         result = MediaPipeline(self.layout, self.media_tool).process(
-            work.aweme_id, download.video_path
+            work.aweme_id,
+            download.video_path,
+            cover_source=download.cover_path,
         )
         self._save_assets(work.id, result)
         self.session.commit()
+        self._remove_download_artifacts(
+            raw_dir,
+            download.cover_path,
+            download.metadata_path,
+        )
         return result
+
+    @staticmethod
+    def _remove_download_artifacts(
+        raw_dir: Path,
+        cover_path: Path | None,
+        metadata_path: Path | None,
+    ) -> None:
+        for path in (cover_path, metadata_path):
+            if path is not None and path.is_file() and path.parent == raw_dir:
+                path.unlink()
+        try:
+            raw_dir.rmdir()
+        except OSError:
+            pass
 
     def _save_assets(self, work_id: int, result: MediaProcessResult) -> None:
         self._upsert(

@@ -127,6 +127,7 @@ class JobQueue:
         if status == "succeeded":
             job.stage = "complete"
             job.progress = 1.0
+            job.next_retry_at = None
         if status in TERMINAL_STATUSES:
             job.finished_at = datetime.now(UTC)
         self.session.commit()

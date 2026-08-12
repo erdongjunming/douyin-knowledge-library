@@ -64,3 +64,25 @@ def test_download_failure_uses_retry_schedule(tmp_path: Path) -> None:
         assert retried.next_retry_at is not None
         retry_at = retried.next_retry_at.replace(tzinfo=UTC)
         assert before + timedelta(seconds=55) <= retry_at <= before + timedelta(seconds=65)
+
+
+def test_successful_retry_preserves_last_failure_for_audit(tmp_path: Path) -> None:
+    engine = create_engine(f"sqlite:///{tmp_path / 'library.db'}")
+    create_schema(engine)
+
+    with Session(engine) as session:
+        queue = JobQueue(session)
+        job = queue.create(kind="download_work")
+        queue.claim_next()
+        queue.fail(job.id, error_code="network_error", error_detail="offline")
+        retried = queue.get(job.id)
+        retried.next_retry_at = datetime.now(UTC) - timedelta(seconds=1)
+        session.commit()
+
+        queue.claim_next()
+        succeeded = queue.transition(job.id, "succeeded")
+
+        assert succeeded.attempts == 1
+        assert succeeded.error_code == "network_error"
+        assert succeeded.error_detail == "offline"
+        assert succeeded.next_retry_at is None

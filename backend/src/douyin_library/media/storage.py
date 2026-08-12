@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import shutil
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -64,7 +65,13 @@ class MediaPipeline:
         self.layout = layout
         self.tool = tool
 
-    def process(self, aweme_id: str, source: Path) -> MediaProcessResult:
+    def process(
+        self,
+        aweme_id: str,
+        source: Path,
+        *,
+        cover_source: Path | None = None,
+    ) -> MediaProcessResult:
         self.layout.initialize()
         source_probe = self.tool.probe(source)
         audio_path = self.layout.audio_path(aweme_id)
@@ -83,7 +90,14 @@ class MediaPipeline:
         if not verified:
             raise RuntimeError("extracted audio failed validation")
 
-        self.tool.extract_cover(source, cover_path)
+        if (
+            cover_source is not None
+            and cover_source.is_file()
+            and cover_source.stat().st_size > 0
+        ):
+            shutil.copyfile(cover_source, cover_path)
+        else:
+            self.tool.extract_cover(source, cover_path)
         loudness = self.tool.analyze_loudness(audio_path)
         metadata = {
             "aweme_id": aweme_id,

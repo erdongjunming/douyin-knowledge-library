@@ -61,5 +61,5 @@ def serialize_job(job: Job) -> dict[str, Any]:
         "stage": job.stage,
         "progress": job.progress,
         "attempts": job.attempts,
-        "error_code": job.error_code,
+        "error_code": None if job.status == "succeeded" else job.error_code,
     }
