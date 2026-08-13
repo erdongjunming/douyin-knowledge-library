@@ -1,3 +1,4 @@
+import json
 from pathlib import Path
 from typing import Any
 
@@ -8,7 +9,7 @@ from sqlalchemy.orm import Session
 from douyin_library.config import Settings
 from douyin_library.db import create_schema
 from douyin_library.jobs.runtime import build_worker_runtime
-from douyin_library.models import Analysis, Job, Transcript, Work
+from douyin_library.models import Analysis, Job, ProcessingAudit, Transcript, Work
 from douyin_library.upstream.contracts import (
     DiscoveredAuthor,
     DiscoveredWork,
@@ -113,6 +114,17 @@ async def test_creator_worker_reads_cookie_and_enqueues_new_media(tmp_path: Path
         assert gateways[0][1].closed is True
         stored_jobs = runtime.session.scalars(select(Job))
         assert all("runtime-secret" not in (job.payload_json or "") for job in stored_jobs)
+        audit = runtime.session.scalar(select(ProcessingAudit))
+        assert audit is not None
+        assert audit.operation == "sync_creator"
+        assert audit.sync_run_id is not None
+        assert json.loads(audit.request_json) == {"reference": "sec-knowledge"}
+        response = json.loads(audit.response_json or "{}")
+        assert response["discovered_count"] == 1
+        assert response["new_work_count"] == 1
+        assert "runtime-secret" not in " ".join(
+            [audit.request_json, audit.response_json or "", audit.stdout or "", audit.stderr or ""]
+        )
     finally:
         runtime.close()
         engine.dispose()
@@ -147,7 +159,9 @@ async def test_favorites_worker_enqueues_new_media(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
-async def test_download_worker_processes_media_without_fake_ai_records(tmp_path: Path) -> None:
+async def test_download_worker_enqueues_transcription_without_fake_ai_records(
+    tmp_path: Path,
+) -> None:
     engine = create_engine(f"sqlite:///{tmp_path / 'library.db'}")
     create_schema(engine)
     with Session(engine) as setup_session:
@@ -181,6 +195,12 @@ async def test_download_worker_processes_media_without_fake_ai_records(tmp_path:
 
         assert runtime.queue.get(job.id).status == "succeeded"
         assert processed == [work_id]
+        transcribe_job = runtime.session.scalar(
+            select(Job).where(Job.kind == "transcribe_work")
+        )
+        assert transcribe_job is not None
+        assert transcribe_job.work_id == work_id
+        assert transcribe_job.status == "pending"
         assert runtime.session.scalar(select(func.count()).select_from(Transcript)) == 0
         assert runtime.session.scalar(select(func.count()).select_from(Analysis)) == 0
     finally:

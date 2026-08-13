@@ -10,7 +10,7 @@ from douyin_library.api.routes.jobs import router as jobs_router
 from douyin_library.api.routes.settings import router as settings_router
 from douyin_library.api.routes.works import router as works_router
 from douyin_library.config import Settings
-from douyin_library.jobs.runtime import build_worker_runtime
+from douyin_library.jobs.runtime import build_worker_runtime, enqueue_missing_transcriptions
 from douyin_library.runtime import initialize_runtime
 
 
@@ -19,6 +19,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     settings = Settings()
     runtime = initialize_runtime(settings)
     worker_runtime = build_worker_runtime(runtime.engine, settings)
+    enqueue_missing_transcriptions(worker_runtime.queue)
     worker_task = asyncio.create_task(
         worker_runtime.worker.run(),
         name="douyin-library-job-worker",

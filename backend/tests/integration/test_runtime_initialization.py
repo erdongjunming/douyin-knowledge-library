@@ -44,6 +44,7 @@ async def test_lifespan_starts_and_stops_worker(monkeypatch) -> None:
     class FakeWorkerRuntime:
         def __init__(self) -> None:
             self.worker = FakeWorker()
+            self.queue = object()
             self.closed = False
 
         def close(self) -> None:
@@ -52,6 +53,7 @@ async def test_lifespan_starts_and_stops_worker(monkeypatch) -> None:
     engine = FakeEngine()
     runtime = type("FakeRuntime", (), {"engine": engine})()
     worker_runtime = FakeWorkerRuntime()
+    backfilled: list[object] = []
     monkeypatch.setattr(main_module, "initialize_runtime", lambda settings: runtime)
     monkeypatch.setattr(
         main_module,
@@ -59,10 +61,16 @@ async def test_lifespan_starts_and_stops_worker(monkeypatch) -> None:
         lambda runtime_engine, settings: worker_runtime,
         raising=False,
     )
+    monkeypatch.setattr(
+        main_module,
+        "enqueue_missing_transcriptions",
+        lambda queue: backfilled.append(queue),
+    )
 
     async with main_module.lifespan(app):
         await asyncio.wait_for(worker_runtime.worker.started.wait(), timeout=0.1)
         assert app.state.worker_runtime is worker_runtime
+        assert backfilled == [worker_runtime.queue]
 
     assert worker_runtime.worker.stopped.is_set()
     assert worker_runtime.closed is True

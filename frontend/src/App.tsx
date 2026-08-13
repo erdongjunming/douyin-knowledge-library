@@ -11,6 +11,7 @@ import {
   Search,
   Settings,
   Trash2,
+  X,
 } from "lucide-react"
 import { useEffect, useMemo, useState } from "react"
 
@@ -48,6 +49,21 @@ type Work = {
   creator_nickname: string | null
   published_at: string | null
   topics: string[]
+  transcript_status: string | null
+  transcript_preview: string | null
+}
+
+type WorkDetail = {
+  id: number
+  aweme_id?: string
+  description?: string | null
+  transcript: {
+    engine: string
+    model: string
+    language: string | null
+    text: string
+    segments: Array<{ start?: number; end?: number; text?: string }>
+  } | null
 }
 
 type CookieStatus = {
@@ -290,6 +306,8 @@ function LibraryView() {
   const [works, setWorks] = useState<Work[]>([])
   const [query, setQuery] = useState("")
   const [error, setError] = useState<string | null>(null)
+  const [selected, setSelected] = useState<WorkDetail | null>(null)
+  const [detailBusy, setDetailBusy] = useState(false)
   useEffect(() => {
     void apiJson<{ items: Work[] }>("/api/works?limit=100").then((result) => setWorks(result.items)).catch((reason) => setError(reason instanceof Error ? reason.message : "无法读取资料库"))
   }, [])
@@ -298,10 +316,22 @@ function LibraryView() {
     if (!normalized) return works
     return works.filter((work) => `${work.description || ""} ${work.creator_nickname || ""} ${work.topics.join(" ")}`.toLowerCase().includes(normalized))
   }, [query, works])
+  const openTranscript = async (work: Work) => {
+    setDetailBusy(true)
+    setError(null)
+    try {
+      setSelected(await apiJson<WorkDetail>(`/api/works/${work.id}`))
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : "无法读取转写")
+    } finally {
+      setDetailBusy(false)
+    }
+  }
   return (
     <div className="content-grid wide-grid">
       <section className="library-toolbar"><div><p className="section-kicker">LIBRARY</p><h2>从转写里找到知识。</h2></div><label className="search-field"><Search size={17} aria-hidden="true" /><input aria-label="筛选资料" value={query} onChange={(event) => setQuery(event.target.value)} placeholder="筛选主播、主题或关键词" /></label></section>
-      <section className="panel table-panel"><div className="panel-heading"><div><p className="eyebrow">已收集作品</p><h3>{filtered.length} 条资料</h3></div><BookOpenText size={20} aria-hidden="true" /></div>{error ? <StatusMessage tone="error">{error}</StatusMessage> : filtered.length === 0 ? <p className="empty-copy">还没有匹配的资料。先同步主播或收藏，再回来筛选。</p> : <div className="table-scroll"><table><thead><tr><th>内容</th><th>主播</th><th>主题</th><th>资产</th></tr></thead><tbody>{filtered.map((work) => <tr key={work.id}><td><strong>{work.description || "无标题作品"}</strong><span className="cell-sub">aweme {work.aweme_id}</span></td><td>{work.creator_nickname || "未知主播"}</td><td><div className="topic-list">{work.topics.slice(0, 3).map((topic) => <span key={topic}>{topic}</span>)}</div></td><td>{work.asset_kinds.length ? work.asset_kinds.join(" · ") : "待处理"}</td></tr>)}</tbody></table></div>}</section>
+      <section className="panel table-panel"><div className="panel-heading"><div><p className="eyebrow">已收集作品</p><h3>{filtered.length} 条资料</h3></div><BookOpenText size={20} aria-hidden="true" /></div>{error ? <StatusMessage tone="error">{error}</StatusMessage> : filtered.length === 0 ? <p className="empty-copy">还没有匹配的资料。先同步主播或收藏，再回来筛选。</p> : <div className="table-scroll"><table><thead><tr><th>内容</th><th>主播</th><th>主题</th><th>资产</th><th aria-label="操作" /></tr></thead><tbody>{filtered.map((work) => <tr key={work.id}><td><strong>{work.description || "无标题作品"}</strong><span className="cell-sub">{work.transcript_preview || `aweme ${work.aweme_id}`}</span></td><td>{work.creator_nickname || "未知主播"}</td><td><div className="topic-list">{work.topics.slice(0, 3).map((topic) => <span key={topic}>{topic}</span>)}</div></td><td>{work.asset_kinds.length ? work.asset_kinds.join(" · ") : "待处理"}</td><td>{work.transcript_status === "succeeded" ? <button className="icon-button" type="button" aria-label={`阅读${work.description || "无标题作品"}的转写`} title="阅读转写" disabled={detailBusy} onClick={() => void openTranscript(work)}><BookOpenText size={16} aria-hidden="true" /></button> : <span className="cell-sub">待转写</span>}</td></tr>)}</tbody></table></div>}</section>
+      {selected && <section className="transcript-reader" aria-labelledby="transcript-title"><div className="reader-heading"><div><p className="eyebrow">TRANSCRIPT</p><h3 id="transcript-title">{selected.description || "作品转写"}</h3><span>{selected.transcript?.model || "尚无转写"}</span></div><button className="icon-button" type="button" aria-label="关闭转写" title="关闭" onClick={() => setSelected(null)}><X size={16} aria-hidden="true" /></button></div>{selected.transcript ? <article>{selected.transcript.text}</article> : <p className="empty-copy">这条作品尚无成功转写。</p>}</section>}
     </div>
   )
 }

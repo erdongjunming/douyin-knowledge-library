@@ -4,10 +4,10 @@ import json
 from collections.abc import Mapping
 from datetime import UTC, datetime, timedelta
 
-from sqlalchemy import select
+from sqlalchemy import case, select
 from sqlalchemy.orm import Session
 
-from douyin_library.models import Job
+from douyin_library.models import Job, ProcessingAudit
 
 
 class JobTransitionError(ValueError):
@@ -108,10 +108,37 @@ class JobQueue:
                 Job.status == "pending",
                 (Job.next_retry_at.is_(None)) | (Job.next_retry_at <= now),
             )
-            .order_by(Job.created_at, Job.id)
+            .order_by(
+                case(
+                    (Job.kind.in_(("sync_creator", "sync_favorites")), 0),
+                    (Job.kind == "transcribe_work", 1),
+                    (Job.kind == "download_work", 2),
+                    (Job.kind == "analyze_work", 3),
+                    else_=4,
+                ),
+                Job.created_at,
+                Job.id,
+            )
         )
         if job is None:
             return None
+        job.status = "running"
+        job.started_at = now
+        self.session.commit()
+        self.session.refresh(job)
+        return job
+
+    def claim(self, job_id: int, *, ignore_schedule: bool = False) -> Job:
+        job = self.get(job_id)
+        if job.status != "pending":
+            raise JobTransitionError(f"cannot_claim:{job.status}")
+        now = datetime.now(UTC)
+        if not ignore_schedule and job.next_retry_at is not None:
+            retry_at = job.next_retry_at
+            if retry_at.tzinfo is None:
+                retry_at = retry_at.replace(tzinfo=UTC)
+            if retry_at > now:
+                raise JobTransitionError("cannot_claim_before_retry")
         job.status = "running"
         job.started_at = now
         self.session.commit()
@@ -159,8 +186,21 @@ class JobQueue:
         stale_jobs = self.session.scalars(
             select(Job).where(Job.status == "running", Job.started_at < cutoff)
         ).all()
+        stale_job_ids = [job.id for job in stale_jobs]
         for job in stale_jobs:
             job.status = "pending"
             job.started_at = None
+        if stale_job_ids:
+            audits = self.session.scalars(
+                select(ProcessingAudit).where(
+                    ProcessingAudit.job_id.in_(stale_job_ids),
+                    ProcessingAudit.status == "running",
+                )
+            ).all()
+            finished_at = datetime.now(UTC)
+            for audit in audits:
+                audit.status = "failed"
+                audit.error = "worker_stale_recovered"
+                audit.finished_at = finished_at
         self.session.commit()
         return len(stale_jobs)

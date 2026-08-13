@@ -26,6 +26,7 @@ def test_initial_migration_creates_core_tables(tmp_path: Path) -> None:
         "transcript",
         "analysis",
         "job",
+        "processing_audit",
         "setting",
         "work_fts",
     }.issubset(tables)

@@ -189,6 +189,29 @@ class Job(Base):
     finished_at: Mapped[datetime | None]
 
 
+class ProcessingAudit(Base):
+    __tablename__ = "processing_audit"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    job_id: Mapped[int | None] = mapped_column(ForeignKey("job.id"), index=True)
+    work_id: Mapped[int | None] = mapped_column(ForeignKey("work.id"), index=True)
+    sync_run_id: Mapped[int | None] = mapped_column(ForeignKey("sync_run.id"), index=True)
+    operation: Mapped[str] = mapped_column(String(80), index=True)
+    processor: Mapped[str] = mapped_column(String(120))
+    model: Mapped[str | None] = mapped_column(String(160))
+    version: Mapped[str | None] = mapped_column(String(80))
+    request_json: Mapped[str] = mapped_column(Text)
+    response_json: Mapped[str | None] = mapped_column(Text)
+    stdout: Mapped[str | None] = mapped_column(Text)
+    stderr: Mapped[str | None] = mapped_column(Text)
+    input_files_json: Mapped[str | None] = mapped_column(Text)
+    output_files_json: Mapped[str | None] = mapped_column(Text)
+    status: Mapped[str] = mapped_column(String(24), default="running", index=True)
+    error: Mapped[str | None] = mapped_column(Text)
+    started_at: Mapped[datetime] = mapped_column(default=utc_now)
+    finished_at: Mapped[datetime | None]
+
+
 class Setting(Base):
     __tablename__ = "setting"
 

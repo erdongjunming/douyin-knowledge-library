@@ -86,3 +86,41 @@ def test_successful_retry_preserves_last_failure_for_audit(tmp_path: Path) -> No
         assert succeeded.error_code == "network_error"
         assert succeeded.error_detail == "offline"
         assert succeeded.next_retry_at is None
+
+
+def test_transcription_is_claimed_before_older_download_backlog(tmp_path: Path) -> None:
+    engine = create_engine(f"sqlite:///{tmp_path / 'library.db'}")
+    create_schema(engine)
+
+    with Session(engine) as session:
+        first = Work(aweme_id="731")
+        second = Work(aweme_id="732")
+        session.add_all([first, second])
+        session.commit()
+        queue = JobQueue(session)
+        download = queue.create(kind="download_work", work_id=first.id)
+        transcribe = queue.create(kind="transcribe_work", work_id=second.id)
+
+        claimed = queue.claim_next()
+
+        assert claimed is not None
+        assert claimed.id == transcribe.id
+        assert queue.get(download.id).status == "pending"
+
+
+def test_specific_pending_job_can_be_claimed_without_claiming_queue_head(
+    tmp_path: Path,
+) -> None:
+    engine = create_engine(f"sqlite:///{tmp_path / 'library.db'}")
+    create_schema(engine)
+
+    with Session(engine) as session:
+        queue = JobQueue(session)
+        first = queue.create(kind="transcribe_work")
+        target = queue.create(kind="sync_creator", payload={"reference": "target"})
+
+        claimed = queue.claim(target.id, ignore_schedule=True)
+
+        assert claimed.id == target.id
+        assert claimed.status == "running"
+        assert queue.get(first.id).status == "pending"

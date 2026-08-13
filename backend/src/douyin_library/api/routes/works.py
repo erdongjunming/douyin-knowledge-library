@@ -5,14 +5,14 @@ from collections.abc import AsyncIterator
 from typing import Annotated, Any
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
-from sqlalchemy import select
+from sqlalchemy import case, exists, select
 from sqlalchemy.orm import Session
 
 from douyin_library.api.dependencies import get_runtime_session
 from douyin_library.config import Settings
 from douyin_library.media.service import WorkMediaService
 from douyin_library.media.storage import StorageLayout
-from douyin_library.models import Analysis, Asset, Creator, Work
+from douyin_library.models import Analysis, Asset, Creator, Transcript, Work
 from douyin_library.security.cookie_store import CookieStore
 from douyin_library.upstream.jiji_gateway import JijiGateway
 
@@ -75,7 +75,20 @@ def list_works(
     statement = (
         select(Work, Creator.nickname)
         .outerjoin(Creator, Work.creator_id == Creator.id)
-        .order_by(Work.published_at.desc().nullslast(), Work.id.desc())
+        .order_by(
+            case(
+                (
+                    exists().where(
+                        Transcript.work_id == Work.id,
+                        Transcript.status == "succeeded",
+                    ),
+                    0,
+                ),
+                else_=1,
+            ),
+            Work.published_at.desc().nullslast(),
+            Work.id.desc(),
+        )
         .limit(limit)
     )
     if query and query.strip():
@@ -110,6 +123,18 @@ def list_works(
                 str(topic) for topic in topics if str(topic).strip()
             )
 
+    transcripts = session.scalars(
+        select(Transcript)
+        .where(
+            Transcript.work_id.in_(work_ids),
+            Transcript.status == "succeeded",
+        )
+        .order_by(Transcript.id.desc())
+    ).all() if work_ids else []
+    transcript_by_work: dict[int, Transcript] = {}
+    for transcript in transcripts:
+        transcript_by_work.setdefault(transcript.work_id, transcript)
+
     return {
         "items": [
             {
@@ -122,7 +147,60 @@ def list_works(
                 "creator_nickname": nickname,
                 "published_at": work.published_at.isoformat() if work.published_at else None,
                 "topics": sorted(set(topics_by_work.get(work.id, []))),
+                "transcript_status": (
+                    "succeeded" if work.id in transcript_by_work else None
+                ),
+                "transcript_preview": _preview(
+                    transcript_by_work[work.id].text
+                    if work.id in transcript_by_work
+                    else None
+                ),
             }
             for work, nickname in rows
         ]
     }
+
+
+@router.get("/{work_id}")
+def get_work(
+    work_id: int,
+    session: Annotated[Session, Depends(get_work_session)],
+) -> dict[str, Any]:
+    work = session.get(Work, work_id)
+    if work is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="work_not_found")
+    transcript = session.scalar(
+        select(Transcript)
+        .where(Transcript.work_id == work.id, Transcript.status == "succeeded")
+        .order_by(Transcript.id.desc())
+    )
+    segments: list[Any] = []
+    if transcript and transcript.segments_json:
+        try:
+            parsed = json.loads(transcript.segments_json)
+            segments = parsed if isinstance(parsed, list) else []
+        except json.JSONDecodeError:
+            segments = []
+    return {
+        "id": work.id,
+        "aweme_id": work.aweme_id,
+        "description": work.description,
+        "transcript": (
+            {
+                "engine": transcript.engine,
+                "model": transcript.model,
+                "language": transcript.language,
+                "text": transcript.text,
+                "segments": segments,
+            }
+            if transcript
+            else None
+        ),
+    }
+
+
+def _preview(value: str | None, *, limit: int = 120) -> str | None:
+    normalized = " ".join((value or "").split())
+    if not normalized:
+        return None
+    return normalized if len(normalized) <= limit else f"{normalized[:limit]}..."

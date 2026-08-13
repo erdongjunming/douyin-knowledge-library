@@ -18,6 +18,9 @@ class CreatorSyncResult:
     new_work_ids: tuple[int, ...]
     discovered_count: int
     status: str
+    sync_run_id: int
+    audit_pages: tuple[dict[str, Any], ...]
+    error_detail: str | None = None
 
     @property
     def complete(self) -> bool:
@@ -85,8 +88,10 @@ class CreatorSyncService:
         new_work_ids: list[int] = []
         new_work_count = 0
         discovered_count = 0
+        audit_pages: list[dict[str, Any]] = []
         try:
             async for page in self.gateway.creator_posts(creator.sec_uid):
+                audit_pages.append(_audit_page(page))
                 for item in page.items:
                     work = self.session.scalar(
                         select(Work).where(Work.aweme_id == item.aweme_id)
@@ -127,6 +132,9 @@ class CreatorSyncService:
                 new_work_ids=tuple(new_work_ids),
                 discovered_count=discovered_count,
                 status="incomplete",
+                sync_run_id=run.id,
+                audit_pages=tuple(audit_pages),
+                error_detail=str(exc),
             )
 
         for relation in self.session.scalars(
@@ -146,6 +154,8 @@ class CreatorSyncService:
             new_work_ids=tuple(new_work_ids),
             discovered_count=discovered_count,
             status="complete",
+            sync_run_id=run.id,
+            audit_pages=tuple(audit_pages),
         )
 
     @staticmethod
@@ -159,3 +169,17 @@ class CreatorSyncService:
         work.availability = "available"
         work.stats_json = json.dumps(item.stats, ensure_ascii=False)
         work.raw_metadata_json = json.dumps(item.raw_payload, ensure_ascii=False)
+
+
+def _audit_page(page: Any) -> dict[str, Any]:
+    raw_response = getattr(page, "raw_response", None)
+    if isinstance(raw_response, dict) and raw_response:
+        return raw_response
+    return {
+        "source_external_id": page.source_external_id,
+        "source_name": getattr(page, "source_name", None),
+        "cursor": page.cursor,
+        "has_more": page.has_more,
+        "raw_summary": getattr(page, "raw_summary", {}),
+        "items": [getattr(item, "raw_payload", {}) for item in page.items],
+    }

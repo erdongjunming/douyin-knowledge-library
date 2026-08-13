@@ -44,10 +44,19 @@ class StorageLayout:
         self.audio = self.root / "audio"
         self.covers = self.root / "cover"
         self.metadata = self.root / "metadata"
+        self.transcript = self.root / "transcript"
         self.raw = self.root / "raw"
 
     def initialize(self) -> None:
-        for directory in (self.root, self.data, self.audio, self.covers, self.metadata, self.raw):
+        for directory in (
+            self.root,
+            self.data,
+            self.audio,
+            self.covers,
+            self.metadata,
+            self.transcript,
+            self.raw,
+        ):
             directory.mkdir(parents=True, exist_ok=True)
 
     def audio_path(self, aweme_id: str) -> Path:
@@ -58,6 +67,15 @@ class StorageLayout:
 
     def metadata_path(self, aweme_id: str) -> Path:
         return self.metadata / f"{aweme_id}.json"
+
+    def transcript_dir(self, aweme_id: str) -> Path:
+        return self.transcript / aweme_id
+
+    def transcript_text_path(self, aweme_id: str) -> Path:
+        return self.transcript_dir(aweme_id) / "transcript.txt"
+
+    def transcript_segments_path(self, aweme_id: str) -> Path:
+        return self.transcript_dir(aweme_id) / "segments.json"
 
 
 class MediaPipeline:

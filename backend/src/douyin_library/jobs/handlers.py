@@ -20,6 +20,14 @@ class JobHandlers:
         job = self.queue.claim_next()
         if job is None:
             return False
+        await self._run_claimed(job)
+        return True
+
+    async def run_job(self, job_id: int, *, ignore_schedule: bool = False) -> None:
+        job = self.queue.claim(job_id, ignore_schedule=ignore_schedule)
+        await self._run_claimed(job)
+
+    async def _run_claimed(self, job: Any) -> None:
         handler = self._handlers.get(job.kind)
         if handler is None:
             self.queue.fail(
@@ -27,7 +35,7 @@ class JobHandlers:
                 error_code="handler_not_registered",
                 error_detail=f"No handler registered for {job.kind}",
             )
-            return True
+            return
         try:
             await handler(job)
         except Exception as exc:  # noqa: BLE001
@@ -38,4 +46,3 @@ class JobHandlers:
             )
         else:
             self.queue.transition(job.id, "succeeded")
-        return True

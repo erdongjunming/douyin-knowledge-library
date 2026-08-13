@@ -41,6 +41,7 @@ class DiscoveryPage:
     source_external_id: str
     source_name: str | None = None
     raw_summary: dict[str, Any] = field(default_factory=dict)
+    raw_response: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass(frozen=True, slots=True)

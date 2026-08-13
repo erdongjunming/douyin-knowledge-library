@@ -259,3 +259,47 @@ it("removes a configured douyin cookie", async () => {
     expect.objectContaining({ method: "DELETE" }),
   )
 })
+
+it("opens and reads a completed transcript from the library", async () => {
+  vi.spyOn(globalThis, "fetch").mockImplementation(async (input) => {
+    const path = String(input)
+    if (path === "/api/works?limit=100") {
+      return new Response(JSON.stringify({ items: [{
+        id: 1,
+        aweme_id: "731",
+        description: "知识口述",
+        media_type: "video",
+        availability: "available",
+        asset_kinds: ["audio", "transcript_text"],
+        creator_nickname: "知识主播",
+        published_at: null,
+        topics: [],
+        transcript_status: "succeeded",
+        transcript_preview: "这是完整转写正文。",
+      }] }), { status: 200, headers: { "Content-Type": "application/json" } })
+    }
+    if (path === "/api/works/1") {
+      return new Response(JSON.stringify({
+        id: 1,
+        transcript: {
+          engine: "qwen3-asr",
+          model: "Qwen/Qwen3-ASR-0.6B",
+          language: "Chinese",
+          text: "这是完整转写正文。第二段也在这里。",
+          segments: [],
+        },
+      }), { status: 200, headers: { "Content-Type": "application/json" } })
+    }
+    return new Response(JSON.stringify({ status: "ok" }), {
+      status: 200,
+      headers: { "Content-Type": "application/json" },
+    })
+  })
+
+  render(<App />)
+  fireEvent.click(screen.getByRole("button", { name: "资料库" }))
+  fireEvent.click(await screen.findByRole("button", { name: "阅读知识口述的转写" }))
+
+  expect(await screen.findByText("这是完整转写正文。第二段也在这里。")).toBeVisible()
+  expect(screen.getByText("Qwen/Qwen3-ASR-0.6B")).toBeVisible()
+})

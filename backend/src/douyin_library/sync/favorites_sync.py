@@ -26,6 +26,9 @@ class FavoritesSyncResult:
     unique_work_count: int
     new_work_ids: tuple[int, ...]
     status: str
+    sync_run_id: int
+    audit_pages: tuple[dict[str, Any], ...]
+    error_detail: str | None = None
 
     @property
     def complete(self) -> bool:
@@ -54,8 +57,10 @@ class FavoritesSyncService:
         new_work_ids: set[int] = set()
         default_count = 0
         folder_count = 0
+        audit_pages: list[dict[str, Any]] = []
         try:
             async for page in self.gateway.all_favorites():
+                audit_pages.append(_audit_page(page))
                 is_default = page.source_external_id == "default"
                 kind = "favorite_default" if is_default else "favorite_folder"
                 source = self._source(kind, page.source_external_id, page.source_name)
@@ -111,6 +116,9 @@ class FavoritesSyncService:
                 unique_work_count=len(unique_work_ids),
                 new_work_ids=tuple(sorted(new_work_ids)),
                 status="incomplete",
+                sync_run_id=run.id,
+                audit_pages=tuple(audit_pages),
+                error_detail=str(exc),
             )
 
         SourceReconciler(self.session).finish(
@@ -132,6 +140,8 @@ class FavoritesSyncService:
             unique_work_count=len(unique_work_ids),
             new_work_ids=tuple(sorted(new_work_ids)),
             status="complete",
+            sync_run_id=run.id,
+            audit_pages=tuple(audit_pages),
         )
 
     def _source(self, kind: str, external_id: str, name: str | None) -> Source:
@@ -192,3 +202,17 @@ class FavoritesSyncService:
         work.stats_json = json.dumps(item.stats, ensure_ascii=False)
         work.raw_metadata_json = json.dumps(item.raw_payload, ensure_ascii=False)
         return work, is_new
+
+
+def _audit_page(page: Any) -> dict[str, Any]:
+    raw_response = getattr(page, "raw_response", None)
+    if isinstance(raw_response, dict) and raw_response:
+        return raw_response
+    return {
+        "source_external_id": page.source_external_id,
+        "source_name": getattr(page, "source_name", None),
+        "cursor": page.cursor,
+        "has_more": page.has_more,
+        "raw_summary": getattr(page, "raw_summary", {}),
+        "items": [getattr(item, "raw_payload", {}) for item in page.items],
+    }

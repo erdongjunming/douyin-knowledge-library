@@ -173,4 +173,5 @@ def normalize_page(
             "cursor": str(cursor_value),
             "risk_flags": response.get("risk_flags") or {},
         },
+        raw_response=response,
     )
