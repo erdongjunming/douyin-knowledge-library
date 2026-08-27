@@ -11,6 +11,8 @@ from douyin_library.notes.contracts import (
     SegmentDisposition,
     SourceOmissionCandidate,
     SynthesisResult,
+    ThemeSection,
+    TimelineEntry,
 )
 from douyin_library.notes.coverage import CoverageValidator
 
@@ -41,11 +43,22 @@ def _disposition(
 
 
 def _synthesis(included_atom_ids: Iterable[str]) -> SynthesisResult:
+    atom_ids = list(included_atom_ids)
     return SynthesisResult(
         title="Title",
         overview="Overview",
         structure=[],
-        themes=[],
+        themes=(
+            [
+                ThemeSection(
+                    heading="Complete evidence",
+                    content="Complete evidence body",
+                    atom_ids=atom_ids,
+                )
+            ]
+            if atom_ids
+            else []
+        ),
         methods_and_steps=[],
         examples_and_counterexamples=[],
         boundaries_and_risks=[],
@@ -56,7 +69,7 @@ def _synthesis(included_atom_ids: Iterable[str]) -> SynthesisResult:
         timeline=[],
         promotions=[],
         tags=[],
-        included_atom_ids=list(included_atom_ids),
+        included_atom_ids=atom_ids,
     )
 
 
@@ -281,6 +294,18 @@ def test_step_sequence_gap_fails_verification() -> None:
     assert report.repairable is False
 
 
+def test_step_without_sequence_fails_verification() -> None:
+    extraction = _complete_extraction()
+    extraction.atoms[0].sequence = None
+    extraction.atoms[1].sequence = 1
+
+    report = _validate(extraction)
+
+    assert report.quality_gate == "failed"
+    assert report.steps_verified is False
+    assert report.repairable is False
+
+
 @pytest.mark.parametrize(
     ("atom_id", "verified_field"),
     [("A-example", "examples_verified"), ("A-condition", "conditions_verified")],
@@ -299,6 +324,18 @@ def test_relationless_examples_and_conditions_fail_verification(
     assert report.repairable is False
 
 
+def test_example_relation_to_unknown_atom_fails_verification() -> None:
+    extraction = _complete_extraction()
+    example = next(atom for atom in extraction.atoms if atom.id == "A-example")
+    example.relations = ["A-unknown"]
+
+    report = _validate(extraction)
+
+    assert report.quality_gate == "failed"
+    assert report.examples_verified is False
+    assert report.repairable is False
+
+
 def test_dropped_promotion_fails_as_repairable() -> None:
     extraction = _complete_extraction()
 
@@ -309,6 +346,135 @@ def test_dropped_promotion_fails_as_repairable() -> None:
 
     assert report.quality_gate == "failed"
     assert report.promotional_content_preserved is False
+    assert report.repairable is True
+
+
+def test_is_promotional_non_promotion_atom_cannot_be_dropped() -> None:
+    extraction = ExtractionResult(
+        atoms=[_atom("A-1", 0, is_promotional=True)],
+        dispositions=[_disposition(0, ["A-1"])],
+    )
+
+    report = _validate(extraction, segment_count=1, synthesis=_synthesis([]))
+
+    assert report.quality_gate == "failed"
+    assert report.promotional_content_preserved is False
+    assert report.repairable is True
+
+
+def test_promotion_with_wrong_disposition_is_nonrepairable() -> None:
+    extraction = ExtractionResult(
+        atoms=[_atom("A-1", 0, kind="promotion")],
+        dispositions=[_disposition(0, ["A-1"], "duplicate")],
+    )
+
+    report = _validate(extraction, segment_count=1)
+
+    assert report.quality_gate == "failed"
+    assert report.promotional_content_preserved is False
+    assert report.repairable is False
+
+
+@pytest.mark.parametrize("disposition_kind", ["included", "promotion"])
+def test_content_dispositions_require_an_atom(disposition_kind: str) -> None:
+    extraction = ExtractionResult(
+        atoms=[],
+        dispositions=[_disposition(0, [], disposition_kind)],
+    )
+
+    report = _validate(extraction, segment_count=1)
+
+    assert report.quality_gate == "failed"
+    assert report.repairable is False
+
+
+@pytest.mark.parametrize(
+    "disposition_kind",
+    ["duplicate", "transition", "unintelligible_asr"],
+)
+def test_non_content_dispositions_may_have_no_atoms(disposition_kind: str) -> None:
+    extraction = ExtractionResult(
+        atoms=[],
+        dispositions=[_disposition(0, [], disposition_kind)],
+    )
+
+    report = _validate(extraction, segment_count=1)
+
+    assert report.quality_gate == "passed"
+
+
+@pytest.mark.parametrize(
+    "section_field",
+    [
+        "themes",
+        "methods_and_steps",
+        "examples_and_counterexamples",
+        "boundaries_and_risks",
+        "promotions",
+    ],
+)
+def test_unknown_theme_section_atom_reference_is_nonrepairable(
+    section_field: str,
+) -> None:
+    extraction = _complete_extraction()
+    synthesis = _synthesis(atom.id for atom in extraction.atoms)
+    getattr(synthesis, section_field).append(
+        ThemeSection(
+            heading="Bad reference",
+            content="Bad reference body",
+            atom_ids=["A-unknown"],
+        )
+    )
+
+    report = _validate(extraction, synthesis=synthesis)
+
+    assert report.quality_gate == "failed"
+    assert report.repairable is False
+
+
+def test_unknown_timeline_atom_reference_is_nonrepairable() -> None:
+    extraction = _complete_extraction()
+    synthesis = _synthesis(atom.id for atom in extraction.atoms)
+    synthesis.timeline.append(
+        TimelineEntry(
+            segment_index=0,
+            disposition="included",
+            atom_ids=["A-unknown"],
+            content="Bad timeline reference",
+        )
+    )
+
+    report = _validate(extraction, synthesis=synthesis)
+
+    assert report.quality_gate == "failed"
+    assert report.repairable is False
+
+
+def test_body_reference_missing_from_included_ids_is_nonrepairable() -> None:
+    extraction = _complete_extraction()
+    synthesis = _synthesis(atom.id for atom in extraction.atoms if atom.id != "A-example")
+    synthesis.themes.append(
+        ThemeSection(
+            heading="Non-included reference",
+            content="Non-included reference body",
+            atom_ids=["A-example"],
+        )
+    )
+
+    report = _validate(extraction, synthesis=synthesis)
+
+    assert report.quality_gate == "failed"
+    assert report.repairable is False
+
+
+def test_included_atom_missing_from_body_is_repairable() -> None:
+    extraction = _complete_extraction()
+    synthesis = _synthesis(atom.id for atom in extraction.atoms)
+    synthesis.themes = []
+
+    report = _validate(extraction, synthesis=synthesis)
+
+    assert report.quality_gate == "failed"
     assert report.repairable is True
 
 

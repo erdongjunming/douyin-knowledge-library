@@ -58,6 +58,13 @@ class CoverageValidator:
         all_atoms_traceable = all(
             self._is_traceable(atom, segment_count) for atom in extraction.atoms
         )
+        body_atom_ids = self._body_atom_ids(synthesis)
+        body_id_set = set(body_atom_ids)
+        unknown_body_references = any(atom_id not in atom_by_id for atom_id in body_atom_ids)
+        non_included_body_references = any(
+            atom_id not in included_ids for atom_id in body_atom_ids
+        )
+        included_atoms_missing_from_body = included_ids - body_id_set
 
         review_counts = Counter(review.reviewed_segment_indexes)
         review_coverage_valid = (
@@ -91,6 +98,8 @@ class CoverageValidator:
                 duplicate_atom_ids,
                 not disposition_references_valid,
                 unknown_synthesis_references,
+                unknown_body_references,
+                non_included_body_references,
                 not all_atoms_traceable,
                 not steps_verified,
                 not examples_verified,
@@ -106,6 +115,7 @@ class CoverageValidator:
                 bool(review.source_omission_candidates),
                 bool(review.unsupported_draft_claims),
                 not promotion_inclusion_valid,
+                bool(included_atoms_missing_from_body),
             )
         )
         passed = not foundational_error and not repair_issue
@@ -141,6 +151,11 @@ class CoverageValidator:
         for disposition in dispositions:
             if disposition.segment_index not in expected_segments:
                 return False
+            if (
+                disposition.disposition in {"included", "promotion"}
+                and not disposition.atom_ids
+            ):
+                return False
             for atom_id in disposition.atom_ids:
                 atom = atom_by_id.get(atom_id)
                 if atom is None or atom.source_segment != disposition.segment_index:
@@ -155,8 +170,11 @@ class CoverageValidator:
     def _steps_are_contiguous(atoms: list[EvidenceAtom]) -> bool:
         sequences_by_topic: dict[str, list[int]] = defaultdict(list)
         for atom in atoms:
-            if atom.kind == "step" and atom.sequence is not None:
-                sequences_by_topic[atom.topic].append(atom.sequence)
+            if atom.kind != "step":
+                continue
+            if atom.sequence is None:
+                return False
+            sequences_by_topic[atom.topic].append(atom.sequence)
         return all(
             sorted(sequences) == list(range(1, max(sequences) + 1))
             for sequences in sequences_by_topic.values()
@@ -199,6 +217,26 @@ class CoverageValidator:
             for atom in promotional_atoms
         )
         return inclusion_valid, disposition_valid
+
+    @staticmethod
+    def _body_atom_ids(synthesis: SynthesisResult) -> list[str]:
+        section_groups = (
+            synthesis.themes,
+            synthesis.methods_and_steps,
+            synthesis.examples_and_counterexamples,
+            synthesis.boundaries_and_risks,
+            synthesis.promotions,
+        )
+        section_atom_ids = [
+            atom_id
+            for sections in section_groups
+            for section in sections
+            for atom_id in section.atom_ids
+        ]
+        timeline_atom_ids = [
+            atom_id for entry in synthesis.timeline for atom_id in entry.atom_ids
+        ]
+        return [*section_atom_ids, *timeline_atom_ids]
 
 
 __all__ = ["CoverageValidator"]

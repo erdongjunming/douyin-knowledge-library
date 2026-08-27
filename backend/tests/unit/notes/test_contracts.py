@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+
 import pytest
 from pydantic import ValidationError
 
@@ -160,6 +162,25 @@ def test_all_contracts_reject_extra_fields(instance: object) -> None:
         (ProviderUsage, {"input_tokens": -1, "cost_status": "unknown"}),
         (ProviderUsage, {"output_tokens": -1, "cost_status": "unknown"}),
         (ProviderUsage, {"api_cost": -0.01, "cost_status": "reported"}),
+        (
+            ThemeSection,
+            {
+                "heading": "Heading",
+                "content": "Content",
+                "atom_ids": [],
+                "timestamps": [-0.1],
+            },
+        ),
+        (
+            CoverageReview,
+            {
+                "reviewed_segment_indexes": [-1],
+                "source_omission_candidates": [],
+                "unsupported_draft_claims": [],
+                "disposition_corrections": [],
+            },
+        ),
+        (CoverageReport, {**_report().model_dump(), "missing_segment_indexes": [-1]}),
     ],
 )
 def test_contracts_reject_negative_indexes_tokens_and_costs(
@@ -172,9 +193,13 @@ def test_contracts_reject_negative_indexes_tokens_and_costs(
 def test_coverage_report_serializes_the_fixed_schema_alias() -> None:
     report = _report()
 
-    serialized = report.model_dump(mode="json", by_alias=True)
+    serialized = report.model_dump(mode="json")
+    serialized_json = json.loads(report.model_dump_json())
 
     assert serialized["schema"] == "douyin-note-coverage-v1"
     assert "schema_name" not in serialized
+    assert serialized_json["schema"] == "douyin-note-coverage-v1"
+    assert "schema_name" not in serialized_json
+    assert CoverageReport.model_validate(serialized) == report
     with pytest.raises(ValidationError):
-        _report(schema_name="another-schema")
+        CoverageReport.model_validate({**serialized, "schema": "another-schema"})

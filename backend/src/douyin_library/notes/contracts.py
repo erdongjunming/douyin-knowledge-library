@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Literal
+from typing import Annotated, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -26,6 +26,8 @@ DispositionKind = Literal[
     "unintelligible_asr",
 ]
 QualityGate = Literal["passed", "failed", "fallback"]
+NonNegativeInt = Annotated[int, Field(ge=0)]
+NonNegativeFloat = Annotated[float, Field(ge=0)]
 
 
 class EvidenceAtom(BaseModel):
@@ -67,7 +69,7 @@ class ThemeSection(BaseModel):
     heading: str
     content: str
     atom_ids: list[str]
-    timestamps: list[float] = Field(default_factory=list)
+    timestamps: list[NonNegativeFloat] = Field(default_factory=list)
 
 
 class TimelineEntry(BaseModel):
@@ -113,7 +115,7 @@ class SourceOmissionCandidate(BaseModel):
 class CoverageReview(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    reviewed_segment_indexes: list[int]
+    reviewed_segment_indexes: list[NonNegativeInt]
     source_omission_candidates: list[SourceOmissionCandidate]
     unsupported_draft_claims: list[str]
     disposition_corrections: list[SegmentDisposition]
@@ -134,15 +136,19 @@ class ProviderUsage(BaseModel):
 
 
 class CoverageReport(BaseModel):
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(
+        extra="forbid",
+        populate_by_name=True,
+        serialize_by_alias=True,
+    )
 
     schema_name: Literal["douyin-note-coverage-v1"] = Field(
         default="douyin-note-coverage-v1",
-        serialization_alias="schema",
+        alias="schema",
     )
     segment_total: int = Field(ge=0)
     segment_disposition_count: int = Field(ge=0)
-    missing_segment_indexes: list[int]
+    missing_segment_indexes: list[NonNegativeInt]
     evidence_atom_total: int = Field(ge=0)
     evidence_atom_included: int = Field(ge=0)
     missing_atom_ids: list[str]
