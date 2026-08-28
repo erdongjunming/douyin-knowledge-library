@@ -94,7 +94,7 @@ def _read_json_object(path: Path) -> dict[str, Any] | None:
         if path.stat().st_size > _MAX_JSON_BYTES:
             return None
         value = json.loads(path.read_text(encoding="utf-8-sig"))
-    except (OSError, UnicodeError, json.JSONDecodeError, RecursionError):
+    except (OSError, UnicodeError, ValueError, json.JSONDecodeError, RecursionError):
         return None
     return value if isinstance(value, dict) else None
 

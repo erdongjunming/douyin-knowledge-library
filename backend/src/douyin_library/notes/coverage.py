@@ -58,13 +58,15 @@ class CoverageValidator:
         all_atoms_traceable = all(
             self._is_traceable(atom, segment_count) for atom in extraction.atoms
         )
-        body_atom_ids = self._body_atom_ids(synthesis)
-        body_id_set = set(body_atom_ids)
-        unknown_body_references = any(atom_id not in atom_by_id for atom_id in body_atom_ids)
-        non_included_body_references = any(
-            atom_id not in included_ids for atom_id in body_atom_ids
+        thematic_atom_ids = self._thematic_atom_ids(synthesis)
+        thematic_id_set = set(thematic_atom_ids)
+        unknown_thematic_references = any(
+            atom_id not in atom_by_id for atom_id in thematic_atom_ids
         )
-        included_atoms_missing_from_body = included_ids - body_id_set
+        non_included_thematic_references = any(
+            atom_id not in included_ids for atom_id in thematic_atom_ids
+        )
+        included_atoms_missing_from_themes = included_ids - thematic_id_set
         timeline_foundational_valid, timeline_complete = self._timeline_status(
             synthesis,
             extraction.dispositions,
@@ -105,8 +107,8 @@ class CoverageValidator:
                 duplicate_atom_ids,
                 not disposition_references_valid,
                 unknown_synthesis_references,
-                unknown_body_references,
-                non_included_body_references,
+                unknown_thematic_references,
+                non_included_thematic_references,
                 not timeline_foundational_valid,
                 not all_atoms_traceable,
                 not steps_verified,
@@ -123,7 +125,7 @@ class CoverageValidator:
                 bool(review.source_omission_candidates),
                 bool(review.unsupported_draft_claims),
                 not promotion_inclusion_valid,
-                bool(included_atoms_missing_from_body),
+                bool(included_atoms_missing_from_themes),
                 not timeline_complete,
             )
         )
@@ -235,7 +237,7 @@ class CoverageValidator:
         return inclusion_valid, disposition_valid
 
     @staticmethod
-    def _body_atom_ids(synthesis: SynthesisResult) -> list[str]:
+    def _thematic_atom_ids(synthesis: SynthesisResult) -> list[str]:
         section_groups = (
             synthesis.themes,
             synthesis.methods_and_steps,
@@ -243,16 +245,12 @@ class CoverageValidator:
             synthesis.boundaries_and_risks,
             synthesis.promotions,
         )
-        section_atom_ids = [
+        return [
             atom_id
             for sections in section_groups
             for section in sections
             for atom_id in section.atom_ids
         ]
-        timeline_atom_ids = [
-            atom_id for entry in synthesis.timeline for atom_id in entry.atom_ids
-        ]
-        return [*section_atom_ids, *timeline_atom_ids]
 
     @staticmethod
     def _timeline_status(

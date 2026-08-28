@@ -213,3 +213,18 @@ def test_oversized_metadata_is_ignored(tmp_path: Path) -> None:
 
     assert state.quality_status == "unknown"
     assert state.legacy_eligible is False
+
+
+def test_metadata_with_overlong_integer_is_ignored_without_raising(tmp_path: Path) -> None:
+    note_dir = _note_dir(tmp_path)
+    manifest = (
+        '{"provider":"ollama","model":"qwen3:8b","quality_gate":"passed","value":'
+        + "9" * 5_000
+        + "}"
+    )
+    (note_dir / "generation_manifest.json").write_text(manifest, encoding="utf-8")
+
+    state = classify_note_bundle(note_dir)
+
+    assert state.quality_status == "unknown"
+    assert state.legacy_eligible is False

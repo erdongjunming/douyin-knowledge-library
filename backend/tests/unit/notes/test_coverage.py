@@ -514,19 +514,58 @@ def test_body_reference_missing_from_included_ids_is_nonrepairable() -> None:
     assert report.repairable is False
 
 
-def test_included_atom_missing_from_body_is_repairable() -> None:
+def test_complete_timeline_does_not_replace_thematic_coverage() -> None:
     extraction = _complete_extraction()
     synthesis = _synthesis(
         (atom.id for atom in extraction.atoms),
         extraction=extraction,
     )
     synthesis.themes = []
-    synthesis.timeline = []
 
     report = _validate(extraction, synthesis=synthesis)
 
     assert report.quality_gate == "failed"
     assert report.repairable is True
+
+
+def test_atom_only_referenced_in_timeline_is_a_repairable_omission() -> None:
+    extraction = _complete_extraction()
+    synthesis = _synthesis(
+        (atom.id for atom in extraction.atoms),
+        extraction=extraction,
+    )
+    synthesis.themes[0].atom_ids.remove("A-example")
+
+    report = _validate(extraction, synthesis=synthesis)
+
+    assert report.quality_gate == "failed"
+    assert report.repairable is True
+
+
+def test_each_included_atom_with_a_thematic_reference_passes() -> None:
+    extraction = _complete_extraction()
+    synthesis = _synthesis(
+        (atom.id for atom in extraction.atoms),
+        extraction=extraction,
+    )
+
+    report = _validate(extraction, synthesis=synthesis)
+
+    assert report.quality_gate == "passed"
+
+
+def test_evidence_specific_theme_groups_may_be_empty() -> None:
+    extraction = _complete_extraction()
+    synthesis = _synthesis(
+        (atom.id for atom in extraction.atoms),
+        extraction=extraction,
+    )
+
+    assert synthesis.methods_and_steps == []
+    assert synthesis.examples_and_counterexamples == []
+    assert synthesis.boundaries_and_risks == []
+    assert synthesis.promotions == []
+    assert _validate(extraction, synthesis=synthesis).quality_gate == "passed"
 
 
 def test_zero_segments_with_empty_results_passes() -> None:
