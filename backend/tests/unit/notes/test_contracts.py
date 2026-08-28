@@ -190,6 +190,119 @@ def test_contracts_reject_negative_indexes_tokens_and_costs(
         model_type(**values)
 
 
+@pytest.mark.parametrize(
+    ("model_type", "payload"),
+    [
+        (
+            ThemeSection,
+            '{"heading":"Heading","content":"Content","atom_ids":[],"timestamps":[1e400]}',
+        ),
+        (
+            ProviderUsage,
+            '{"api_cost":1e400,"cost_status":"reported"}',
+        ),
+    ],
+)
+def test_json_overflow_float_is_rejected(
+    model_type: type[object], payload: str
+) -> None:
+    with pytest.raises(ValidationError):
+        model_type.model_validate_json(payload)
+
+
+@pytest.mark.parametrize(
+    ("model_type", "values", "field", "is_list"),
+    [
+        (EvidenceAtom, _atom().model_dump(), "start", False),
+        (EvidenceAtom, _atom().model_dump(), "end", False),
+        (
+            ThemeSection,
+            {"heading": "Heading", "content": "Content", "atom_ids": []},
+            "timestamps",
+            True,
+        ),
+        (
+            TimelineEntry,
+            {
+                "segment_index": 0,
+                "disposition": "included",
+                "atom_ids": [],
+                "content": "Content",
+            },
+            "start",
+            False,
+        ),
+        (
+            TimelineEntry,
+            {
+                "segment_index": 0,
+                "disposition": "included",
+                "atom_ids": [],
+                "content": "Content",
+            },
+            "end",
+            False,
+        ),
+        (
+            ProviderUsage,
+            {"cost_status": "reported"},
+            "api_cost",
+            False,
+        ),
+    ],
+)
+@pytest.mark.parametrize(
+    "non_finite",
+    [
+        pytest.param(float("inf"), id="positive-infinity"),
+        pytest.param(float("-inf"), id="negative-infinity"),
+        pytest.param(float("nan"), id="nan"),
+    ],
+)
+def test_contract_float_fields_reject_non_finite_python_values(
+    model_type: type[object],
+    values: dict[str, object],
+    field: str,
+    is_list: bool,
+    non_finite: float,
+) -> None:
+    payload = dict(values)
+    payload[field] = [non_finite] if is_list else non_finite
+
+    with pytest.raises(ValidationError):
+        model_type.model_validate(payload)
+
+
+@pytest.mark.parametrize(
+    "instance",
+    [
+        _atom(start=0.0, end=1.25),
+        ThemeSection(
+            heading="Heading",
+            content="Content",
+            atom_ids=["A-0001"],
+            timestamps=[0.0, 1.25],
+        ),
+        TimelineEntry(
+            segment_index=0,
+            start=0.0,
+            end=1.25,
+            disposition="included",
+            atom_ids=["A-0001"],
+            content="Content",
+        ),
+        ProviderUsage(api_cost=0.125, cost_status="reported"),
+    ],
+    ids=lambda value: type(value).__name__,
+)
+def test_finite_float_values_round_trip_through_json(instance: object) -> None:
+    model_type = type(instance)
+
+    restored = model_type.model_validate_json(instance.model_dump_json())
+
+    assert restored == instance
+
+
 def test_coverage_report_serializes_the_fixed_schema_alias() -> None:
     report = _report()
 

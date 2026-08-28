@@ -32,10 +32,15 @@ NonEmptyString = Annotated[
     str,
     StringConstraints(strip_whitespace=True, min_length=1),
 ]
+_STRICT_MODEL_CONFIG = ConfigDict(
+    allow_inf_nan=False,
+    extra="forbid",
+    strict=True,
+)
 
 
 class EvidenceAtom(BaseModel):
-    model_config = ConfigDict(extra="forbid", strict=True)
+    model_config = _STRICT_MODEL_CONFIG
 
     id: NonEmptyString
     kind: AtomKind
@@ -52,7 +57,7 @@ class EvidenceAtom(BaseModel):
 
 
 class SegmentDisposition(BaseModel):
-    model_config = ConfigDict(extra="forbid", strict=True)
+    model_config = _STRICT_MODEL_CONFIG
 
     segment_index: int = Field(ge=0)
     disposition: DispositionKind
@@ -61,14 +66,14 @@ class SegmentDisposition(BaseModel):
 
 
 class ExtractionResult(BaseModel):
-    model_config = ConfigDict(extra="forbid", strict=True)
+    model_config = _STRICT_MODEL_CONFIG
 
     atoms: list[EvidenceAtom]
     dispositions: list[SegmentDisposition]
 
 
 class ThemeSection(BaseModel):
-    model_config = ConfigDict(extra="forbid", strict=True)
+    model_config = _STRICT_MODEL_CONFIG
 
     heading: NonEmptyString
     content: NonEmptyString
@@ -77,7 +82,7 @@ class ThemeSection(BaseModel):
 
 
 class TimelineEntry(BaseModel):
-    model_config = ConfigDict(extra="forbid", strict=True)
+    model_config = _STRICT_MODEL_CONFIG
 
     segment_index: int = Field(ge=0)
     start: float | None = Field(default=None, ge=0)
@@ -88,7 +93,7 @@ class TimelineEntry(BaseModel):
 
 
 class SynthesisResult(BaseModel):
-    model_config = ConfigDict(extra="forbid", strict=True)
+    model_config = _STRICT_MODEL_CONFIG
 
     title: NonEmptyString
     overview: NonEmptyString
@@ -108,7 +113,7 @@ class SynthesisResult(BaseModel):
 
 
 class SourceOmissionCandidate(BaseModel):
-    model_config = ConfigDict(extra="forbid", strict=True)
+    model_config = _STRICT_MODEL_CONFIG
 
     segment_index: int = Field(ge=0)
     source_excerpt: NonEmptyString
@@ -117,7 +122,7 @@ class SourceOmissionCandidate(BaseModel):
 
 
 class CoverageReview(BaseModel):
-    model_config = ConfigDict(extra="forbid", strict=True)
+    model_config = _STRICT_MODEL_CONFIG
 
     reviewed_segment_indexes: list[NonNegativeInt]
     source_omission_candidates: list[SourceOmissionCandidate]
@@ -126,7 +131,7 @@ class CoverageReview(BaseModel):
 
 
 class ProviderUsage(BaseModel):
-    model_config = ConfigDict(extra="forbid", strict=True)
+    model_config = _STRICT_MODEL_CONFIG
 
     input_tokens: int | None = Field(default=None, ge=0)
     output_tokens: int | None = Field(default=None, ge=0)
@@ -141,10 +146,9 @@ class ProviderUsage(BaseModel):
 
 class CoverageReport(BaseModel):
     model_config = ConfigDict(
-        extra="forbid",
+        **_STRICT_MODEL_CONFIG,
         populate_by_name=True,
         serialize_by_alias=True,
-        strict=True,
     )
 
     schema_name: Literal["douyin-note-coverage-v1"] = Field(
