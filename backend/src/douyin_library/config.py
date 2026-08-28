@@ -3,7 +3,9 @@ from __future__ import annotations
 import os
 import shutil
 from pathlib import Path
+from typing import Literal
 
+from pydantic import Field, SecretStr, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -19,6 +21,37 @@ class Settings(BaseSettings):
     qwen_asr_script_path: Path | None = None
     ffmpeg_path: Path | None = None
     ffprobe_path: Path | None = None
+    note_provider_policy: Literal["auto", "local", "external", "rule"] = "auto"
+    note_ollama_url: str = "http://127.0.0.1:11434"
+    note_ollama_model: str = "qwen3:8b"
+    note_ollama_executable: Path | None = None
+    note_ollama_autostart: bool = True
+    note_ollama_probe_timeout_seconds: float = Field(default=2, ge=0.2, le=30)
+    note_ollama_unload_timeout_seconds: float = Field(default=10, ge=0.05, le=60)
+    note_request_timeout_seconds: float = Field(default=600, ge=10, le=3600)
+    note_context_tokens: int = Field(default=32768, ge=4096, le=131072)
+    note_ollama_keep_alive: str = "10m"
+    note_external_base_url: str | None = None
+    note_external_model: str | None = None
+    note_external_api_key: SecretStr | None = None
+    note_external_input_cost_per_million: float | None = Field(
+        default=None,
+        ge=0,
+        allow_inf_nan=False,
+    )
+    note_external_output_cost_per_million: float | None = Field(
+        default=None,
+        ge=0,
+        allow_inf_nan=False,
+    )
+
+    @field_validator("note_ollama_keep_alive")
+    @classmethod
+    def _strip_note_ollama_keep_alive(cls, value: str) -> str:
+        stripped = value.strip()
+        if not stripped:
+            raise ValueError("note_ollama_keep_alive_empty")
+        return stripped
 
 
 def resolve_tool(settings: Settings, name: str) -> Path | None:
