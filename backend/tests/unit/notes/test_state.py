@@ -186,3 +186,30 @@ def test_all_malformed_metadata_results_in_unknown(tmp_path: Path) -> None:
 
     assert state.quality_status == "unknown"
     assert state.legacy_eligible is False
+
+
+def test_deeply_nested_metadata_is_ignored_without_raising(tmp_path: Path) -> None:
+    note_dir = _note_dir(tmp_path)
+    nested = '{"generation":' * 100_000 + "{}" + "}" * 100_000
+    (note_dir / "generation_manifest.json").write_text(nested, encoding="utf-8")
+
+    state = classify_note_bundle(note_dir)
+
+    assert state.quality_status == "unknown"
+    assert state.legacy_eligible is False
+
+
+def test_oversized_metadata_is_ignored(tmp_path: Path) -> None:
+    note_dir = _note_dir(tmp_path)
+    oversized = {
+        "provider": "ollama",
+        "model": "qwen3:8b",
+        "quality_gate": "passed",
+        "padding": "x" * (4 * 1024 * 1024),
+    }
+    _write_json(note_dir / "generation_manifest.json", oversized)
+
+    state = classify_note_bundle(note_dir)
+
+    assert state.quality_status == "unknown"
+    assert state.legacy_eligible is False

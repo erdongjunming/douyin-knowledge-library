@@ -42,8 +42,13 @@ def _disposition(
     )
 
 
-def _synthesis(included_atom_ids: Iterable[str]) -> SynthesisResult:
+def _synthesis(
+    included_atom_ids: Iterable[str],
+    *,
+    extraction: ExtractionResult | None = None,
+) -> SynthesisResult:
     atom_ids = list(included_atom_ids)
+    included = set(atom_ids)
     return SynthesisResult(
         title="Title",
         overview="Overview",
@@ -66,7 +71,23 @@ def _synthesis(included_atom_ids: Iterable[str]) -> SynthesisResult:
         quotes=[],
         implications=[],
         actions=[],
-        timeline=[],
+        timeline=(
+            [
+                TimelineEntry(
+                    segment_index=disposition.segment_index,
+                    disposition=disposition.disposition,
+                    atom_ids=[
+                        atom_id
+                        for atom_id in disposition.atom_ids
+                        if atom_id in included
+                    ],
+                    content=f"Segment {disposition.segment_index}",
+                )
+                for disposition in extraction.dispositions
+            ]
+            if extraction is not None
+            else []
+        ),
         promotions=[],
         tags=[],
         included_atom_ids=atom_ids,
@@ -112,7 +133,14 @@ def _validate(
     return CoverageValidator().validate(
         segment_count=segment_count,
         extraction=extraction,
-        synthesis=synthesis or _synthesis(atom.id for atom in extraction.atoms),
+        synthesis=(
+            synthesis
+            if synthesis is not None
+            else _synthesis(
+                (atom.id for atom in extraction.atoms),
+                extraction=extraction,
+            )
+        ),
         review=review or _review(range(segment_count)),
         semantic_generator="ollama/qwen3:8b",
     )
@@ -194,7 +222,10 @@ def test_atom_missing_from_synthesis_is_reported_as_repairable() -> None:
 
     report = _validate(
         extraction,
-        synthesis=_synthesis(atom.id for atom in extraction.atoms if atom.id != "A-example"),
+        synthesis=_synthesis(
+            (atom.id for atom in extraction.atoms if atom.id != "A-example"),
+            extraction=extraction,
+        ),
     )
 
     assert report.quality_gate == "failed"
@@ -204,15 +235,17 @@ def test_atom_missing_from_synthesis_is_reported_as_repairable() -> None:
 
 
 def test_missing_synthesis_atom_with_bad_traceability_is_nonrepairable() -> None:
+    atom = _atom("A-1", 0)
+    atom.source_excerpt = ""
     extraction = ExtractionResult(
-        atoms=[_atom("A-1", 0, source_excerpt="")],
+        atoms=[atom],
         dispositions=[_disposition(0, ["A-1"])],
     )
 
     report = _validate(
         extraction,
         segment_count=1,
-        synthesis=_synthesis([]),
+        synthesis=_synthesis([], extraction=extraction),
     )
 
     assert report.quality_gate == "failed"
@@ -224,15 +257,20 @@ def test_unknown_synthesis_atom_is_nonrepairable() -> None:
     extraction = _complete_extraction()
     included = [atom.id for atom in extraction.atoms]
 
-    report = _validate(extraction, synthesis=_synthesis([*included, "A-unknown"]))
+    report = _validate(
+        extraction,
+        synthesis=_synthesis([*included, "A-unknown"], extraction=extraction),
+    )
 
     assert report.quality_gate == "failed"
     assert report.repairable is False
 
 
 def test_untraceable_included_atom_is_nonrepairable() -> None:
+    atom = _atom("A-1", 0)
+    atom.source_excerpt = "   "
     extraction = ExtractionResult(
-        atoms=[_atom("A-1", 0, source_excerpt="   ")],
+        atoms=[atom],
         dispositions=[_disposition(0, ["A-1"])],
     )
 
@@ -341,7 +379,10 @@ def test_dropped_promotion_fails_as_repairable() -> None:
 
     report = _validate(
         extraction,
-        synthesis=_synthesis(atom.id for atom in extraction.atoms if atom.id != "A-promo"),
+        synthesis=_synthesis(
+            (atom.id for atom in extraction.atoms if atom.id != "A-promo"),
+            extraction=extraction,
+        ),
     )
 
     assert report.quality_gate == "failed"
@@ -355,7 +396,11 @@ def test_is_promotional_non_promotion_atom_cannot_be_dropped() -> None:
         dispositions=[_disposition(0, ["A-1"])],
     )
 
-    report = _validate(extraction, segment_count=1, synthesis=_synthesis([]))
+    report = _validate(
+        extraction,
+        segment_count=1,
+        synthesis=_synthesis([], extraction=extraction),
+    )
 
     assert report.quality_gate == "failed"
     assert report.promotional_content_preserved is False
@@ -417,7 +462,10 @@ def test_unknown_theme_section_atom_reference_is_nonrepairable(
     section_field: str,
 ) -> None:
     extraction = _complete_extraction()
-    synthesis = _synthesis(atom.id for atom in extraction.atoms)
+    synthesis = _synthesis(
+        (atom.id for atom in extraction.atoms),
+        extraction=extraction,
+    )
     getattr(synthesis, section_field).append(
         ThemeSection(
             heading="Bad reference",
@@ -434,15 +482,11 @@ def test_unknown_theme_section_atom_reference_is_nonrepairable(
 
 def test_unknown_timeline_atom_reference_is_nonrepairable() -> None:
     extraction = _complete_extraction()
-    synthesis = _synthesis(atom.id for atom in extraction.atoms)
-    synthesis.timeline.append(
-        TimelineEntry(
-            segment_index=0,
-            disposition="included",
-            atom_ids=["A-unknown"],
-            content="Bad timeline reference",
-        )
+    synthesis = _synthesis(
+        (atom.id for atom in extraction.atoms),
+        extraction=extraction,
     )
+    synthesis.timeline[0].atom_ids.append("A-unknown")
 
     report = _validate(extraction, synthesis=synthesis)
 
@@ -452,7 +496,10 @@ def test_unknown_timeline_atom_reference_is_nonrepairable() -> None:
 
 def test_body_reference_missing_from_included_ids_is_nonrepairable() -> None:
     extraction = _complete_extraction()
-    synthesis = _synthesis(atom.id for atom in extraction.atoms if atom.id != "A-example")
+    synthesis = _synthesis(
+        (atom.id for atom in extraction.atoms if atom.id != "A-example"),
+        extraction=extraction,
+    )
     synthesis.themes.append(
         ThemeSection(
             heading="Non-included reference",
@@ -469,8 +516,12 @@ def test_body_reference_missing_from_included_ids_is_nonrepairable() -> None:
 
 def test_included_atom_missing_from_body_is_repairable() -> None:
     extraction = _complete_extraction()
-    synthesis = _synthesis(atom.id for atom in extraction.atoms)
+    synthesis = _synthesis(
+        (atom.id for atom in extraction.atoms),
+        extraction=extraction,
+    )
     synthesis.themes = []
+    synthesis.timeline = []
 
     report = _validate(extraction, synthesis=synthesis)
 
@@ -488,4 +539,162 @@ def test_zero_segments_with_empty_results_passes() -> None:
     assert report.evidence_atom_total == 0
     assert report.traceable_atom_count == 0
     assert report.source_segments_independently_reviewed == 0
+    assert report.repairable is False
+
+
+def test_timeline_requires_every_segment() -> None:
+    extraction = _complete_extraction()
+    synthesis = _synthesis(
+        (atom.id for atom in extraction.atoms),
+        extraction=extraction,
+    )
+    synthesis.timeline.pop(1)
+
+    report = _validate(extraction, synthesis=synthesis)
+
+    assert report.quality_gate == "failed"
+
+
+def test_timeline_rejects_duplicate_segment() -> None:
+    extraction = _complete_extraction()
+    synthesis = _synthesis(
+        (atom.id for atom in extraction.atoms),
+        extraction=extraction,
+    )
+    synthesis.timeline.insert(1, synthesis.timeline[0].model_copy(deep=True))
+
+    report = _validate(extraction, synthesis=synthesis)
+
+    assert report.quality_gate == "failed"
+    assert report.repairable is False
+
+
+def test_timeline_rejects_out_of_range_segment() -> None:
+    extraction = _complete_extraction()
+    synthesis = _synthesis(
+        (atom.id for atom in extraction.atoms),
+        extraction=extraction,
+    )
+    synthesis.timeline.append(
+        TimelineEntry(
+            segment_index=4,
+            disposition="duplicate",
+            atom_ids=[],
+            content="Out of range",
+        )
+    )
+
+    report = _validate(extraction, synthesis=synthesis)
+
+    assert report.quality_gate == "failed"
+    assert report.repairable is False
+
+
+def test_timeline_rejects_reordered_segments() -> None:
+    extraction = _complete_extraction()
+    synthesis = _synthesis(
+        (atom.id for atom in extraction.atoms),
+        extraction=extraction,
+    )
+    synthesis.timeline[0], synthesis.timeline[1] = (
+        synthesis.timeline[1],
+        synthesis.timeline[0],
+    )
+
+    report = _validate(extraction, synthesis=synthesis)
+
+    assert report.quality_gate == "failed"
+    assert report.repairable is False
+
+
+def test_timeline_disposition_must_match_extraction() -> None:
+    extraction = _complete_extraction()
+    synthesis = _synthesis(
+        (atom.id for atom in extraction.atoms),
+        extraction=extraction,
+    )
+    synthesis.timeline[0].disposition = "promotion"
+
+    report = _validate(extraction, synthesis=synthesis)
+
+    assert report.quality_gate == "failed"
+    assert report.repairable is False
+
+
+@pytest.mark.parametrize(
+    "timeline_atom_ids",
+    [["A-step-1"], ["A-step-1", "A-step-1"]],
+)
+def test_timeline_atom_mapping_must_match_without_duplicates(
+    timeline_atom_ids: list[str],
+) -> None:
+    extraction = _complete_extraction()
+    synthesis = _synthesis(
+        (atom.id for atom in extraction.atoms),
+        extraction=extraction,
+    )
+    synthesis.timeline[0].atom_ids = timeline_atom_ids
+
+    report = _validate(extraction, synthesis=synthesis)
+
+    assert report.quality_gate == "failed"
+    assert report.repairable is False
+
+
+def test_zero_segments_rejects_nonempty_timeline() -> None:
+    extraction = ExtractionResult(atoms=[], dispositions=[])
+    synthesis = _synthesis([], extraction=extraction)
+    synthesis.timeline.append(
+        TimelineEntry(
+            segment_index=0,
+            disposition="duplicate",
+            atom_ids=[],
+            content="Unexpected segment",
+        )
+    )
+
+    report = _validate(
+        extraction,
+        segment_count=0,
+        synthesis=synthesis,
+        review=_review([]),
+    )
+
+    assert report.quality_gate == "failed"
+    assert report.repairable is False
+
+
+def test_atom_must_be_mapped_by_a_disposition() -> None:
+    extraction = ExtractionResult(
+        atoms=[_atom("A-1", 0)],
+        dispositions=[_disposition(0, [], "transition")],
+    )
+
+    report = _validate(extraction, segment_count=1)
+
+    assert report.quality_gate == "failed"
+    assert report.repairable is False
+
+
+def test_atom_cannot_be_mapped_twice_by_dispositions() -> None:
+    extraction = ExtractionResult(
+        atoms=[_atom("A-1", 0)],
+        dispositions=[_disposition(0, ["A-1", "A-1"])],
+    )
+
+    report = _validate(extraction, segment_count=1)
+
+    assert report.quality_gate == "failed"
+    assert report.repairable is False
+
+
+def test_atom_mapping_requires_content_disposition() -> None:
+    extraction = ExtractionResult(
+        atoms=[_atom("A-1", 0)],
+        dispositions=[_disposition(0, ["A-1"], "transition")],
+    )
+
+    report = _validate(extraction, segment_count=1)
+
+    assert report.quality_gate == "failed"
     assert report.repairable is False

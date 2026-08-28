@@ -65,6 +65,13 @@ class CoverageValidator:
             atom_id not in included_ids for atom_id in body_atom_ids
         )
         included_atoms_missing_from_body = included_ids - body_id_set
+        timeline_foundational_valid, timeline_complete = self._timeline_status(
+            synthesis,
+            extraction.dispositions,
+            segment_count,
+            atom_by_id,
+            included_ids,
+        )
 
         review_counts = Counter(review.reviewed_segment_indexes)
         review_coverage_valid = (
@@ -100,6 +107,7 @@ class CoverageValidator:
                 unknown_synthesis_references,
                 unknown_body_references,
                 non_included_body_references,
+                not timeline_foundational_valid,
                 not all_atoms_traceable,
                 not steps_verified,
                 not examples_verified,
@@ -116,6 +124,7 @@ class CoverageValidator:
                 bool(review.unsupported_draft_claims),
                 not promotion_inclusion_valid,
                 bool(included_atoms_missing_from_body),
+                not timeline_complete,
             )
         )
         passed = not foundational_error and not repair_issue
@@ -148,6 +157,7 @@ class CoverageValidator:
         atom_by_id: dict[str, EvidenceAtom],
         expected_segments: set[int],
     ) -> bool:
+        mapped_atom_counts: Counter[str] = Counter()
         for disposition in dispositions:
             if disposition.segment_index not in expected_segments:
                 return False
@@ -156,11 +166,17 @@ class CoverageValidator:
                 and not disposition.atom_ids
             ):
                 return False
+            if (
+                disposition.atom_ids
+                and disposition.disposition not in {"included", "promotion"}
+            ):
+                return False
             for atom_id in disposition.atom_ids:
                 atom = atom_by_id.get(atom_id)
                 if atom is None or atom.source_segment != disposition.segment_index:
                     return False
-        return True
+            mapped_atom_counts.update(disposition.atom_ids)
+        return mapped_atom_counts == Counter(atom_by_id.keys())
 
     @staticmethod
     def _is_traceable(atom: EvidenceAtom, segment_count: int) -> bool:
@@ -237,6 +253,69 @@ class CoverageValidator:
             atom_id for entry in synthesis.timeline for atom_id in entry.atom_ids
         ]
         return [*section_atom_ids, *timeline_atom_ids]
+
+    @staticmethod
+    def _timeline_status(
+        synthesis: SynthesisResult,
+        dispositions: list[SegmentDisposition],
+        segment_count: int,
+        atom_by_id: dict[str, EvidenceAtom],
+        included_ids: set[str],
+    ) -> tuple[bool, bool]:
+        expected_order = list(range(segment_count))
+        timeline_indexes = [entry.segment_index for entry in synthesis.timeline]
+        structure_complete = timeline_indexes == expected_order
+        missing_only = (
+            len(timeline_indexes) < segment_count
+            and len(timeline_indexes) == len(set(timeline_indexes))
+            and set(timeline_indexes).issubset(expected_order)
+            and timeline_indexes == sorted(timeline_indexes)
+        )
+        structure_foundational_valid = structure_complete or missing_only
+
+        disposition_by_segment = {
+            disposition.segment_index: disposition for disposition in dispositions
+        }
+        mapping_foundational_valid = True
+        mapping_complete = True
+        for entry in synthesis.timeline:
+            disposition = disposition_by_segment.get(entry.segment_index)
+            if disposition is None or entry.disposition != disposition.disposition:
+                mapping_foundational_valid = False
+                continue
+
+            timeline_atom_counts = Counter(entry.atom_ids)
+            if any(count != 1 for count in timeline_atom_counts.values()):
+                mapping_foundational_valid = False
+                continue
+            if any(
+                atom_id not in atom_by_id or atom_id not in included_ids
+                for atom_id in entry.atom_ids
+            ):
+                mapping_foundational_valid = False
+                continue
+
+            disposition_atom_counts = Counter(disposition.atom_ids)
+            if timeline_atom_counts == disposition_atom_counts:
+                continue
+            included_disposition_counts = Counter(
+                atom_id
+                for atom_id in disposition.atom_ids
+                if atom_id in included_ids
+            )
+            if (
+                timeline_atom_counts == included_disposition_counts
+                and included_disposition_counts != disposition_atom_counts
+            ):
+                mapping_complete = False
+                continue
+            mapping_foundational_valid = False
+
+        foundational_valid = (
+            structure_foundational_valid and mapping_foundational_valid
+        )
+        complete = structure_complete and mapping_complete and mapping_foundational_valid
+        return foundational_valid, complete
 
 
 __all__ = ["CoverageValidator"]

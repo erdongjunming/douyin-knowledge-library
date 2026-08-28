@@ -18,6 +18,7 @@ _METADATA_FILES = (
     "generation_audit.json",
     "note_budget.json",
 )
+_MAX_JSON_BYTES = 4 * 1024 * 1024
 
 
 @dataclass(frozen=True, slots=True)
@@ -90,8 +91,10 @@ def _read_json_object(path: Path) -> dict[str, Any] | None:
     if not path.is_file():
         return None
     try:
+        if path.stat().st_size > _MAX_JSON_BYTES:
+            return None
         value = json.loads(path.read_text(encoding="utf-8-sig"))
-    except (OSError, UnicodeError, json.JSONDecodeError):
+    except (OSError, UnicodeError, json.JSONDecodeError, RecursionError):
         return None
     return value if isinstance(value, dict) else None
 

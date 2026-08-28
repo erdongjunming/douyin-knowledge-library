@@ -203,3 +203,182 @@ def test_coverage_report_serializes_the_fixed_schema_alias() -> None:
     assert CoverageReport.model_validate(serialized) == report
     with pytest.raises(ValidationError):
         CoverageReport.model_validate({**serialized, "schema": "another-schema"})
+
+
+@pytest.mark.parametrize(
+    "model_type",
+    [
+        EvidenceAtom,
+        SegmentDisposition,
+        ExtractionResult,
+        ThemeSection,
+        TimelineEntry,
+        SynthesisResult,
+        SourceOmissionCandidate,
+        CoverageReview,
+        ProviderUsage,
+        CoverageReport,
+    ],
+)
+def test_all_contracts_use_strict_validation(model_type: type[object]) -> None:
+    assert model_type.model_config.get("strict") is True
+
+
+def test_provider_json_rejects_string_source_segment() -> None:
+    payload = _atom().model_dump(mode="json")
+    payload["source_segment"] = "0"
+
+    with pytest.raises(ValidationError):
+        EvidenceAtom.model_validate_json(json.dumps(payload))
+
+
+@pytest.mark.parametrize("field", ["id", "topic", "statement", "source_excerpt"])
+def test_atom_required_text_rejects_whitespace(field: str) -> None:
+    payload = _atom().model_dump(mode="json")
+    payload[field] = "   "
+
+    with pytest.raises(ValidationError):
+        EvidenceAtom.model_validate_json(json.dumps(payload))
+
+
+@pytest.mark.parametrize(
+    ("model_type", "payload"),
+    [
+        (EvidenceAtom, {**_atom().model_dump(mode="json"), "relations": [" "]}),
+        (EvidenceAtom, {**_atom().model_dump(mode="json"), "asr_uncertainty": [" "]}),
+        (
+            SegmentDisposition,
+            {
+                "segment_index": 0,
+                "disposition": "included",
+                "atom_ids": [" "],
+            },
+        ),
+        (
+            SegmentDisposition,
+            {
+                "segment_index": 0,
+                "disposition": "included",
+                "atom_ids": ["A-1"],
+                "reason": " ",
+            },
+        ),
+        (
+            ThemeSection,
+            {"heading": " ", "content": "content", "atom_ids": ["A-1"]},
+        ),
+        (
+            ThemeSection,
+            {"heading": "heading", "content": " ", "atom_ids": ["A-1"]},
+        ),
+        (
+            ThemeSection,
+            {"heading": "heading", "content": "content", "atom_ids": [" "]},
+        ),
+        (
+            TimelineEntry,
+            {
+                "segment_index": 0,
+                "disposition": "included",
+                "atom_ids": ["A-1"],
+                "content": " ",
+            },
+        ),
+        (
+            TimelineEntry,
+            {
+                "segment_index": 0,
+                "disposition": "included",
+                "atom_ids": [" "],
+                "content": "content",
+            },
+        ),
+        (
+            SourceOmissionCandidate,
+            {
+                "segment_index": 0,
+                "source_excerpt": " ",
+                "missing_statement": "missing",
+                "suggested_kind": "claim",
+            },
+        ),
+        (
+            SourceOmissionCandidate,
+            {
+                "segment_index": 0,
+                "source_excerpt": "source",
+                "missing_statement": " ",
+                "suggested_kind": "claim",
+            },
+        ),
+        (
+            CoverageReview,
+            {
+                "reviewed_segment_indexes": [0],
+                "source_omission_candidates": [],
+                "unsupported_draft_claims": [" "],
+                "disposition_corrections": [],
+            },
+        ),
+        (
+            CoverageReport,
+            {**_report().model_dump(mode="json"), "missing_atom_ids": [" "]},
+        ),
+        (
+            CoverageReport,
+            {
+                **_report().model_dump(mode="json"),
+                "unsupported_draft_claims": [" "],
+            },
+        ),
+        (
+            CoverageReport,
+            {**_report().model_dump(mode="json"), "semantic_generator": " "},
+        ),
+    ],
+)
+def test_contract_text_and_identifier_items_reject_whitespace(
+    model_type: type[object],
+    payload: dict[str, object],
+) -> None:
+    with pytest.raises(ValidationError):
+        model_type.model_validate_json(json.dumps(payload))
+
+
+@pytest.mark.parametrize(
+    "field",
+    [
+        "title",
+        "overview",
+        "structure",
+        "concepts",
+        "quotes",
+        "implications",
+        "actions",
+        "tags",
+        "included_atom_ids",
+    ],
+)
+def test_synthesis_required_text_rejects_whitespace(field: str) -> None:
+    payload = _synthesis().model_dump(mode="json")
+    payload[field] = " " if field in {"title", "overview"} else [" "]
+
+    with pytest.raises(ValidationError):
+        SynthesisResult.model_validate_json(json.dumps(payload))
+
+
+def test_nonempty_strings_are_stripped_during_json_validation() -> None:
+    payload = _atom().model_dump(mode="json")
+    payload.update(
+        {
+            "id": "  A-0001  ",
+            "topic": "  topic  ",
+            "relations": ["  A-parent  "],
+        }
+    )
+
+    atom = EvidenceAtom.model_validate_json(json.dumps(payload))
+
+    assert atom.id == "A-0001"
+    assert atom.topic == "topic"
+    assert atom.relations == ["A-parent"]
