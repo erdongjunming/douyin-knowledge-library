@@ -27,9 +27,25 @@ async def select_transcript_source(
         ).usable
     ):
         return replace(subtitle, provider=subtitle.provider or "subtitle_local")
-    factory_args = (audio_path,) if len(inspect.signature(asr_factory).parameters) else ()
-    provider = asr_factory(*factory_args)
+    provider = _build_asr_provider(asr_factory, audio_path)
     return await provider.transcribe(audio_path)
+
+
+def _build_asr_provider(factory: Any, audio_path: Path) -> Any:
+    """Call factories with their declared audio-path calling convention."""
+    try:
+        signature = inspect.signature(factory)
+    except (TypeError, ValueError):
+        return factory(audio_path=audio_path)
+    parameters = tuple(signature.parameters.values())
+    if not parameters:
+        return factory()
+    if any(parameter.kind is inspect.Parameter.VAR_POSITIONAL for parameter in parameters):
+        return factory(audio_path)
+    audio_parameter = signature.parameters.get("audio_path")
+    if audio_parameter is not None and audio_parameter.kind is inspect.Parameter.KEYWORD_ONLY:
+        return factory(audio_path=audio_path)
+    return factory(audio_path)
 
 
 __all__ = ["select_transcript_source"]

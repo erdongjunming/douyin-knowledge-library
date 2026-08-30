@@ -27,6 +27,26 @@ class ASR:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("factory_kind", ["zero", "positional", "keyword"])
+async def test_asr_factory_argument_shapes_are_supported(factory_kind: str) -> None:
+    asr = ASR()
+    if factory_kind == "zero":
+        def factory():
+            return asr
+    elif factory_kind == "positional":
+        def factory(audio_path):
+            return asr
+    else:
+        def factory(*, audio_path):
+            return asr
+
+    subtitle = Subtitle(None)
+    result = await select_transcript_source(subtitle, factory, Work(aweme_id="1"), Path("a.m4a"))
+    assert result.provider == "asr"
+    assert asr.calls == 1
+
+
+@pytest.mark.asyncio
 async def test_usable_subtitle_is_selected_without_asr() -> None:
     subtitle = Subtitle(TranscriptDraft((TranscriptSegment("s", 0, 1, "真实字幕"),), "真实字幕"))
     asr = ASR()

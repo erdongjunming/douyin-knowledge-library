@@ -3,6 +3,7 @@ from __future__ import annotations
 import html
 import math
 import re
+from copy import copy
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -190,7 +191,7 @@ class LocalSubtitleProvider:
         default_root = Path(settings.storage_root) / "subtitle"
         has_explicit_root = configured_root is not None and Path(configured_root) != default_root
         if layout is not None and not has_explicit_root or configured_root is None:
-            self.layout = default_layout
+            self.layout = copy(default_layout)
         else:
             self.layout = default_layout
             self.layout.subtitle = Path(configured_root)
