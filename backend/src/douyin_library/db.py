@@ -20,10 +20,30 @@ SELECT
     work.aweme_id,
     COALESCE(work.description, ''),
     COALESCE((
-        SELECT group_concat(transcript.text, ' ')
-        FROM transcript
-        WHERE transcript.work_id = work.id
-          AND transcript.status = 'succeeded'
+        SELECT selected.text
+        FROM transcript AS selected
+        WHERE selected.work_id = work.id
+          AND selected.status = 'succeeded'
+          AND length(trim(COALESCE(selected.text, ''))) > 0
+          AND (
+              selected.variant = 'raw'
+              OR (
+                  selected.variant = 'cleaned'
+                  AND selected.parent_transcript_id IS NOT NULL
+                  AND EXISTS (
+                      SELECT 1
+                      FROM transcript AS parent
+                      WHERE parent.id = selected.parent_transcript_id
+                        AND parent.work_id = selected.work_id
+                        AND parent.variant = 'raw'
+                        AND parent.status = 'succeeded'
+                        AND length(trim(COALESCE(parent.text, ''))) > 0
+                  )
+              )
+          )
+        ORDER BY CASE selected.variant WHEN 'cleaned' THEN 0 ELSE 1 END,
+                 selected.id DESC
+        LIMIT 1
     ), ''),
     COALESCE((
         SELECT group_concat(analysis.summary, ' ')
@@ -46,12 +66,28 @@ SELECT
 FROM work
 """
 
+FTS_TRIGGER_NAMES = (
+    "work_fts_work_insert",
+    "work_fts_work_update",
+    "work_fts_work_delete",
+    "work_fts_transcript_insert",
+    "work_fts_transcript_update",
+    "work_fts_transcript_delete",
+    "work_fts_analysis_insert",
+    "work_fts_analysis_update",
+    "work_fts_analysis_delete",
+)
 
-def create_fts_schema(connection: Connection) -> None:
+
+def create_fts_schema(
+    connection: Connection,
+    *,
+    document_sql: str = FTS_DOCUMENT_SQL,
+) -> None:
     connection.exec_driver_sql(FTS_TABLE_SQL)
-    refresh_new_work = FTS_DOCUMENT_SQL + " WHERE work.id = NEW.id;"
-    refresh_new_owner = FTS_DOCUMENT_SQL + " WHERE work.id = NEW.work_id;"
-    refresh_old_owner = FTS_DOCUMENT_SQL + " WHERE work.id = OLD.work_id;"
+    refresh_new_work = document_sql + " WHERE work.id = NEW.id;"
+    refresh_new_owner = document_sql + " WHERE work.id = NEW.work_id;"
+    refresh_old_owner = document_sql + " WHERE work.id = OLD.work_id;"
     triggers = {
         "work_fts_work_insert": (
             "AFTER INSERT ON work BEGIN " + refresh_new_work + " END"
@@ -91,6 +127,16 @@ def create_fts_schema(connection: Connection) -> None:
     }
     for name, body in triggers.items():
         connection.exec_driver_sql(f"CREATE TRIGGER IF NOT EXISTS {name} {body}")
+
+
+def recreate_fts_schema(
+    connection: Connection,
+    *,
+    document_sql: str = FTS_DOCUMENT_SQL,
+) -> None:
+    for name in FTS_TRIGGER_NAMES:
+        connection.exec_driver_sql(f"DROP TRIGGER IF EXISTS {name}")
+    create_fts_schema(connection, document_sql=document_sql)
 
 
 def create_schema(engine: Engine) -> None:

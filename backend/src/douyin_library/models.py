@@ -136,15 +136,30 @@ class Transcript(Base):
             "work_id",
             "engine",
             "model",
+            "variant",
             unique=True,
             sqlite_where=text("status = 'succeeded'"),
         ),
+        Index("ix_transcript_work_variant_status", "work_id", "variant", "status"),
     )
 
     id: Mapped[int] = mapped_column(primary_key=True)
     work_id: Mapped[int] = mapped_column(ForeignKey("work.id"), index=True)
     engine: Mapped[str] = mapped_column(String(80))
     model: Mapped[str] = mapped_column(String(120))
+    source_kind: Mapped[str] = mapped_column(
+        String(24), default="asr", server_default="asr", nullable=False
+    )
+    variant: Mapped[str] = mapped_column(
+        String(24), default="raw", server_default="raw", nullable=False
+    )
+    parent_transcript_id: Mapped[int | None] = mapped_column(
+        ForeignKey(
+            "transcript.id",
+            name="fk_transcript_parent_transcript_id_transcript",
+        ),
+        index=True,
+    )
     language: Mapped[str | None] = mapped_column(String(20))
     text: Mapped[str | None] = mapped_column(Text)
     segments_json: Mapped[str | None] = mapped_column(Text)
