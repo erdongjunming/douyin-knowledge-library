@@ -187,7 +187,9 @@ class LocalSubtitleProvider:
         self.settings = settings
         default_layout = layout or StorageLayout(Path(settings.storage_root))
         configured_root = getattr(settings, "transcription_subtitle_root", None)
-        if layout is not None or configured_root is None:
+        default_root = Path(settings.storage_root) / "subtitle"
+        has_explicit_root = configured_root is not None and Path(configured_root) != default_root
+        if layout is not None and not has_explicit_root or configured_root is None:
             self.layout = default_layout
         else:
             self.layout = default_layout

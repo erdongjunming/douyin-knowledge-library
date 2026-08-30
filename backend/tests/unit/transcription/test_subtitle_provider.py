@@ -100,6 +100,19 @@ def test_configured_subtitle_root_is_used_without_duplicate_subtitle_directory(
     assert draft.text == "配置字幕"
 
 
+def test_configured_root_takes_precedence_over_layout(tmp_path: Path) -> None:
+    layout = StorageLayout(tmp_path / "layout")
+    configured = tmp_path / "configured"
+    path = configured / "42" / "subtitle.srt"
+    path.parent.mkdir(parents=True)
+    path.write_text("1\n00:00:00,000 --> 00:00:01,000\n配置根", encoding="utf-8")
+    settings = Settings(storage_root=tmp_path / "storage", transcription_subtitle_root=configured)
+    provider = LocalSubtitleProvider(settings, layout)
+    draft = provider.discover(Work(aweme_id="42", duration_ms=1000))
+    assert draft is not None
+    assert draft.text == "配置根"
+
+
 def test_local_provider_uses_first_usable_candidate(tmp_path: Path) -> None:
     layout = StorageLayout(tmp_path)
     subtitle_dir = layout.subtitle_dir("42")
