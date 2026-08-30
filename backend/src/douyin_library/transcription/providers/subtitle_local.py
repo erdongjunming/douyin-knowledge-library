@@ -131,10 +131,14 @@ def score_subtitle(
     texts = [s.text.strip() for s in segments if s.text.strip()]
     chars = len("".join(texts))
     timestamped = [s for s in segments if s.start is not None or s.end is not None]
+    has_timestamps = bool(timestamped)
+    has_untimed = any(s.start is None and s.end is None for s in segments)
     timestamp_valid = all(
         s.start is not None and s.end is not None and s.start >= 0 and s.end >= s.start
         for s in timestamped
     )
+    if has_timestamps and has_untimed:
+        timestamp_valid = False
     previous_start = None
     for segment in timestamped:
         if (
@@ -151,12 +155,18 @@ def score_subtitle(
         reason = "empty_text"
     elif not segments:
         reason = "no_segments"
+    elif has_timestamps and has_untimed:
+        reason = "mixed_timestamp"
     elif not timestamp_valid:
         reason = "invalid_timestamp"
     elif ratio >= 0.5:
         reason = "placeholder_or_noise"
-    elif chars < 2:
-        reason = "text_too_short"
+    elif chars < (
+        1
+        if duration_ms is not None and duration_ms <= 10_000
+        else max(2, (duration_ms or 0) // 30_000)
+    ):
+        reason = "text_too_sparse_for_duration"
     else:
         reason = "usable"
     return SubtitleQuality(chars, len(segments), timestamp_valid, ratio, reason == "usable", reason)
@@ -167,9 +177,11 @@ class LocalSubtitleProvider:
         self.settings = settings
         default_layout = layout or StorageLayout(Path(settings.storage_root))
         configured_root = getattr(settings, "transcription_subtitle_root", None)
-        self.layout = (
-            default_layout if configured_root is None else StorageLayout(Path(configured_root))
-        )
+        if layout is not None or configured_root is None:
+            self.layout = default_layout
+        else:
+            self.layout = default_layout
+            self.layout.subtitle = Path(configured_root)
 
     def discover(self, work: Work) -> TranscriptDraft | None:
         for path in self.layout.subtitle_candidate_paths(work.aweme_id):

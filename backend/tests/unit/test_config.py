@@ -12,6 +12,7 @@ def test_default_storage_root_is_d_drive(monkeypatch) -> None:
     settings = Settings()
 
     assert settings.storage_root == Path(r"D:\DouyinKnowledgeLibrary")
+    assert settings.transcription_subtitle_root == Path(r"D:\DouyinKnowledgeLibrary\subtitle")
 
 
 def test_note_provider_defaults(monkeypatch) -> None:
@@ -38,7 +39,7 @@ def test_note_provider_defaults(monkeypatch) -> None:
 
     assert settings.note_provider_policy == "auto"
     assert settings.note_ollama_url == "http://127.0.0.1:11434"
-    assert settings.note_ollama_model == "qwen3:8b"
+    assert settings.note_ollama_model == "qwen3:4b"
     assert settings.note_ollama_executable is None
     assert settings.note_ollama_autostart is True
     assert settings.note_ollama_probe_timeout_seconds == 2
