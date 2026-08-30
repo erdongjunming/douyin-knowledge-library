@@ -9,8 +9,8 @@ import pytest
 from douyin_library.media.storage import StorageLayout
 from douyin_library.transcription.contracts import (
     ASRProvider,
-    CleanerResult,
     CleanedTranscript,
+    CleanerResult,
     TranscriptDraft,
     TranscriptPostprocessor,
     TranscriptSegment,
