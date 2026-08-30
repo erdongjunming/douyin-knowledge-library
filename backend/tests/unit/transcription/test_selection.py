@@ -79,6 +79,22 @@ async def test_uninspectable_factory_receives_keyword_audio_path() -> None:
 
 
 @pytest.mark.asyncio
+async def test_mixed_factory_prefers_position_for_audio_path() -> None:
+    asr = ASR()
+    calls = []
+
+    def factory(audio_path, *, mode="default"):
+        calls.append((audio_path, mode))
+        return asr
+
+    result = await select_transcript_source(
+        Subtitle(None), factory, Work(aweme_id="1"), Path("a.m4a")
+    )
+    assert result.provider == "asr"
+    assert calls == [(Path("a.m4a"), "default")]
+
+
+@pytest.mark.asyncio
 async def test_usable_subtitle_is_selected_without_asr() -> None:
     subtitle = Subtitle(TranscriptDraft((TranscriptSegment("s", 0, 1, "真实字幕"),), "真实字幕"))
     asr = ASR()

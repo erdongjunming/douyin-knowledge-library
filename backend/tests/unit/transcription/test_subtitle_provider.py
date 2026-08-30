@@ -107,8 +107,8 @@ def test_configured_root_takes_precedence_over_layout(tmp_path: Path) -> None:
     path.parent.mkdir(parents=True)
     path.write_text("1\n00:00:00,000 --> 00:00:01,000\n配置根", encoding="utf-8")
     settings = Settings(storage_root=tmp_path / "storage", transcription_subtitle_root=configured)
-    provider = LocalSubtitleProvider(settings, layout)
     original_subtitle = layout.subtitle
+    provider = LocalSubtitleProvider(settings, layout)
     draft = provider.discover(Work(aweme_id="42", duration_ms=1000))
     assert draft is not None
     assert draft.text == "配置根"
