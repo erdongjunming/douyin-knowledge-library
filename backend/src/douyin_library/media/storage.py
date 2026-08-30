@@ -46,6 +46,7 @@ class StorageLayout:
         self.metadata = self.root / "metadata"
         self.subtitle = self.root / "subtitle"
         self.transcript = self.root / "transcript"
+        self.dy_note = self.root / "dy-note"
         self.raw = self.root / "raw"
 
     def initialize(self) -> None:
@@ -57,6 +58,7 @@ class StorageLayout:
             self.metadata,
             self.subtitle,
             self.transcript,
+            self.dy_note,
             self.raw,
         ):
             directory.mkdir(parents=True, exist_ok=True)
