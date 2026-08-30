@@ -5,7 +5,13 @@ from collections.abc import Sequence
 import sqlalchemy as sa
 from alembic import op
 
-from douyin_library.db import FTS_DOCUMENT_SQL, FTS_TRIGGER_NAMES, recreate_fts_schema
+from douyin_library.db import (
+    FTS_DOCUMENT_SQL,
+    FTS_TRIGGER_NAMES,
+    TRANSCRIPT_INTEGRITY_TRIGGER_NAMES,
+    create_transcript_integrity_triggers,
+    recreate_fts_schema,
+)
 
 revision: str = "0006_transcript_variants"
 down_revision: str | None = "0005_resource_lease"
@@ -70,6 +76,8 @@ def _rebuild_fts(document_sql: str) -> None:
 
 
 def upgrade() -> None:
+    for name in (*FTS_TRIGGER_NAMES, *TRANSCRIPT_INTEGRITY_TRIGGER_NAMES):
+        op.execute(f"DROP TRIGGER IF EXISTS {name}")
     columns = _columns()
     if "source_kind" not in columns:
         op.add_column(
@@ -137,11 +145,33 @@ def upgrade() -> None:
             "transcript",
             ["work_id", "variant", "status"],
         )
+    check_constraints = {
+        constraint["name"]
+        for constraint in sa.inspect(op.get_bind()).get_check_constraints("transcript")
+    }
+    with op.batch_alter_table("transcript") as batch_op:
+        if "ck_transcript_source_kind" not in check_constraints:
+            batch_op.create_check_constraint(
+                "ck_transcript_source_kind",
+                "source_kind IN ('subtitle', 'asr')",
+            )
+        if "ck_transcript_variant" not in check_constraints:
+            batch_op.create_check_constraint(
+                "ck_transcript_variant",
+                "variant IN ('raw', 'cleaned')",
+            )
+        if "ck_transcript_variant_parent" not in check_constraints:
+            batch_op.create_check_constraint(
+                "ck_transcript_variant_parent",
+                "(variant = 'raw' AND parent_transcript_id IS NULL) OR "
+                "(variant = 'cleaned' AND parent_transcript_id IS NOT NULL)",
+            )
     _rebuild_fts(FTS_DOCUMENT_SQL)
+    create_transcript_integrity_triggers(op.get_bind())
 
 
 def downgrade() -> None:
-    for name in FTS_TRIGGER_NAMES:
+    for name in (*FTS_TRIGGER_NAMES, *TRANSCRIPT_INTEGRITY_TRIGGER_NAMES):
         op.execute(f"DROP TRIGGER IF EXISTS {name}")
     indexes = _indexes()
     for name in (
@@ -151,6 +181,7 @@ def downgrade() -> None:
     ):
         if name in indexes:
             op.drop_index(name, table_name="transcript")
+    op.execute("DELETE FROM transcript WHERE variant = 'cleaned'")
     op.create_index(
         "uq_transcript_succeeded",
         "transcript",
@@ -159,6 +190,9 @@ def downgrade() -> None:
         sqlite_where=sa.text("status = 'succeeded'"),
     )
     with op.batch_alter_table("transcript") as batch_op:
+        batch_op.drop_constraint("ck_transcript_variant_parent", type_="check")
+        batch_op.drop_constraint("ck_transcript_variant", type_="check")
+        batch_op.drop_constraint("ck_transcript_source_kind", type_="check")
         batch_op.drop_column("parent_transcript_id")
         batch_op.drop_column("variant")
         batch_op.drop_column("source_kind")

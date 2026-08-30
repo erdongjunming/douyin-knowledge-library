@@ -4,6 +4,7 @@ from datetime import UTC, datetime
 
 from sqlalchemy import (
     Boolean,
+    CheckConstraint,
     Float,
     ForeignKey,
     Index,
@@ -131,6 +132,19 @@ class Asset(Base):
 class Transcript(Base):
     __tablename__ = "transcript"
     __table_args__ = (
+        CheckConstraint(
+            "source_kind IN ('subtitle', 'asr')",
+            name="ck_transcript_source_kind",
+        ),
+        CheckConstraint(
+            "variant IN ('raw', 'cleaned')",
+            name="ck_transcript_variant",
+        ),
+        CheckConstraint(
+            "(variant = 'raw' AND parent_transcript_id IS NULL) OR "
+            "(variant = 'cleaned' AND parent_transcript_id IS NOT NULL)",
+            name="ck_transcript_variant_parent",
+        ),
         Index(
             "uq_transcript_succeeded",
             "work_id",

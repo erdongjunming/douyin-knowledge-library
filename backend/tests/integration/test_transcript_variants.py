@@ -91,6 +91,155 @@ def test_migration_backfills_legacy_transcript_without_changing_text(tmp_path: P
         ).scalar_one() == "downgraded text"
 
 
+def test_downgrade_drops_cleaned_variants_but_preserves_raw(tmp_path: Path) -> None:
+    database_path = tmp_path / "downgrade-cleaned.db"
+    config = _alembic_config(database_path)
+    command.upgrade(config, "head")
+    engine = create_engine(f"sqlite:///{database_path}")
+    with Session(engine) as session:
+        work = Work(aweme_id="legacy-cleaned")
+        session.add(work)
+        session.flush()
+        raw = Transcript(
+            work_id=work.id,
+            engine="qwen3-asr",
+            model="0.6b",
+            source_kind="asr",
+            variant="raw",
+            text="raw survives",
+            status="succeeded",
+        )
+        session.add(raw)
+        session.flush()
+        session.add(
+            Transcript(
+                work_id=work.id,
+                engine="qwen3-asr",
+                model="0.6b",
+                source_kind="asr",
+                variant="cleaned",
+                parent_transcript_id=raw.id,
+                text="cleaned is derived",
+                status="succeeded",
+            )
+        )
+        session.commit()
+    command.downgrade(config, "0005_resource_lease")
+    downgraded = create_engine(f"sqlite:///{database_path}")
+    with downgraded.connect() as connection:
+        rows = connection.execute(
+            text("SELECT text FROM transcript WHERE work_id = 1")
+        ).scalars().all()
+    assert rows == ["raw survives"]
+
+
+@pytest.mark.parametrize(
+    "values",
+    [
+        {"source_kind": "manual", "variant": "raw", "parent": None},
+        {"source_kind": "asr", "variant": "draft", "parent": None},
+    ],
+)
+def test_transcript_rejects_invalid_source_or_variant_values(
+    tmp_path: Path, values: dict[str, object]
+) -> None:
+    engine = create_engine(f"sqlite:///{tmp_path / 'invalid-values.db'}")
+    create_schema(engine)
+    with engine.begin() as connection:
+        connection.execute(
+            text(
+                "INSERT INTO work(aweme_id, media_type, availability) "
+                "VALUES ('invalid-values', 'video', 'available')"
+            )
+        )
+        work_id = connection.execute(text("SELECT id FROM work")).scalar_one()
+        with pytest.raises(IntegrityError):
+            connection.execute(
+                text(
+                    "INSERT INTO transcript("
+                    "work_id, engine, model, source_kind, variant, "
+                    "parent_transcript_id, text, status"
+                    ") VALUES (:work_id, 'engine', 'model', :source_kind, "
+                    ":variant, :parent, 'x', 'succeeded')"
+                ),
+                {"work_id": work_id, **values},
+            )
+
+
+def test_transcript_rejects_invalid_parent_relationships_at_db_boundary(tmp_path: Path) -> None:
+    engine = create_engine(f"sqlite:///{tmp_path / 'invalid-parent.db'}")
+    create_schema(engine)
+    with engine.begin() as connection:
+        connection.execute(
+            text(
+                "INSERT INTO work(aweme_id, media_type, availability) "
+                "VALUES ('parent-check', 'video', 'available')"
+            )
+        )
+        work_id = connection.execute(text("SELECT id FROM work")).scalar_one()
+        connection.execute(
+                text(
+                    "INSERT INTO transcript("
+                    "work_id, engine, model, source_kind, variant, text, status) "
+                    "VALUES (:work_id, 'engine', 'model', 'asr', 'raw', "
+                    "'raw', 'succeeded')"
+            ),
+            {"work_id": work_id},
+        )
+        raw_id = connection.execute(text("SELECT id FROM transcript")).scalar_one()
+
+    def insert(values: dict[str, object]) -> None:
+        with engine.begin() as connection:
+            connection.execute(
+                text(
+                    "INSERT INTO transcript("
+                    "work_id, engine, model, source_kind, variant, "
+                    "parent_transcript_id, text, status"
+                    ") VALUES (:work_id, :engine, :model, 'asr', 'cleaned', "
+                    ":parent, 'derived', 'succeeded')"
+                ),
+                values,
+            )
+
+    with pytest.raises(IntegrityError):
+        insert({"work_id": work_id, "engine": "engine", "model": "model", "parent": None})
+    with pytest.raises(IntegrityError):
+        insert({"work_id": work_id, "engine": "engine", "model": "model", "parent": 9999})
+    with pytest.raises(IntegrityError):
+        insert({"work_id": work_id, "engine": "other", "model": "model", "parent": raw_id})
+    with pytest.raises(IntegrityError):
+        insert({"work_id": work_id, "engine": "engine", "model": "other", "parent": raw_id})
+
+    with engine.begin() as connection:
+        connection.execute(
+            text(
+                "INSERT INTO transcript("
+                "work_id, engine, model, source_kind, variant, "
+                "parent_transcript_id, text, status"
+                ") VALUES (:work_id, 'engine', 'model', 'asr', 'cleaned', "
+                ":parent, 'derived', 'succeeded')"
+            ),
+            {"work_id": work_id, "parent": raw_id},
+        )
+        with pytest.raises(IntegrityError):
+            connection.execute(
+                text(
+                    "INSERT INTO transcript("
+                    "work_id, engine, model, source_kind, variant, "
+                    "parent_transcript_id, text, status"
+                    ") VALUES (:work_id, 'engine', 'model', 'asr', 'raw', "
+                    ":parent, 'bad raw', 'succeeded')"
+                ),
+                {"work_id": work_id, "parent": raw_id},
+            )
+
+        with pytest.raises(IntegrityError):
+            connection.execute(
+                text("DELETE FROM transcript WHERE id = :parent"),
+                {"parent": raw_id},
+            )
+
+
 def test_raw_sources_and_cleaned_parent_persist_as_separate_variants(tmp_path: Path) -> None:
     engine = create_engine(f"sqlite:///{tmp_path / 'variants.db'}")
     create_schema(engine)
@@ -179,8 +328,8 @@ def test_fts_prefers_valid_cleaned_and_falls_back_to_raw_on_update(tmp_path: Pat
 
         cleaned = Transcript(
             work_id=work.id,
-            engine="ollama",
-            model="qwen3:4b",
+            engine="qwen3-asr",
+            model="0.6b",
             source_kind="asr",
             variant="cleaned",
             parent_transcript_id=raw.id,

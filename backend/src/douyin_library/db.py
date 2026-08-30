@@ -78,6 +78,12 @@ FTS_TRIGGER_NAMES = (
     "work_fts_analysis_delete",
 )
 
+TRANSCRIPT_INTEGRITY_TRIGGER_NAMES = (
+    "transcript_parent_integrity_insert",
+    "transcript_parent_integrity_update",
+    "transcript_parent_integrity_delete",
+)
+
 
 def create_fts_schema(
     connection: Connection,
@@ -139,10 +145,89 @@ def recreate_fts_schema(
     create_fts_schema(connection, document_sql=document_sql)
 
 
+def create_transcript_integrity_triggers(connection: Connection) -> None:
+    connection.exec_driver_sql(
+        """
+        CREATE TRIGGER IF NOT EXISTS transcript_parent_integrity_insert
+        BEFORE INSERT ON transcript
+        WHEN (
+            (NEW.variant = 'raw' AND NEW.parent_transcript_id IS NOT NULL)
+            OR (
+                NEW.variant = 'cleaned'
+                AND (
+                    NEW.parent_transcript_id IS NULL
+                    OR NOT EXISTS (
+                        SELECT 1 FROM transcript AS parent
+                        WHERE parent.id = NEW.parent_transcript_id
+                          AND parent.work_id = NEW.work_id
+                          AND parent.engine = NEW.engine
+                          AND parent.model = NEW.model
+                          AND parent.variant = 'raw'
+                    )
+                )
+            )
+        )
+        BEGIN
+            SELECT RAISE(ABORT, 'transcript_parent_integrity');
+        END
+        """
+    )
+    connection.exec_driver_sql(
+        """
+        CREATE TRIGGER IF NOT EXISTS transcript_parent_integrity_delete
+        BEFORE DELETE ON transcript
+        WHEN EXISTS (
+            SELECT 1 FROM transcript AS child
+            WHERE child.parent_transcript_id = OLD.id
+        )
+        BEGIN
+            SELECT RAISE(ABORT, 'transcript_parent_integrity');
+        END
+        """
+    )
+    connection.exec_driver_sql(
+        """
+        CREATE TRIGGER IF NOT EXISTS transcript_parent_integrity_update
+        BEFORE UPDATE OF work_id, engine, model, variant, parent_transcript_id ON transcript
+        WHEN (
+            (NEW.variant = 'raw' AND NEW.parent_transcript_id IS NOT NULL)
+            OR (
+                NEW.variant = 'cleaned'
+                AND (
+                    NEW.parent_transcript_id IS NULL
+                    OR NOT EXISTS (
+                        SELECT 1 FROM transcript AS parent
+                        WHERE parent.id = NEW.parent_transcript_id
+                          AND parent.work_id = NEW.work_id
+                          AND parent.engine = NEW.engine
+                          AND parent.model = NEW.model
+                          AND parent.variant = 'raw'
+                    )
+                )
+            )
+            OR EXISTS (
+                SELECT 1 FROM transcript AS child
+                WHERE child.parent_transcript_id = OLD.id
+                  AND (
+                      NEW.variant <> 'raw'
+                      OR child.work_id <> NEW.work_id
+                      OR child.engine <> NEW.engine
+                      OR child.model <> NEW.model
+                  )
+            )
+        )
+        BEGIN
+            SELECT RAISE(ABORT, 'transcript_parent_integrity');
+        END
+        """
+    )
+
+
 def create_schema(engine: Engine) -> None:
     Base.metadata.create_all(engine)
     with engine.begin() as connection:
         create_fts_schema(connection)
+        create_transcript_integrity_triggers(connection)
 
 
 def rebuild_work_fts(engine: Engine) -> int:
