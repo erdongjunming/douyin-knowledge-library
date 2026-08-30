@@ -54,6 +54,7 @@ class StorageLayout:
             self.audio,
             self.covers,
             self.metadata,
+            self.subtitle,
             self.transcript,
             self.raw,
         ):
@@ -76,6 +77,34 @@ class StorageLayout:
 
     def transcript_segments_path(self, aweme_id: str) -> Path:
         return self.transcript_dir(aweme_id) / "segments.json"
+
+    def transcript_qwen_path(self, aweme_id: str) -> Path:
+        return self.transcript_dir(aweme_id) / "qwen3_asr.json"
+
+    def subtitle_dir(self, aweme_id: str) -> Path:
+        return self.subtitle / aweme_id
+
+    def subtitle_candidate_paths(self, aweme_id: str) -> tuple[Path, ...]:
+        directory = self.subtitle_dir(aweme_id)
+        return tuple(
+            directory / name
+            for name in (
+                "subtitle.srt",
+                "subtitle.vtt",
+                "subtitle.ass",
+                "subtitle.ssa",
+                "subtitle.txt",
+            )
+        )
+
+    def transcript_cleaned_text_path(self, aweme_id: str) -> Path:
+        return self.transcript_dir(aweme_id) / "transcript.cleaned.md"
+
+    def transcript_cleaned_json_path(self, aweme_id: str) -> Path:
+        return self.transcript_dir(aweme_id) / "transcript.cleaned.json"
+
+    def note_dir(self, aweme_id: str) -> Path:
+        return self.dy_note / aweme_id
 
 
 class MediaPipeline:
