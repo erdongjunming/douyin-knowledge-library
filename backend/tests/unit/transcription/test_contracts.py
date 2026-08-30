@@ -46,6 +46,7 @@ def test_storage_layout_exposes_subtitle_and_cleaned_transcript_paths(
 ) -> None:
     layout = StorageLayout(tmp_path)
 
+    assert layout.subtitle == tmp_path / "subtitle"
     assert layout.subtitle_dir("abc") == tmp_path / "subtitle" / "abc"
     assert layout.subtitle_candidate_paths("abc") == tuple(
         tmp_path / "subtitle" / "abc" / f"subtitle{extension}"

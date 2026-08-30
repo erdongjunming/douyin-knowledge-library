@@ -44,6 +44,7 @@ class StorageLayout:
         self.audio = self.root / "audio"
         self.covers = self.root / "cover"
         self.metadata = self.root / "metadata"
+        self.subtitle = self.root / "subtitle"
         self.transcript = self.root / "transcript"
         self.raw = self.root / "raw"
 
