@@ -40,10 +40,19 @@ def _build_asr_provider(factory: Any, audio_path: Path) -> Any:
     parameters = tuple(signature.parameters.values())
     if not parameters:
         return factory()
+    if any(parameter.kind is inspect.Parameter.VAR_KEYWORD for parameter in parameters):
+        return factory(audio_path=audio_path)
+    keyword_only = [
+        parameter for parameter in parameters if parameter.kind is inspect.Parameter.KEYWORD_ONLY
+    ]
+    if len(keyword_only) == 1:
+        return factory(**{keyword_only[0].name: audio_path})
     if any(parameter.kind is inspect.Parameter.VAR_POSITIONAL for parameter in parameters):
         return factory(audio_path)
-    audio_parameter = signature.parameters.get("audio_path")
-    if audio_parameter is not None and audio_parameter.kind is inspect.Parameter.KEYWORD_ONLY:
+    try:
+        signature.bind(audio_path)
+    except TypeError:
+        signature.bind(audio_path=audio_path)
         return factory(audio_path=audio_path)
     return factory(audio_path)
 

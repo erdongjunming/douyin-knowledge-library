@@ -27,7 +27,9 @@ class ASR:
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("factory_kind", ["zero", "positional", "keyword"])
+@pytest.mark.parametrize(
+    "factory_kind", ["zero", "positional", "keyword", "named", "kwargs", "varargs"]
+)
 async def test_asr_factory_argument_shapes_are_supported(factory_kind: str) -> None:
     asr = ASR()
     if factory_kind == "zero":
@@ -36,14 +38,44 @@ async def test_asr_factory_argument_shapes_are_supported(factory_kind: str) -> N
     elif factory_kind == "positional":
         def factory(audio_path):
             return asr
-    else:
+    elif factory_kind == "keyword":
         def factory(*, audio_path):
+            return asr
+    elif factory_kind == "named":
+        def factory(*, source):
+            return asr
+    elif factory_kind == "kwargs":
+        def factory(**kwargs):
+            assert kwargs == {"audio_path": Path("a.m4a")}
+            return asr
+    else:
+        def factory(*args):
+            assert args == (Path("a.m4a"),)
             return asr
 
     subtitle = Subtitle(None)
     result = await select_transcript_source(subtitle, factory, Work(aweme_id="1"), Path("a.m4a"))
     assert result.provider == "asr"
     assert asr.calls == 1
+
+
+@pytest.mark.asyncio
+async def test_uninspectable_factory_receives_keyword_audio_path() -> None:
+    asr = ASR()
+
+    class Factory:
+        @property
+        def __signature__(self):
+            raise ValueError("uninspectable")
+
+        def __call__(self, **kwargs):
+            assert kwargs == {"audio_path": Path("a.m4a")}
+            return asr
+
+    result = await select_transcript_source(
+        Subtitle(None), Factory(), Work(aweme_id="1"), Path("a.m4a")
+    )
+    assert result.provider == "asr"
 
 
 @pytest.mark.asyncio

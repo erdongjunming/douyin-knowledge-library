@@ -190,10 +190,8 @@ class LocalSubtitleProvider:
         configured_root = getattr(settings, "transcription_subtitle_root", None)
         default_root = Path(settings.storage_root) / "subtitle"
         has_explicit_root = configured_root is not None and Path(configured_root) != default_root
-        if layout is not None and not has_explicit_root or configured_root is None:
-            self.layout = copy(default_layout)
-        else:
-            self.layout = default_layout
+        self.layout = copy(default_layout) if layout is not None else default_layout
+        if has_explicit_root:
             self.layout.subtitle = Path(configured_root)
 
     def discover(self, work: Work) -> TranscriptDraft | None:
