@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import html
+import math
 import re
 from dataclasses import dataclass
 from pathlib import Path
@@ -45,10 +46,12 @@ def _seconds(value: str) -> float | None:
     try:
         if len(parts) == 2:
             minutes, seconds = parts
-            return float(minutes) * 60 + float(seconds)
+            result = float(minutes) * 60 + float(seconds)
+            return result if math.isfinite(result) else None
         if len(parts) == 3:
             hours, minutes, seconds = parts
-            return float(hours) * 3600 + float(minutes) * 60 + float(seconds)
+            result = float(hours) * 3600 + float(minutes) * 60 + float(seconds)
+            return result if math.isfinite(result) else None
     except ValueError:
         return None
     return None
@@ -87,6 +90,8 @@ def parse_subtitle(raw_text: str, format_hint: str | None = None) -> tuple[Trans
         if timing or "-->" in line:
             start = _seconds(timing.group(1)) if timing else -1
             end = _seconds(timing.group(2)) if timing else -1
+            if start is None or end is None:
+                start, end = -1, -1
             i += 1
             text_lines = []
             while i < len(lines) and lines[i].strip():
@@ -134,7 +139,12 @@ def score_subtitle(
     has_timestamps = bool(timestamped)
     has_untimed = any(s.start is None and s.end is None for s in segments)
     timestamp_valid = all(
-        s.start is not None and s.end is not None and s.start >= 0 and s.end >= s.start
+        s.start is not None
+        and s.end is not None
+        and math.isfinite(s.start)
+        and math.isfinite(s.end)
+        and s.start >= 0
+        and s.end >= s.start
         for s in timestamped
     )
     if has_timestamps and has_untimed:

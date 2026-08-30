@@ -1,8 +1,10 @@
+from math import inf, nan
 from pathlib import Path
 
 from douyin_library.config import Settings
 from douyin_library.media.storage import StorageLayout
 from douyin_library.models import Work
+from douyin_library.transcription.contracts import TranscriptSegment
 from douyin_library.transcription.providers.subtitle_local import (
     LocalSubtitleProvider,
     normalize_subtitle_text,
@@ -45,6 +47,15 @@ def test_bad_empty_and_placeholder_subtitles_fail_quality() -> None:
     assert not quality.usable
     placeholder = parse_subtitle("[音乐]\n字幕\n", ".txt")
     assert score_subtitle(placeholder).placeholder_ratio > 0
+
+
+def test_non_finite_timestamps_are_rejected() -> None:
+    parsed = parse_subtitle("nan --> inf\n不可用", ".vtt")
+    assert not score_subtitle(parsed).timestamp_valid
+    direct = (TranscriptSegment("x", nan, inf, "不可用"),)
+    quality = score_subtitle(direct)
+    assert not quality.timestamp_valid
+    assert not quality.usable
 
 
 def test_one_real_sentence_short_video_is_usable() -> None:
