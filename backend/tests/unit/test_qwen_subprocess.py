@@ -1,9 +1,13 @@
+import asyncio
 import json
+import sys
 from pathlib import Path
 
 import pytest
 
-from douyin_library.transcription.service import QwenAsrSubprocess
+from douyin_library.jobs.control import JobCancelledError
+from douyin_library.transcription.providers.qwen import QwenAsrProvider
+from douyin_library.transcription.service import QwenAsrSubprocess, _communicate_or_cancel
 
 
 @pytest.mark.asyncio
@@ -65,3 +69,52 @@ async def test_qwen_subprocess_converts_m4a_to_temporary_16k_wav(
     assert result.stdout == "qwen stdout"
     assert "ffmpeg diagnostics" in result.stderr
     assert "qwen stderr" in result.stderr
+
+
+@pytest.mark.asyncio
+async def test_cancellation_terminates_running_subprocess() -> None:
+    process = await asyncio.create_subprocess_exec(
+        sys.executable,
+        "-c",
+        "import time; time.sleep(30)",
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    cancel_event = asyncio.Event()
+    cancel_event.set()
+
+    with pytest.raises(JobCancelledError, match="cancelled_by_user"):
+        await _communicate_or_cancel(process, cancel_event)
+
+    assert process.returncode is not None
+
+
+@pytest.mark.asyncio
+async def test_qwen_provider_delegates_attempt_result_path_and_cancellation(
+    tmp_path: Path,
+) -> None:
+    audio_path = tmp_path / "audio.m4a"
+    result_path = tmp_path / "attempt" / "qwen3_asr.json"
+    audio_path.write_bytes(b"audio")
+    calls: dict[str, object] = {}
+
+    class FakeRunner:
+        async def run(self, **kwargs):
+            calls.update(kwargs)
+            return "subprocess-result"
+
+    provider = QwenAsrProvider(FakeRunner())
+    cancel_event = asyncio.Event()
+
+    result = await provider.run(
+        audio_path=audio_path,
+        result_path=result_path,
+        cancel_event=cancel_event,
+    )
+
+    assert result == "subprocess-result"
+    assert calls == {
+        "audio_path": audio_path,
+        "result_path": result_path,
+        "cancel_event": cancel_event,
+    }
