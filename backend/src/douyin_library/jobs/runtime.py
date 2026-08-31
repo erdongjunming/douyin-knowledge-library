@@ -21,8 +21,8 @@ from douyin_library.models import Asset, Job, Transcript, Work
 from douyin_library.security.cookie_store import CookieStore
 from douyin_library.sync.creator_sync import CreatorSyncService
 from douyin_library.sync.favorites_sync import FavoritesSyncService
+from douyin_library.transcription.providers.qwen import QwenAsrProvider
 from douyin_library.transcription.service import (
-    QwenAsrSubprocess,
     Transcriber,
     TranscriptionService,
 )
@@ -68,7 +68,7 @@ def build_worker_runtime(
     store = cookie_store or CookieStore()
     make_gateway = gateway_factory or JijiGateway.from_cookie_header
     make_media_service = media_service_factory or _build_media_service
-    make_transcriber = transcriber_factory or QwenAsrSubprocess.from_settings
+    make_transcriber = transcriber_factory or QwenAsrProvider.from_settings
 
     async def sync_creator(job: Job) -> None:
         payload = _job_payload(job)
