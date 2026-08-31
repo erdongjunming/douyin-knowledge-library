@@ -1,29 +1,160 @@
 # Douyin Knowledge Library
 
-Local-first workspace for collecting authorized Douyin content, extracting audio, transcribing speech, and organizing knowledge notes.
+Local-first workspace for collecting authorized Douyin content, retaining audio and
+metadata, transcribing speech, and turning the transcript into evidence-linked learning
+notes. Runtime data defaults to `D:\DouyinKnowledgeLibrary`; the application does not
+silently move the library to the system drive.
 
-Runtime data defaults to `D:\DouyinKnowledgeLibrary`. The application must not silently fall back to the system drive when that location is unavailable.
+## Start locally
+
+Double-click `start-local.cmd`, or run:
+
+```powershell
+.\start-local.cmd
+```
+
+The launcher starts four independently managed processes: FastAPI on `8002`, a general
+job worker, an ASR worker, and Vite on `5175`. It keeps child logs under `.runtime\logs`
+and terminates the complete process trees when the launcher exits. Open
+`http://127.0.0.1:5175/` after the readiness message. To create or repair the desktop
+shortcut, run `install-desktop-shortcut.cmd`.
+
+For manual process control, start the pools from `backend`:
+
+```powershell
+.\.venv\Scripts\python.exe -m uvicorn douyin_library.main:app --host 127.0.0.1 --port 8002
+.\.venv\Scripts\python.exe -m douyin_library.worker_main --pool general --concurrency 2
+.\.venv\Scripts\python.exe -m douyin_library.worker_main --pool asr --concurrency 1
+```
+
+The API defaults to `DKL_EMBEDDED_WORKERS=false`; tests and small single-process setups
+can explicitly set it to `true`. General and ASR workers claim the same durable SQLite
+queue, so they can be restarted independently.
 
 ## Local transcription
 
-Chinese audio is transcribed with the shared `Qwen/Qwen3-ASR-0.6B` environment. The
-FastAPI process launches ASR as a separate subprocess, converts retained M4A audio to
-a temporary 16 kHz mono WAV under the work's D-drive transcript directory, and removes
-the WAV after inference.
+Chinese audio uses the shared `Qwen/Qwen3-ASR-0.6B` environment. The ASR worker converts
+retained M4A audio to a temporary 16 kHz mono WAV, runs the Qwen subprocess, and removes
+the temporary file. Retained transcripts stay under
+`D:\DouyinKnowledgeLibrary\transcript\<aweme_id>\`.
 
-Retained transcript files are stored under:
+Transcription is subtitle-first when `DKL_TRANSCRIPTION_SUBTITLE_ENABLED=true`: a usable
+local SRT/VTT/ASS/SSA/TXT subtitle is retained as the raw source and Qwen ASR is not
+invoked. Missing, empty, or low-quality subtitles fall back to Qwen ASR. Optional
+`DKL_TRANSCRIPTION_CLEANING_ENABLED=true` creates a derived cleaned variant with
+`qwen3:4b`; a disabled, unavailable, cancelled, or invalid cleaner leaves the raw source
+untouched and note generation records the raw fallback.
 
-```text
-D:\DouyinKnowledgeLibrary\transcript\<aweme_id>\
+Normal startup does not enqueue historical `clean_transcript_work` jobs. Review legacy
+cleaning candidates with a zero-write dry run, then explicitly select a bounded set:
+
+```powershell
+cd backend
+.\.venv\Scripts\python.exe -m douyin_library.cli clean-transcripts `
+  --dry-run --limit 3 --provider local --model qwen3:4b
+.\.venv\Scripts\python.exe -m douyin_library.cli clean-transcripts `
+  --dry-run --aweme-id <aweme_id> --provider local --model qwen3:4b
 ```
 
-Run one existing audio asset through the complete database, FTS, file and audit pipeline:
+The dry run creates no jobs, provider calls, files, or source changes. Run without
+`--dry-run` only after reviewing the result; repeat `--aweme-id` for an exact set.
+
+Run one existing audio asset through the database, FTS, file, and audit pipeline:
 
 ```powershell
 cd backend
 .\.venv\Scripts\python.exe -m douyin_library.cli transcribe-one --aweme-id <aweme_id>
 ```
 
-Every synchronization and ASR operation writes a `processing_audit` record containing
-the complete sanitized request and response, stdout/stderr, timestamps and file hashes.
-Cookie, token and signed URL values are redacted before persistence.
+Cancellation is cooperative at the job layer and forceful at the process layer:
+heartbeats notice remote cancellation, then terminate FFmpeg/Qwen and clean the temporary
+WAV. A GPU lease (`gpu:0`) prevents ASR and local note inference from running together;
+the lease expires or renews across worker processes.
+
+## Note providers and cost
+
+The semantic note chain is local-first: `auto` tries Ollama, then an explicitly configured
+external provider, then the deterministic rule fallback. `local` omits the external
+provider, `external` opts into it, and `rule` is deterministic-only. Ollama is never
+auto-installed or auto-pulled. Start and prepare it explicitly:
+
+```powershell
+ollama serve
+ollama pull qwen3:4b
+```
+
+Ollama requests have zero external API charge, but use local GPU/CPU, memory, time, and
+electricity. An external provider is contacted only when its base URL, model, and API key
+are all configured (and the selected policy permits it). External cost is reported as
+unknown unless the provider reports a cost or explicit per-million-token rates are set.
+Keys are never written to prompts, jobs, notes, or audit payloads.
+
+## Incremental learning notes
+
+The note pipeline reuses only retained `metadata`, `transcript.txt`, `segments.json`, and
+`qwen3_asr.json`, plus `transcript.cleaned.md`/`transcript.cleaned.json` when the cleaned
+variant validates its parent raw fingerprint and segment identities. Otherwise it uses
+the raw source and records that fallback; it never downloads media or reruns ASR. It extracts evidence atoms,
+synthesizes both a topic review and a complete chronological timeline, independently
+checks source coverage, performs at most one repair pass, and publishes only a passed
+evidence-complete semantic bundle. If semantic providers are unavailable, the rule fallback preserves every
+source segment and is marked as `fallback`; it cannot overwrite a stronger existing note.
+The dry run only reports eligible IDs and creates no jobs or files. Note generation never
+downloads a video or overwrites source audio, cover, metadata, subtitle, or raw transcript
+files; failed attempts are isolated under the note `attempts` directory.
+
+Always inspect the candidate count first:
+
+```powershell
+cd backend
+.\.venv\Scripts\python.exe -m douyin_library.cli generate-notes --dry-run --all
+```
+
+Useful controls:
+
+```powershell
+# Generate at most 3 missing notes using the local-first policy.
+.\.venv\Scripts\python.exe -m douyin_library.cli generate-notes --limit 3
+# Generate selected IDs (repeat the option for more than one).
+.\.venv\Scripts\python.exe -m douyin_library.cli generate-notes --aweme-id <aweme_id>
+# Upgrade only explicitly identified legacy rule bundles.
+.\.venv\Scripts\python.exe -m douyin_library.cli generate-notes --legacy-only --provider local
+# Rebuild a bundle intentionally; --force and --legacy-only cannot be combined.
+.\.venv\Scripts\python.exe -m douyin_library.cli generate-notes --force --limit 3
+```
+
+Incremental runs skip a video when `dy-note\<aweme_id>\learning_note.md` exists.
+Each published directory contains `learning_note.md`, `douyin_ai_brief.md`,
+`douyin_ai_brief.json`, `note_budget.json`, `note_score.json`, `page_metadata.json`,
+`coverage_report.json`, `evidence_map.json`, `generation_audit.json`, `generation_manifest.json`, and
+`assets\asset_manifest.json`. Failed or cancelled attempts are retained under
+`dy-note\<aweme_id>\attempts\`; previous bundles are archived under `versions\` before a
+forced replacement.
+
+## Audit and backup
+
+Every synchronization, ASR, and note generation records sanitized input, prompts, raw
+responses, parsed results, errors, and start/end timestamps in `processing_audit`. Large
+fields are externalized under `D:\DouyinKnowledgeLibrary\audit\processing`; SQLite keeps
+only an integrity-checked summary, byte count, SHA-256, and path. Compact legacy rows with:
+
+```powershell
+.\.venv\Scripts\python.exe -m douyin_library.cli compact-audits --vacuum
+```
+
+Backups are verified and serialized under
+`D:\DouyinKnowledgeLibrary\data\backups` before required migrations and periodically
+(24 hours by default), with the newest seven retained.
+
+## Web library and troubleshooting
+
+The web library paginates works in groups of 100 and provides search plus an extraction
+failure filter. Clicking a work opens an in-page reader containing the full note; the
+reader offers both `主题复盘` and `完整逐段时间线` sections without hiding source content.
+Provider readiness and note progress are visible in the UI, including skipped, failed,
+legacy-upgrade, and recent-work states.
+
+If the page does not open, check `.runtime\logs`, confirm `8002` and `5175` are free, and
+run `start-local.cmd` from the project directory. If notes show a fallback warning, check
+`GET http://127.0.0.1:8002/api/notes/provider-status`, start Ollama, and install the model
+explicitly; no source assets need to be downloaded again.
