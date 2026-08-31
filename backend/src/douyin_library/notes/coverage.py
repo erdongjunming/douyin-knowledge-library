@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+import re
 from collections import Counter, defaultdict
 
 from douyin_library.notes.contracts import (
@@ -10,6 +12,22 @@ from douyin_library.notes.contracts import (
     SegmentDisposition,
     SynthesisResult,
 )
+
+_COMMON_SENTENCE_OPENERS = {
+    "A", "An", "And", "First", "I", "It", "Next", "The", "This", "That", "Today", "We",
+    "Complete", "Segment", "Source", "Statement",
+}
+
+
+def _looks_like_latin_name(token: str) -> bool:
+    token = re.sub(r"^[^A-Za-z]+|[^A-Za-z]+$", "", token)
+    if not token or not token.isascii() or not token.isalpha():
+        return False
+    if token.isupper() and len(token) >= 2:
+        return True
+    if any(char.isupper() for char in token[1:]):
+        return True
+    return token[0].isupper() and token not in _COMMON_SENTENCE_OPENERS
 
 
 class CoverageValidator:
@@ -67,6 +85,10 @@ class CoverageValidator:
             atom_id not in included_ids for atom_id in thematic_atom_ids
         )
         included_atoms_missing_from_themes = included_ids - thematic_id_set
+        theme_timestamps_valid = self._theme_timestamps_are_valid(
+            synthesis,
+            atom_by_id,
+        )
         timeline_foundational_valid, timeline_complete = self._timeline_status(
             synthesis,
             extraction.dispositions,
@@ -93,6 +115,18 @@ class CoverageValidator:
             atom_by_id,
             kinds={"condition"},
         )
+        quotations_verified = self._quotations_are_preserved(
+            extraction.atoms, synthesis
+        )
+        numbers_verified = self._text_categories_are_preserved(
+            extraction.atoms, synthesis, category="number"
+        )
+        named_entities_verified = self._named_entities_are_preserved(
+            extraction.atoms, synthesis
+        )
+        uncertainty_markers_verified = self._uncertainty_markers_are_preserved(
+            extraction.atoms, synthesis
+        )
         promotion_inclusion_valid, promotion_dispositions_valid = (
             self._promotions_are_preserved(
                 extraction.atoms,
@@ -114,6 +148,10 @@ class CoverageValidator:
                 not steps_verified,
                 not examples_verified,
                 not conditions_verified,
+                not quotations_verified,
+                not numbers_verified,
+                not named_entities_verified,
+                not uncertainty_markers_verified,
                 not promotion_dispositions_valid,
                 bool(review.disposition_corrections),
             )
@@ -126,6 +164,7 @@ class CoverageValidator:
                 bool(review.unsupported_draft_claims),
                 not promotion_inclusion_valid,
                 bool(included_atoms_missing_from_themes),
+                not theme_timestamps_valid,
                 not timeline_complete,
             )
         )
@@ -145,6 +184,9 @@ class CoverageValidator:
             steps_verified=steps_verified,
             examples_verified=examples_verified,
             conditions_verified=conditions_verified,
+            numbers_verified=numbers_verified,
+            named_entities_verified=named_entities_verified,
+            uncertainty_markers_verified=uncertainty_markers_verified,
             promotional_content_preserved=(
                 promotion_inclusion_valid and promotion_dispositions_valid
             ),
@@ -237,6 +279,64 @@ class CoverageValidator:
         return inclusion_valid, disposition_valid
 
     @staticmethod
+    def _quotations_are_preserved(
+        atoms: list[EvidenceAtom], synthesis: SynthesisResult
+    ) -> bool:
+        quote_atoms = [atom for atom in atoms if atom.kind == "quote"]
+        if not quote_atoms:
+            return True
+        # A quote atom must survive in the dedicated quote section. Matching
+        # by source text tolerates harmless punctuation around the quote.
+        rendered = " ".join(synthesis.quotes)
+        return all(
+            atom.source_excerpt in rendered or atom.statement in rendered
+            for atom in quote_atoms
+        )
+
+    @staticmethod
+    def _synthesis_text(synthesis: SynthesisResult) -> str:
+        return json.dumps(synthesis.model_dump(mode="json"), ensure_ascii=False)
+
+    @classmethod
+    def _text_categories_are_preserved(
+        cls, atoms: list[EvidenceAtom], synthesis: SynthesisResult, *, category: str
+    ) -> bool:
+        relevant = [atom for atom in atoms if atom.kind == category]
+        if not relevant:
+            return True
+        text = cls._synthesis_text(synthesis)
+        return all(
+            atom.source_excerpt in text or atom.statement in text for atom in relevant
+        )
+
+    @classmethod
+    def _named_entities_are_preserved(
+        cls, atoms: list[EvidenceAtom], synthesis: SynthesisResult
+    ) -> bool:
+        # AtomKind deliberately stays compact; identify likely proper names by
+        # explicit name markers or conservative capitalized Latin tokens.
+        candidates = [
+            atom
+            for atom in atoms
+            if re.search(r"(?:姜学长|老师|先生|女士)", atom.statement)
+            or any(_looks_like_latin_name(token) for token in atom.statement.split())
+        ]
+        if not candidates:
+            return True
+        text = cls._synthesis_text(synthesis)
+        return all(atom.source_excerpt in text or atom.statement in text for atom in candidates)
+
+    @classmethod
+    def _uncertainty_markers_are_preserved(
+        cls, atoms: list[EvidenceAtom], synthesis: SynthesisResult
+    ) -> bool:
+        markers = [marker for atom in atoms for marker in atom.asr_uncertainty]
+        if not markers:
+            return True
+        text = cls._synthesis_text(synthesis)
+        return all(marker in text for marker in markers)
+
+    @staticmethod
     def _thematic_atom_ids(synthesis: SynthesisResult) -> list[str]:
         section_groups = (
             synthesis.themes,
@@ -251,6 +351,30 @@ class CoverageValidator:
             for section in sections
             for atom_id in section.atom_ids
         ]
+
+    @staticmethod
+    def _theme_timestamps_are_valid(
+        synthesis: SynthesisResult,
+        atom_by_id: dict[str, EvidenceAtom],
+    ) -> bool:
+        section_groups = (
+            synthesis.themes,
+            synthesis.methods_and_steps,
+            synthesis.examples_and_counterexamples,
+            synthesis.boundaries_and_risks,
+            synthesis.promotions,
+        )
+        for sections in section_groups:
+            for section in sections:
+                expected = Counter(
+                    atom.start
+                    for atom_id in section.atom_ids
+                    if (atom := atom_by_id.get(atom_id)) is not None
+                    and atom.start is not None
+                )
+                if Counter(section.timestamps) != expected:
+                    return False
+        return True
 
     @staticmethod
     def _timeline_status(

@@ -25,6 +25,22 @@ DispositionKind = Literal[
     "promotion",
     "unintelligible_asr",
 ]
+DraftClaimField = Literal[
+    "title",
+    "overview",
+    "structure",
+    "themes",
+    "methods_and_steps",
+    "examples_and_counterexamples",
+    "boundaries_and_risks",
+    "concepts",
+    "quotes",
+    "implications",
+    "actions",
+    "timeline",
+    "promotions",
+    "tags",
+]
 QualityGate = Literal["passed", "failed", "fallback"]
 NonNegativeInt = Annotated[int, Field(ge=0)]
 NonNegativeFloat = Annotated[float, Field(ge=0)]
@@ -112,6 +128,30 @@ class SynthesisResult(BaseModel):
     included_atom_ids: list[NonEmptyString]
 
 
+class RepairResult(BaseModel):
+    model_config = _STRICT_MODEL_CONFIG
+
+    extraction_patch: ExtractionResult
+    synthesis_patch: SynthesisResult
+
+
+class DraftClaim(BaseModel):
+    model_config = _STRICT_MODEL_CONFIG
+
+    id: NonEmptyString
+    field: DraftClaimField
+    text: NonEmptyString
+    atom_ids: list[NonEmptyString]
+
+
+class DraftClaimReview(BaseModel):
+    model_config = _STRICT_MODEL_CONFIG
+
+    reviewed_claim_ids: list[NonEmptyString]
+    supported_claim_ids: list[NonEmptyString]
+    contradicted_claim_ids: list[NonEmptyString]
+
+
 class SourceOmissionCandidate(BaseModel):
     model_config = _STRICT_MODEL_CONFIG
 
@@ -168,6 +208,9 @@ class CoverageReport(BaseModel):
     steps_verified: bool
     examples_verified: bool
     conditions_verified: bool
+    numbers_verified: bool = True
+    named_entities_verified: bool = True
+    uncertainty_markers_verified: bool = True
     promotional_content_preserved: bool
     semantic_generator: NonEmptyString
     quality_gate: QualityGate
@@ -179,10 +222,14 @@ __all__ = [
     "CoverageReport",
     "CoverageReview",
     "DispositionKind",
+    "DraftClaim",
+    "DraftClaimField",
+    "DraftClaimReview",
     "EvidenceAtom",
     "ExtractionResult",
     "ProviderUsage",
     "QualityGate",
+    "RepairResult",
     "SegmentDisposition",
     "SourceOmissionCandidate",
     "SynthesisResult",

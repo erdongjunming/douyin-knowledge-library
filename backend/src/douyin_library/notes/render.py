@@ -18,6 +18,9 @@ def render_semantic_note(
     synthesis = generation.synthesis
     coverage = generation.coverage.model_dump(mode="json", by_alias=True)
     timeline_by_index = {entry.segment_index: entry for entry in synthesis.timeline}
+    disposition_by_index = {
+        item.segment_index: item for item in generation.extraction.dispositions
+    }
     timeline = [
         {
             "segment_index": segment.index,
@@ -26,24 +29,31 @@ def render_semantic_note(
             "disposition": (
                 timeline_by_index[segment.index].disposition
                 if segment.index in timeline_by_index
-                else "unintelligible_asr"
+                else _required_disposition(disposition_by_index, segment.index).disposition
             ),
             "atom_ids": (
                 list(timeline_by_index[segment.index].atom_ids)
                 if segment.index in timeline_by_index
-                else []
+                else list(
+                    _required_disposition(
+                        disposition_by_index,
+                        segment.index,
+                    ).atom_ids
+                )
             ),
             "content": segment.text,
         }
         for segment in note_input.segments
     ]
     parsed = synthesis.model_dump(mode="json")
+    evidence_map = evidence_map_from_generation(note_input, generation)
     parsed.update(
         {
             "aweme_id": note_input.aweme_id,
             "quality_gate": generation.coverage.quality_gate,
             "timeline": timeline,
             "coverage_report": coverage,
+            "evidence_map": evidence_map,
         }
     )
     learning_note = _render_learning_note(note_input, generation, timeline)
@@ -62,6 +72,9 @@ def render_semantic_note(
         "topics": list(synthesis.tags),
         "tags": list(synthesis.tags),
         "source_files": dict(note_input.source_files),
+        "transcript_variant": note_input.transcript_variant,
+        "transcript_source_kind": note_input.transcript_source_kind,
+        "cleaning_fallback": note_input.cleaning_fallback,
         "generated_at": generated_at,
         "generation_method": "semantic-evidence-linked",
         "provider": generation.provider,
@@ -80,6 +93,9 @@ def render_semantic_note(
         "duration_ms": note_input.duration_ms,
         "source_url": note_input.source_url,
         "source_files": dict(note_input.source_files),
+        "transcript_variant": note_input.transcript_variant,
+        "transcript_source_kind": note_input.transcript_source_kind,
+        "cleaning_fallback": note_input.cleaning_fallback,
         "provider": generation.provider,
         "model": generation.model,
         "quality_gate": generation.coverage.quality_gate,
@@ -100,6 +116,7 @@ def render_semantic_note(
             "page_metadata.json",
             "coverage_report.json",
             "generation_audit.json",
+            "evidence_map.json",
             "assets/asset_manifest.json",
         ],
         "copies_original_assets": False,
@@ -118,6 +135,67 @@ def render_semantic_note(
         asset_manifest=asset_manifest,
         coverage_report=coverage,
     )
+
+
+def evidence_map_from_generation(
+    note_input: NoteInput,
+    generation: SemanticGeneration,
+) -> dict[str, Any]:
+    """Project merged extraction atoms into a durable, traceable evidence map.
+
+    The semantic pipeline already performs overlapping chunk extraction and
+    deterministic merge by atom ID. This projection keeps that canonical result
+    lossless while adding explicit segment IDs and timestamp pairs for readers.
+    """
+    segments = {segment.index: segment for segment in note_input.segments}
+    items: list[dict[str, Any]] = []
+    for atom in sorted(generation.extraction.atoms, key=lambda item: item.id):
+        segment = segments.get(atom.source_segment)
+        start = atom.start if atom.start is not None else (segment.start if segment else None)
+        end = atom.end if atom.end is not None else (segment.end if segment else None)
+        items.append(
+            {
+                "id": atom.id,
+                "kind": atom.kind,
+                "topic": atom.topic,
+                "statement": atom.statement,
+                "source_segment": atom.source_segment,
+                "segment_id": (
+                    segment.segment_id
+                    if segment and segment.segment_id
+                    else f"segment-{atom.source_segment}"
+                ),
+                "start": start,
+                "end": end,
+                "timestamps": [value for value in (start, end) if value is not None],
+                "source_excerpt": atom.source_excerpt,
+                "relations": list(atom.relations),
+                "sequence": atom.sequence,
+                "is_promotional": atom.is_promotional,
+                "asr_uncertainty": list(atom.asr_uncertainty),
+            }
+        )
+    return {
+        "schema": "douyin-note-evidence-map-v1",
+        "aweme_id": note_input.aweme_id,
+        "transcript_variant": note_input.transcript_variant,
+        "transcript_source_kind": note_input.transcript_source_kind,
+        "cleaning_fallback": note_input.cleaning_fallback,
+        "items": items,
+        "segment_count": len(note_input.segments),
+        "dispositions": [
+            item.model_dump(mode="json") for item in generation.extraction.dispositions
+        ],
+    }
+
+
+def _required_disposition(dispositions: dict[int, Any], segment_index: int) -> Any:
+    try:
+        return dispositions[segment_index]
+    except KeyError as exc:
+        raise ValueError(
+            f"missing extraction disposition for segment {segment_index}"
+        ) from exc
 
 
 def _render_learning_note(
@@ -141,6 +219,8 @@ def _render_learning_note(
         f"- 作者唯一 ID：{note_input.author_unique_id or '未知'}",
         f"- 发布时间：{note_input.published_at or '未知'}",
         f"- 原始链接：{note_input.source_url or '未知'}",
+        f"- 转写变体：{note_input.transcript_variant} ({note_input.transcript_source_kind})",
+        f"- 清洗回退：{note_input.cleaning_fallback or '无'}",
         f"- 时长：{_duration_label(note_input.duration_ms)}",
         "",
         "## 一句话总览",
@@ -185,6 +265,13 @@ def _render_learning_note(
             "- “我的理解与启发”是生成理解，不等同于作者观点。",
         ]
     )
+    uncertain = [
+        marker
+        for atom in generation.extraction.atoms
+        for marker in atom.asr_uncertainty
+    ]
+    if uncertain:
+        lines.append("- 未确认内容：" + "；".join(dict.fromkeys(uncertain)))
     lines.extend(f"- 输入警告：{warning}" for warning in note_input.warnings)
     return "\n".join(lines).rstrip() + "\n"
 
@@ -209,6 +296,9 @@ def _note_budget(
     segment_chars = sum(len(segment.text) for segment in note_input.segments)
     metadata_chars = len(json.dumps(note_input.metadata, ensure_ascii=False))
     complete_input_chars = transcript_chars + segment_chars + metadata_chars
+    evidence_types = sorted({atom.kind for atom in generation.extraction.atoms})
+    recommended_detail = _recommended_detail(evidence_types)
+    execution_mode = _execution_mode(generation)
     return {
         "schema": "douyin-note-budget-v2",
         "aweme_id": note_input.aweme_id,
@@ -235,6 +325,18 @@ def _note_budget(
         "input_truncated": False,
         "provider": generation.provider,
         "model": generation.model,
+        "recommended_detail": {
+            "level": recommended_detail["level"],
+            "evidence_types": evidence_types,
+            "reason": recommended_detail["reason"],
+        },
+        "execution": {
+            "mode": execution_mode,
+            "provider": generation.provider,
+            "model": generation.model,
+            "is_local": generation.is_local,
+            "is_external": execution_mode == "external",
+        },
         "prompt_versions": dict(generation.prompt_versions),
         "usage": generation.usage.model_dump(mode="json"),
         "api_cost": generation.usage.api_cost,
@@ -245,6 +347,42 @@ def _note_budget(
         "quality_gate": generation.coverage.quality_gate,
         "generated_at": generated_at,
     }
+
+
+def _recommended_detail(evidence_types: list[str]) -> dict[str, str]:
+    """Choose detail from the evidence shape, not transcript length."""
+    high_fidelity_types = {
+        "step",
+        "example",
+        "counterexample",
+        "condition",
+        "warning",
+        "number",
+        "recommendation",
+        "promotion",
+    }
+    if not evidence_types:
+        return {
+            "level": "minimal",
+            "reason": "未提取到证据 atom，只能保留基础时间线。",
+        }
+    if high_fidelity_types.intersection(evidence_types):
+        return {
+            "level": "full",
+            "reason": "包含步骤、案例、条件、风险或行动号召等需要完整保留的证据类型。",
+        }
+    return {
+        "level": "standard",
+        "reason": "当前证据以一般观点为主，保留主题与时间线即可复盘。",
+    }
+
+
+def _execution_mode(generation: SemanticGeneration) -> str:
+    if generation.is_local:
+        return "local"
+    if generation.provider.strip().casefold() in {"rule", "local-rule"}:
+        return "rule"
+    return "external"
 
 
 def _note_score(
