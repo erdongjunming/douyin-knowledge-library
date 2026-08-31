@@ -39,6 +39,11 @@ def test_parse_vtt_ass_and_plain_text() -> None:
     assert parse_subtitle(ssa, ".ssa")[0].text == "SSA字幕"
 
 
+def test_ass_dialogue_detection_ignores_leading_whitespace() -> None:
+    raw = "  Dialogue: 0,0:00:00.00,0:00:01.00,Default,,0,0,0,,前导空白"
+    assert parse_subtitle(raw)[0].text == "前导空白"
+
+
 def test_bad_empty_and_placeholder_subtitles_fail_quality() -> None:
     assert not score_subtitle(parse_subtitle("", ".srt")).usable
     bad = parse_subtitle("1\nnot-a-time --> 00:01:00,000\nhello", ".srt")

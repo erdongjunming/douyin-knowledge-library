@@ -76,7 +76,7 @@ def parse_subtitle(raw_text: str, format_hint: str | None = None) -> tuple[Trans
     hint = (format_hint or "").lower()
     lines = raw_text.replace("\r\n", "\n").replace("\r", "\n").split("\n")
     if hint in {".ass", ".ssa", "ass", "ssa"} or any(
-        line.startswith("Dialogue:") for line in lines
+        line.strip().startswith("Dialogue:") for line in lines
     ):
         output: list[TranscriptSegment] = []
         for line in lines:
