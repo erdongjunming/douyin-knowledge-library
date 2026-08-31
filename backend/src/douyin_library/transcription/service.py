@@ -250,6 +250,8 @@ class TranscriptionService:
                 Transcript.work_id == work.id,
                 Transcript.engine == self.engine,
                 Transcript.model == self.settings.transcription_model,
+                Transcript.source_kind == "asr",
+                Transcript.variant == "raw",
                 Transcript.status == "succeeded",
             )
         )

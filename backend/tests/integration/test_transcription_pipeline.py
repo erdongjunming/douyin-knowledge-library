@@ -170,6 +170,87 @@ async def test_existing_successful_transcript_is_reused_without_subprocess(tmp_p
 
 
 @pytest.mark.asyncio
+async def test_existing_cleaned_transcript_is_not_reused_as_asr_raw(
+    tmp_path: Path,
+) -> None:
+    engine = create_engine(f"sqlite:///{tmp_path / 'library.db'}")
+    create_schema(engine)
+    storage = tmp_path / "storage"
+    audio_path = storage / "audio" / "732-cleaned.m4a"
+    audio_path.parent.mkdir(parents=True)
+    audio_path.write_bytes(b"existing-audio")
+    with Session(engine) as setup_session:
+        work = Work(aweme_id="732-cleaned")
+        setup_session.add(work)
+        setup_session.flush()
+        work_id = work.id
+        setup_session.add_all(
+            [
+                Asset(work_id=work.id, kind="audio", path=str(audio_path)),
+                Transcript(
+                    work_id=work.id,
+                    engine="qwen3-asr",
+                    model="Qwen/Qwen3-ASR-0.6B",
+                    source_kind="asr",
+                    variant="raw",
+                    text="原始转录",
+                    status="failed",
+                ),
+            ]
+        )
+        setup_session.flush()
+        raw = setup_session.scalar(select(Transcript).where(Transcript.work_id == work.id))
+        setup_session.add(
+            Transcript(
+                work_id=work.id,
+                engine="qwen3-asr",
+                model="Qwen/Qwen3-ASR-0.6B",
+                source_kind="asr",
+                variant="cleaned",
+                parent_transcript_id=raw.id,
+                text="清洗转录",
+                status="succeeded",
+            )
+        )
+        setup_session.commit()
+
+    class WritesFreshRaw:
+        async def run(self, *, audio_path: Path, result_path: Path) -> SubprocessResult:
+            del audio_path
+            result_path.parent.mkdir(parents=True, exist_ok=True)
+            result_path.write_text(
+                json.dumps({"text": "新原始转录", "segments": []}),
+                encoding="utf-8",
+            )
+            return SubprocessResult(returncode=0, stdout="", stderr="")
+
+    runtime = build_worker_runtime(
+        engine,
+        Settings(storage_root=storage),
+        cookie_store=NoCookieStore(),
+        transcriber_factory=lambda settings: WritesFreshRaw(),
+    )
+    try:
+        runtime.queue.create(kind="transcribe_work", work_id=work_id)
+        assert await runtime.handlers.run_one() is True
+        current_job = runtime.session.scalar(select(Job).where(Job.work_id == work_id))
+        assert current_job is not None, current_job
+        assert current_job.status == "succeeded", current_job.error_detail
+        raw_rows = runtime.session.scalars(
+            select(Transcript).where(
+                Transcript.work_id == work_id,
+                Transcript.variant == "raw",
+                Transcript.status == "succeeded",
+            )
+        ).all()
+        assert len(raw_rows) == 1
+        assert raw_rows[0].text == "新原始转录"
+    finally:
+        runtime.close()
+        engine.dispose()
+
+
+@pytest.mark.asyncio
 async def test_missing_current_asr_output_does_not_reuse_stale_result(
     tmp_path: Path,
 ) -> None:
