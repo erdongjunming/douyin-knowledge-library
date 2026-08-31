@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import inspect
 import json
 import os
@@ -24,18 +25,16 @@ from douyin_library.media.metadata import file_sha256
 from douyin_library.media.storage import StorageLayout
 from douyin_library.models import Asset, Job, Transcript, Work
 from douyin_library.notes.publisher import note_publication_lock
+from douyin_library.transcription.contracts import (
+    CleanerResult,
+    TranscriptDraft,
+    TranscriptSegment,
+)
 
 DEFAULT_QWEN_PYTHON = (
-    Path.home()
-    / ".cache"
-    / "rimagination-notes"
-    / "qwen3-asr-venv"
-    / "Scripts"
-    / "python.exe"
+    Path.home() / ".cache" / "rimagination-notes" / "qwen3-asr-venv" / "Scripts" / "python.exe"
 )
-DEFAULT_QWEN_SCRIPT = (
-    Path.home() / ".codex" / "skills" / "dy-note" / "scripts" / "run_qwen_asr.py"
-)
+DEFAULT_QWEN_SCRIPT = Path.home() / ".codex" / "skills" / "dy-note" / "scripts" / "run_qwen_asr.py"
 
 
 @dataclass(frozen=True, slots=True)
@@ -181,6 +180,7 @@ class TranscriptionService:
         settings: Settings,
         transcriber: Transcriber,
         *,
+        subtitle_provider: Any | None = None,
         lease_store: ResourceLeaseStore | None = None,
         worker_id: str | None = None,
     ) -> None:
@@ -188,6 +188,7 @@ class TranscriptionService:
         self.layout = layout
         self.settings = settings
         self.transcriber = transcriber
+        self.subtitle_provider = subtitle_provider
         # A lease store uses short independent transactions, which is
         # important while another process (the general worker) owns the GPU.
         self.lease_store = lease_store or ResourceLeaseStore(session.get_bind())
@@ -201,6 +202,11 @@ class TranscriptionService:
         cancel_event: asyncio.Event | None = None,
     ) -> Transcript:
         self.layout.initialize()
+        subtitle_provider = self.subtitle_provider
+        if subtitle_provider is not None:
+            subtitle = subtitle_provider.discover(work)
+            if subtitle is not None:
+                return self._process_subtitle(job, work, subtitle, cancel_event=cancel_event)
         audio = self.session.scalar(
             select(Asset).where(Asset.work_id == work.id, Asset.kind == "audio")
         )
@@ -298,9 +304,7 @@ class TranscriptionService:
                 os.replace(attempt_result_path, result_path)
                 transcript = self._save_transcript(work, payload)
                 output_paths = self._write_outputs(work, payload)
-                published_snapshot = _snapshot_files(
-                    (result_path, *output_paths)
-                )
+                published_snapshot = _snapshot_files((result_path, *output_paths))
                 await self._commit_if_owned(job, lease_handle)
                 committed = True
                 recorder.succeed(
@@ -346,6 +350,77 @@ class TranscriptionService:
         finally:
             attempt_result_path.unlink(missing_ok=True)
             await self._release_gpu(lease_handle)
+
+    async def _process_subtitle(
+        self, job: Job, work: Work, draft: Any, *, cancel_event: asyncio.Event | None
+    ) -> Transcript:
+        _raise_if_cancelled(cancel_event)
+        existing = self.session.scalar(
+            select(Transcript)
+            .where(
+                Transcript.work_id == work.id,
+                Transcript.variant == "raw",
+                Transcript.source_kind == "subtitle",
+                Transcript.status == "succeeded",
+            )
+            .order_by(Transcript.id.desc())
+        )
+        if existing is not None:
+            return existing
+        recorder = ProcessingAuditRecorder(
+            self.session,
+            audit_root=self.settings.storage_root / "audit",
+            inline_max_bytes=self.settings.audit_inline_max_bytes,
+        )
+        audit = recorder.start(
+            operation="transcribe_work",
+            processor="subtitle_local",
+            model="subtitle",
+            version="1",
+            job=job,
+            request={"source_kind": "subtitle"},
+        )
+        try:
+            with note_publication_lock(self.settings.storage_root, work.aweme_id):
+                text_path = self.layout.transcript_text_path(work.aweme_id)
+                segments_path = self.layout.transcript_segments_path(work.aweme_id)
+                text_path.parent.mkdir(parents=True, exist_ok=True)
+                text_path.write_text(draft.text.strip(), encoding="utf-8")
+                segments = [
+                    {"id": s.segment_id, "start": s.start, "end": s.end, "text": s.text}
+                    for s in draft.segments
+                ]
+                segments_path.write_text(
+                    json.dumps(segments, ensure_ascii=False, indent=2), encoding="utf-8"
+                )
+                transcript = Transcript(
+                    work_id=work.id,
+                    engine="subtitle-local",
+                    model="subtitle",
+                    source_kind="subtitle",
+                    variant="raw",
+                    language=draft.language,
+                    text=draft.text.strip(),
+                    segments_json=json.dumps(segments, ensure_ascii=False),
+                    status="succeeded",
+                )
+                self.session.add(transcript)
+                self.session.flush()
+                self._upsert_asset(work.id, "transcript_text", text_path, "text/plain")
+                self._upsert_asset(
+                    work.id, "transcript_segments", segments_path, "application/json"
+                )
+                await self._commit_if_owned(job)
+                recorder.succeed(
+                    audit,
+                    response={"source_kind": "subtitle"},
+                    output_files=(text_path, segments_path),
+                )
+                return transcript
+        except Exception as exc:
+            self.session.rollback()
+            recorder.fail(audit, error=str(exc))
+            raise
 
     async def _renew_lease(self, lease_handle: object | None) -> None:
         if lease_handle is None:
@@ -400,9 +475,7 @@ class TranscriptionService:
             statement = statement.where(Job.worker_id.is_(None))
         else:
             statement = statement.where(Job.worker_id == owner_worker_id)
-        result = self.session.execute(
-            statement.values(heartbeat_at=datetime.now(UTC))
-        )
+        result = self.session.execute(statement.values(heartbeat_at=datetime.now(UTC)))
         if not result.rowcount:
             raise JobCancelledError("cancelled_by_user")
         self.session.commit()
@@ -530,6 +603,307 @@ class TranscriptionService:
         asset.mime_type = mime_type
         asset.bytes = path.stat().st_size
         asset.sha256 = file_sha256(path)
+
+
+class TranscriptCleaningService:
+    """Derive an immutable cleaned transcript from a successful raw transcript."""
+
+    engine = "ollama-cleaner"
+    audit_version = "1"
+
+    def __init__(
+        self,
+        session: Session,
+        layout: StorageLayout,
+        settings: Settings,
+        cleaner: Any,
+        *,
+        lease_store: ResourceLeaseStore | None = None,
+        worker_id: str | None = None,
+    ) -> None:
+        self.session = session
+        self.layout = layout
+        self.settings = settings
+        self.cleaner = cleaner
+        self.lease_store = lease_store or ResourceLeaseStore(session.get_bind())
+        self.worker_id = worker_id or "general-worker"
+
+    async def process(
+        self,
+        job: Job,
+        work: Work,
+        *,
+        cancel_event: asyncio.Event | None = None,
+        raw_transcript_id: int | None = None,
+        raw_fingerprint: str | None = None,
+        cleaner_model: str | None = None,
+        prompt_version: str | None = None,
+    ) -> Transcript:
+        self.layout.initialize()
+        raw_query = select(Transcript).where(
+            Transcript.work_id == work.id,
+            Transcript.variant == "raw",
+            Transcript.status == "succeeded",
+        )
+        if raw_transcript_id is not None:
+            raw_query = raw_query.where(Transcript.id == raw_transcript_id)
+        else:
+            raw_query = raw_query.order_by(Transcript.id.desc())
+        raw = self.session.scalar(raw_query)
+        if raw is None or not raw.text:
+            raise RuntimeError("clean_transcript_stale_input")
+        current_fingerprint = _transcript_fingerprint(raw)
+        if raw_fingerprint is not None and raw_fingerprint != current_fingerprint:
+            raise RuntimeError("clean_transcript_stale_input")
+        raw_fingerprint = current_fingerprint
+        model = str(getattr(self.cleaner, "model", self.settings.transcription_cleaner_model))
+        current_prompt_version = str(
+            getattr(
+                self.cleaner, "prompt_version", self.settings.transcription_cleaner_prompt_version
+            )
+        )
+        if cleaner_model is not None and cleaner_model != model:
+            raise RuntimeError("clean_transcript_stale_input")
+        if prompt_version is not None and prompt_version != current_prompt_version:
+            raise RuntimeError("clean_transcript_stale_input")
+        prompt_version = current_prompt_version
+        existing = self.session.scalar(
+            select(Transcript).where(
+                Transcript.work_id == work.id,
+                Transcript.variant == "cleaned",
+                Transcript.status == "succeeded",
+                Transcript.parent_transcript_id == raw.id,
+                Transcript.engine == raw.engine,
+                Transcript.model == raw.model,
+                Transcript.word_timestamps_json
+                == json.dumps(
+                    {
+                        "raw_fingerprint": raw_fingerprint,
+                        "cleaner_model": model,
+                        "prompt_version": prompt_version,
+                    },
+                    sort_keys=True,
+                ),
+            )
+        )
+        if existing is not None:
+            return existing
+
+        recorder = ProcessingAuditRecorder(
+            self.session,
+            audit_root=self.settings.storage_root / "audit",
+            inline_max_bytes=self.settings.audit_inline_max_bytes,
+        )
+        audit = recorder.start(
+            operation="clean_transcript_work",
+            processor=str(getattr(self.cleaner, "name", self.engine)),
+            model=model,
+            version=prompt_version,
+            job=job,
+            request={
+                "raw_transcript_id": raw.id,
+                "raw_fingerprint": raw_fingerprint,
+                "prompt_version": prompt_version,
+            },
+        )
+        lease_handle = None
+        output_paths = (
+            self.layout.transcript_cleaned_text_path(work.aweme_id),
+            self.layout.transcript_cleaned_json_path(work.aweme_id),
+        )
+        snapshot = _snapshot_files(output_paths)
+        published_expected: dict[Path, bytes | None] | None = None
+        staged_paths: tuple[Path, ...] = ()
+        committed = False
+        try:
+            lease_handle = await self._acquire_gpu(job, cancel_event)
+            _raise_if_cancelled(cancel_event)
+            if getattr(self.cleaner, "_lease_checker", None) is None:
+                try:
+                    self.cleaner._lease_checker = lambda: self.lease_store.is_owned(lease_handle)
+                except (AttributeError, TypeError):
+                    pass
+            draft = _draft_from_raw(raw)
+            cleaner_kwargs: dict[str, Any] = {}
+            with suppress(TypeError, ValueError):
+                if "cancel_event" in inspect.signature(self.cleaner.clean).parameters:
+                    cleaner_kwargs["cancel_event"] = cancel_event
+            result = await self.cleaner.clean(draft, **cleaner_kwargs)
+            cleaned = _validate_cleaner_result(result, draft)
+            with note_publication_lock(self.settings.storage_root, work.aweme_id):
+                await self._assert_lease_owned(lease_handle)
+                staged = tuple(_attempt_result_path(path) for path in output_paths)
+                staged_paths = staged
+                output_paths[0].parent.mkdir(parents=True, exist_ok=True)
+                staged[0].write_text(cleaned.text.strip(), encoding="utf-8")
+                staged[1].write_text(
+                    json.dumps(
+                        [
+                            {"id": s.segment_id, "start": s.start, "end": s.end, "text": s.text}
+                            for s in cleaned.segments
+                        ],
+                        ensure_ascii=False,
+                        indent=2,
+                    ),
+                    encoding="utf-8",
+                )
+                for source, target in zip(staged, output_paths, strict=True):
+                    os.replace(source, target)
+                published_expected = _snapshot_files(output_paths)
+                transcript = Transcript(
+                    work_id=work.id,
+                    engine=raw.engine,
+                    model=raw.model,
+                    source_kind=raw.source_kind,
+                    variant="cleaned",
+                    parent_transcript_id=raw.id,
+                    language=cleaned.language or raw.language,
+                    text=cleaned.text,
+                    segments_json=json.dumps(
+                        [
+                            {"id": s.segment_id, "start": s.start, "end": s.end, "text": s.text}
+                            for s in cleaned.segments
+                        ],
+                        ensure_ascii=False,
+                    ),
+                    word_timestamps_json=json.dumps(
+                        {
+                            "raw_fingerprint": raw_fingerprint,
+                            "cleaner_model": model,
+                            "prompt_version": prompt_version,
+                        },
+                        sort_keys=True,
+                    ),
+                    status="succeeded",
+                )
+                self.session.add(transcript)
+                await self._commit_if_owned(job, lease_handle)
+                committed = True
+                recorder.succeed(
+                    audit,
+                    response={"raw_fingerprint": raw_fingerprint, "prompt_version": prompt_version},
+                    output_files=output_paths,
+                )
+                return transcript
+        except JobCancelledError as exc:
+            self.session.rollback()
+            if not committed:
+                with note_publication_lock(self.settings.storage_root, work.aweme_id):
+                    if published_expected is None:
+                        _restore_files(snapshot)
+                    else:
+                        _restore_files(snapshot, expected=published_expected)
+            recorder.cancel(audit, error=str(exc), output_files=output_paths)
+            raise
+        except Exception as exc:
+            self.session.rollback()
+            if not committed:
+                with note_publication_lock(self.settings.storage_root, work.aweme_id):
+                    if published_expected is None:
+                        _restore_files(snapshot)
+                    else:
+                        _restore_files(snapshot, expected=published_expected)
+            recorder.fail(audit, error=str(exc), output_files=output_paths)
+            raise
+        finally:
+            for staged_path in staged_paths:
+                staged_path.unlink(missing_ok=True)
+            await self._release_gpu(lease_handle)
+
+    async def _acquire_gpu(self, job: Job, cancel_event: asyncio.Event | None) -> object:
+        resource = getattr(self.settings, "gpu_resource_name", "gpu:0")
+        poll = max(0.01, float(getattr(self.settings, "gpu_lease_poll_seconds", 0.5)))
+        ttl = float(getattr(self.settings, "gpu_lease_ttl_seconds", 120.0))
+        owner = job.worker_id or self.worker_id
+        while True:
+            _raise_if_cancelled(cancel_event)
+            current = self.session.get(Job, job.id)
+            if current is None or current.status != "running":
+                raise JobCancelledError("cancelled_by_user")
+            if current.stage != "waiting_gpu":
+                current.stage = "waiting_gpu"
+                self.session.commit()
+            handle = self.lease_store.try_acquire(resource, owner, job.id, ttl=ttl)
+            if handle is not None:
+                current.stage = "clean"
+                self.session.commit()
+                return handle
+            await asyncio.sleep(poll)
+
+    async def _assert_lease_owned(self, handle: object | None) -> None:
+        if handle is not None and not self.lease_store.is_owned(handle):
+            raise JobCancelledError("gpu_lease_lost")
+
+    async def _commit_if_owned(self, job: Job, handle: object | None) -> None:
+        await self._assert_lease_owned(handle)
+        result = self.session.execute(
+            update(Job)
+            .where(Job.id == job.id, Job.status == "running", Job.worker_id == job.worker_id)
+            .values(heartbeat_at=datetime.now(UTC))
+        )
+        if not result.rowcount:
+            raise JobCancelledError("cancelled_by_user")
+        self.session.commit()
+
+    async def _release_gpu(self, handle: object | None) -> None:
+        if handle is not None:
+            with suppress(Exception):
+                self.lease_store.release(handle)
+
+
+def _draft_from_raw(raw: Transcript) -> TranscriptDraft:
+    values = json.loads(raw.segments_json or "[]")
+    if not isinstance(values, list):
+        raise RuntimeError("raw_transcript_segments_invalid")
+    segments: list[TranscriptSegment] = []
+    for index, value in enumerate(values):
+        if not isinstance(value, dict) or not isinstance(value.get("text"), str):
+            raise RuntimeError("raw_transcript_segments_invalid")
+        segments.append(
+            TranscriptSegment(
+                str(value.get("id") or index), value.get("start"), value.get("end"), value["text"]
+            )
+        )
+    if not segments:
+        raise RuntimeError("raw_transcript_segments_invalid")
+    return TranscriptDraft(tuple(segments), raw.text or "", raw.language, raw.source_kind)
+
+
+def _validate_cleaner_result(result: Any, draft: TranscriptDraft):
+    cleaned = result.transcript if isinstance(result, CleanerResult) else result
+    if isinstance(result, CleanerResult) and not result.usable:
+        raise RuntimeError("cleaner_result_not_usable")
+    if (
+        not hasattr(cleaned, "segments")
+        or not hasattr(cleaned, "text")
+        or not cleaned.text.strip()
+        or not cleaned.segments
+        or len(cleaned.segments) != len(draft.segments)
+    ):
+        raise RuntimeError("cleaner_result_invalid")
+    for original, edited in zip(draft.segments, cleaned.segments, strict=True):
+        if (
+            edited.segment_id != original.segment_id
+            or edited.start != original.start
+            or edited.end != original.end
+            or not isinstance(edited.text, str)
+            or not edited.text.strip()
+        ):
+            raise RuntimeError("cleaner_result_invalid")
+    return cleaned
+
+
+def _transcript_fingerprint(raw: Transcript) -> str:
+    payload = json.dumps(
+        {
+            "text": raw.text or "",
+            "segments": json.loads(raw.segments_json or "[]"),
+            "source_kind": raw.source_kind,
+        },
+        ensure_ascii=False,
+        sort_keys=True,
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
 def _snapshot_files(paths: tuple[Path, ...]) -> dict[Path, bytes | None]:
