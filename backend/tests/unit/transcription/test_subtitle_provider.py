@@ -47,6 +47,8 @@ def test_bad_empty_and_placeholder_subtitles_fail_quality() -> None:
     assert not quality.usable
     placeholder = parse_subtitle("[音乐]\n字幕\n", ".txt")
     assert score_subtitle(placeholder).placeholder_ratio > 0
+    assert score_subtitle(parse_subtitle("（音效）", ".txt")).usable is False
+    assert score_subtitle(parse_subtitle("♪♪♪", ".txt")).usable is False
 
 
 def test_non_finite_timestamps_are_rejected() -> None:
@@ -56,6 +58,11 @@ def test_non_finite_timestamps_are_rejected() -> None:
     quality = score_subtitle(direct)
     assert not quality.timestamp_valid
     assert not quality.usable
+
+
+def test_out_of_range_clock_fields_are_rejected() -> None:
+    parsed = parse_subtitle("00:00:99.000 --> 00:01:00.000\n错误时间", ".srt")
+    assert not score_subtitle(parsed).timestamp_valid
 
 
 def test_one_real_sentence_short_video_is_usable() -> None:
@@ -128,3 +135,14 @@ def test_local_provider_uses_first_usable_candidate(tmp_path: Path) -> None:
     assert draft is not None
     assert draft.provider == "subtitle_local"
     assert draft.text == "真实字幕"
+
+
+def test_local_provider_reads_work_associated_asset_path(tmp_path: Path) -> None:
+    asset = tmp_path / "captions" / "external-caption.vtt"
+    asset.parent.mkdir(parents=True)
+    asset.write_text("WEBVTT\n\n00:00.000 --> 00:01.000\n关联字幕", encoding="utf-8")
+    settings = Settings(storage_root=tmp_path / "storage")
+    provider = LocalSubtitleProvider(settings, asset_paths=lambda work: [asset])
+    draft = provider.discover(Work(aweme_id="asset-work", duration_ms=1000))
+    assert draft is not None
+    assert draft.text == "关联字幕"

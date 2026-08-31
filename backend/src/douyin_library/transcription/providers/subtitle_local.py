@@ -3,13 +3,17 @@ from __future__ import annotations
 import html
 import math
 import re
+from collections.abc import Callable, Iterable
 from copy import copy
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from sqlalchemy import select
+from sqlalchemy.orm import Session
+
 from douyin_library.media.storage import StorageLayout
-from douyin_library.models import Work
+from douyin_library.models import Asset, Work
 from douyin_library.transcription.contracts import TranscriptDraft, TranscriptSegment
 
 
@@ -26,9 +30,11 @@ class SubtitleQuality:
 _TIMING = re.compile(r"^\s*(\S+)\s+-->\s+(\S+)(?:\s+.*)?$")
 _TAG = re.compile(r"<[^>]*>|\{\\[^}]*\}")
 _PLACEHOLDER = re.compile(
-    r"^(?:\[?(?:music|song|applause|laughter|noise|silence|音乐|歌声|掌声|笑声|音效|无声)\]?)$",
+    r"^[\[\(（【]?\s*(?:music|song|applause|laughter|noise|silence|"
+    r"sound effect|字幕|音乐|歌声|掌声|笑声|音效|无声)\s*[\]\)）】]?$",
     re.I,
 )
+_NOISE_ONLY = re.compile(r"^[.…·~～\-_=♪♫♬]+$")
 
 
 def _clean_text(value: str) -> str:
@@ -46,12 +52,20 @@ def _seconds(value: str) -> float | None:
     parts = value.split(":")
     try:
         if len(parts) == 2:
-            minutes, seconds = parts
-            result = float(minutes) * 60 + float(seconds)
+            minutes, seconds = float(parts[0]), float(parts[1])
+            if minutes < 0 or seconds < 0 or seconds >= 60:
+                return None
+            result = minutes * 60 + seconds
             return result if math.isfinite(result) else None
         if len(parts) == 3:
-            hours, minutes, seconds = parts
-            result = float(hours) * 3600 + float(minutes) * 60 + float(seconds)
+            hours, minutes, seconds = (
+                float(parts[0]),
+                float(parts[1]),
+                float(parts[2]),
+            )
+            if hours < 0 or minutes < 0 or minutes >= 60 or seconds < 0 or seconds >= 60:
+                return None
+            result = hours * 3600 + minutes * 60 + seconds
             return result if math.isfinite(result) else None
     except ValueError:
         return None
@@ -66,9 +80,10 @@ def parse_subtitle(raw_text: str, format_hint: str | None = None) -> tuple[Trans
     ):
         output: list[TranscriptSegment] = []
         for line in lines:
-            if not line.startswith("Dialogue:"):
+            dialogue = line.strip()
+            if not dialogue.startswith("Dialogue:"):
                 continue
-            fields = line[len("Dialogue:") :].lstrip().split(",", 9)
+            fields = dialogue[len("Dialogue:") :].lstrip().split(",", 9)
             if len(fields) < 10:
                 output.append(TranscriptSegment(f"segment-{len(output) + 1}", -1, -1, ""))
                 continue
@@ -160,7 +175,9 @@ def score_subtitle(
             timestamp_valid = False
             break
         previous_start = segment.start
-    placeholders = sum(bool(_PLACEHOLDER.fullmatch(text)) for text in texts)
+    placeholders = sum(
+        bool(_PLACEHOLDER.fullmatch(text) or _NOISE_ONLY.fullmatch(text)) for text in texts
+    )
     ratio = placeholders / len(texts) if texts else 0.0
     if not texts:
         reason = "empty_text"
@@ -184,8 +201,17 @@ def score_subtitle(
 
 
 class LocalSubtitleProvider:
-    def __init__(self, settings: Any, layout: StorageLayout | None = None) -> None:
+    def __init__(
+        self,
+        settings: Any,
+        layout: StorageLayout | None = None,
+        *,
+        session: Session | None = None,
+        asset_paths: Callable[[Work], Iterable[Path]] | None = None,
+    ) -> None:
         self.settings = settings
+        self.session = session
+        self.asset_paths = asset_paths
         default_layout = layout or StorageLayout(Path(settings.storage_root))
         configured_root = getattr(settings, "transcription_subtitle_root", None)
         default_root = Path(settings.storage_root) / "subtitle"
@@ -195,7 +221,21 @@ class LocalSubtitleProvider:
             self.layout.subtitle = Path(configured_root)
 
     def discover(self, work: Work) -> TranscriptDraft | None:
-        for path in self.layout.subtitle_candidate_paths(work.aweme_id):
+        candidates = list(self.layout.subtitle_candidate_paths(work.aweme_id))
+        if self.session is not None and getattr(work, "id", None) is not None:
+            assets = self.session.scalars(
+                select(Asset).where(Asset.work_id == work.id, Asset.kind == "subtitle")
+            ).all()
+            candidates.extend(Path(asset.path) for asset in assets if asset.path)
+        if self.asset_paths is not None:
+            candidates.extend(Path(path) for path in self.asset_paths(work))
+
+        seen: set[Path] = set()
+        for path in candidates:
+            path = Path(path)
+            if path in seen:
+                continue
+            seen.add(path)
             if not path.is_file():
                 continue
             try:
