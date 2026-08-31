@@ -14,6 +14,17 @@ class Settings(BaseSettings):
 
     storage_root: Path = Path(r"D:\DouyinKnowledgeLibrary")
     transcription_subtitle_root: Path | None = None
+    transcription_subtitle_enabled: bool = True
+    transcription_cleaning_enabled: bool = False
+    transcription_cleaner_model: str = "qwen3:4b"
+    transcription_cleaner_timeout_seconds: float = Field(default=600, ge=10, le=3600)
+    transcription_cleaner_batch_character_limit: int = Field(
+        default=12000, ge=1000, le=1_000_000
+    )
+    transcription_cleaner_drift_ratio: float = Field(default=0.5, ge=0, le=1)
+    transcription_cleaner_prompt_version: str = "v1"
+    transcription_cleaner_keep_alive: str = "10m"
+    transcription_cleaner_thinking: bool = False
     job_concurrency: int = Field(default=2, ge=1, le=8)
     transcription_concurrency: int = Field(default=1, ge=1, le=2)
     job_heartbeat_seconds: float = Field(default=10.0, ge=1.0, le=60.0)
@@ -73,6 +84,18 @@ class Settings(BaseSettings):
         stripped = value.strip()
         if not stripped:
             raise ValueError("note_ollama_keep_alive_empty")
+        return stripped
+
+    @field_validator(
+        "transcription_cleaner_keep_alive",
+        "transcription_cleaner_model",
+        "transcription_cleaner_prompt_version",
+    )
+    @classmethod
+    def _strip_cleaner_strings(cls, value: str) -> str:
+        stripped = value.strip()
+        if not stripped:
+            raise ValueError("transcription_cleaner_value_empty")
         return stripped
 
 
