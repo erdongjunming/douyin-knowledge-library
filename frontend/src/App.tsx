@@ -2,7 +2,11 @@ import {
   Archive,
   BookOpenText,
   CheckCircle2,
+  ChevronLeft,
+  ChevronRight,
   CircleAlert,
+  FileText,
+  Gauge,
   KeyRound,
   ListChecks,
   LoaderCircle,
@@ -10,15 +14,16 @@ import {
   RefreshCw,
   Search,
   Settings,
+  Square,
   Trash2,
-  X,
 } from "lucide-react"
-import { useEffect, useMemo, useState } from "react"
+import { useEffect, useState } from "react"
 
 import "./styles.css"
+import { NoteReader } from "./NoteReader"
 
 type ViewKey = "creator" | "favorites" | "jobs" | "library" | "settings"
-type ConnectionState = "connecting" | "connected" | "disconnected"
+type ConnectionState = "connecting" | "connected" | "degraded" | "disconnected"
 
 type CreatorPreview = {
   sec_uid: string
@@ -51,19 +56,64 @@ type Work = {
   topics: string[]
   transcript_status: string | null
   transcript_preview: string | null
+  transcript_variant?: string | null
+  transcript_source_kind?: string | null
+  cleaner_model?: string | null
+  cleaning_fallback?: string | null
+  note_status: string
+  note_available: boolean
+  note_preview: string | null
+  extraction_status: string
+  failure: { stage: string; reason: string } | null
+  note_quality_status?: "semantic_complete" | "fallback" | "legacy" | "unknown" | "missing" | string | null
+  note_provider?: string | null
+  note_model?: string | null
+  note_quality_gate?: string | null
+  note_coverage?: { segment_total?: number | null; segment_disposition_count?: number | null; evidence_atom_total?: number | null; evidence_atom_included?: number | null } | null
+  note_segment_coverage?: { covered?: number | null; total?: number | null; percent?: number | null } | null
+  note_atom_coverage?: { covered?: number | null; total?: number | null; percent?: number | null } | null
 }
 
 type WorkDetail = {
   id: number
   aweme_id?: string
   description?: string | null
+  note: { path: string; text: string } | null
+  note_status: string
+  extraction_status: string
+  failure: { stage: string; reason: string } | null
   transcript: {
     engine: string
     model: string
     language: string | null
     text: string
     segments: Array<{ start?: number; end?: number; text?: string }>
+    variant?: string | null
+    source_kind?: string | null
+    cleaner_model?: string | null
+    cleaner_prompt_version?: string | null
+    cleaning_fallback?: string | null
   } | null
+  transcript_variant?: string | null
+  transcript_source_kind?: string | null
+  cleaner_model?: string | null
+  cleaning_fallback?: string | null
+  note_quality_status?: string | null
+  note_provider?: string | null
+  note_model?: string | null
+  note_quality_gate?: string | null
+  note_coverage?: { segment_total?: number | null; segment_disposition_count?: number | null; evidence_atom_total?: number | null; evidence_atom_included?: number | null } | null
+  note_segment_coverage?: { covered?: number | null; total?: number | null; percent?: number | null } | null
+  note_atom_coverage?: { covered?: number | null; total?: number | null; percent?: number | null } | null
+}
+
+type WorkListResponse = {
+  items: Work[]
+  total?: number
+  limit?: number
+  offset?: number
+  has_more?: boolean
+  failed_total?: number
 }
 
 type CookieStatus = {
@@ -75,6 +125,62 @@ type CookieSaveResult = CookieStatus & {
   account_nickname: string | null
   expires_or_unknown: string
   risk_controlled: boolean
+}
+
+type ProcessingProgress = {
+  works: {
+    collected: number
+    audio_ready: number
+  }
+  audio_extraction: {
+    total: number
+    completed: number
+    running: number
+    pending: number
+    failed: number
+    not_queued: number
+    percent: number
+  }
+  transcription: {
+    total: number
+    completed: number
+    running: number
+    pending: number
+    failed: number
+    not_queued: number
+    percent: number
+  }
+}
+
+type NoteProgress = {
+  total: number
+  completed: number
+  running: number
+  pending: number
+  failed: number
+  skipped: number
+  not_queued: number
+  percent: number
+  recent_aweme_id: string | null
+  failures: Array<{ aweme_id: string; reason: string }>
+  quality_counts?: Record<string, number>
+  upgrade?: { eligible?: number; queued?: number; running?: number; failed?: number }
+  provider_summary?: { provider?: string | null; model?: string | null; ready?: boolean; external_configured?: boolean }
+}
+
+type NoteQueueResult = {
+  queued: number
+  already_queued: number
+  skipped: number
+}
+
+type ProviderStatus = {
+  ready?: boolean
+  provider?: string | null
+  model?: string | null
+  external_configured?: boolean
+  ollama?: { ready?: boolean; model?: string | null; service_status?: string; model_available?: boolean; action_required?: string | null }
+  external?: { ready?: boolean; configured?: boolean; model?: string | null }
 }
 
 const navigation: Array<{ key: ViewKey; label: string; icon: typeof Radio }> = [
@@ -127,6 +233,71 @@ function StatusMessage({ tone, children }: { tone: "success" | "error"; children
       {tone === "success" ? <CheckCircle2 size={16} aria-hidden="true" /> : <CircleAlert size={16} aria-hidden="true" />}
       {children}
     </p>
+  )
+}
+
+function GlobalProgress({
+  progress,
+  notes,
+  noteBusy,
+  noteMessage,
+  onGenerateNotes,
+  onUpgradeNotes,
+  providerReady,
+  providerStatus,
+}: {
+  progress: ProcessingProgress | null
+  notes: NoteProgress | null
+  noteBusy: boolean
+  noteMessage: { tone: "success" | "error"; text: string } | null
+  onGenerateNotes: () => void
+  onUpgradeNotes: () => void
+  providerReady: boolean
+  providerStatus: ProviderStatus | null
+}) {
+  if (!progress) {
+    return (
+      <section className="progress-dock is-loading" aria-label="处理总进度">
+        <Gauge size={18} aria-hidden="true" />
+        <span>正在读取处理进度</span>
+      </section>
+    )
+  }
+
+  const { works, audio_extraction: extraction, transcription } = progress
+  const audioPercent = Math.max(0, Math.min(100, extraction?.percent ?? (works.collected ? works.audio_ready / works.collected * 100 : 0)))
+  const transcriptionPercent = Math.max(0, Math.min(100, transcription.percent))
+  return (
+    <section className="progress-dock" aria-label="处理总进度">
+      <div className="progress-lane">
+        <div className="progress-summary">
+          <div className="progress-title"><Gauge size={18} aria-hidden="true" /><div><strong>音频提取</strong><span>已收集 {works.collected} 条视频</span></div></div>
+          <strong className="progress-count">{extraction?.completed ?? works.audio_ready} / {extraction?.total ?? works.collected}</strong>
+        </div>
+        <div className="global-progress-track" role="progressbar" aria-label="音频提取进度" aria-valuemin={0} aria-valuemax={100} aria-valuenow={audioPercent} aria-valuetext={`${extraction?.completed ?? works.audio_ready} / ${extraction?.total ?? works.collected}，${audioPercent}%`}><span style={{ width: `${audioPercent}%` }} /></div>
+        <div className="progress-meta"><strong>{audioPercent}%</strong><span className="progress-running">处理中 {extraction?.running ?? 0}</span><span>待处理 {(extraction?.pending ?? 0) + (extraction?.not_queued ?? 0)}</span><span className={extraction?.failed ? "progress-failed" : undefined}>失败 {extraction?.failed ?? 0}</span></div>
+      </div>
+      <div className="progress-lane">
+        <div className="progress-summary"><div className="progress-title"><Gauge size={18} aria-hidden="true" /><div><strong>音频转写</strong><span>仅对已提取音频进行转写</span></div></div><strong className="progress-count">{transcription.completed} / {transcription.total}</strong></div>
+        <div className="global-progress-track" role="progressbar" aria-label="音频转写进度" aria-valuemin={0} aria-valuemax={100} aria-valuenow={transcriptionPercent} aria-valuetext={`${transcription.completed} / ${transcription.total}，${transcriptionPercent}%`}><span style={{ width: `${transcriptionPercent}%` }} /></div>
+        <div className="progress-meta"><strong>{transcriptionPercent}%</strong><span className="progress-running">处理中 {transcription.running}</span><span>待处理 {transcription.pending + transcription.not_queued}</span><span className={transcription.failed ? "progress-failed" : undefined}>失败 {transcription.failed}</span></div>
+      </div>
+      {notes && <div className="progress-lane note-progress-lane">
+        <div className="progress-summary">
+          <div className="progress-title"><FileText size={18} aria-hidden="true" /><div><strong>知识笔记</strong><span>{notes.failures[0] ? `失败 ${notes.failures[0].aweme_id}：${notes.failures[0].reason}` : notes.recent_aweme_id ? `最近处理 ${notes.recent_aweme_id}` : "基于现有 ASR 转写增量生成"}</span></div></div>
+          <strong className="progress-count">{notes.completed} / {notes.total}</strong>
+        </div>
+        <div className="global-progress-track" role="progressbar" aria-label="知识笔记生成进度" aria-valuemin={0} aria-valuemax={100} aria-valuenow={notes.percent} aria-valuetext={`${notes.completed} / ${notes.total}，${notes.percent}%`}><span style={{ width: `${Math.max(0, Math.min(100, notes.percent))}%` }} /></div>
+        <div className="note-progress-actions">
+          <div className="progress-meta"><strong>{notes.percent}%</strong><span className="progress-running">处理中 {notes.running}</span><span>待处理 {notes.pending + notes.not_queued}</span><span className={notes.failed ? "progress-failed" : undefined}>失败 {notes.failed}</span><span>跳过 {notes.skipped}</span>{notes.quality_counts && <span>语义 {notes.quality_counts.semantic_complete ?? 0} · 回退 {notes.quality_counts.fallback ?? 0} · 旧 {notes.quality_counts.legacy ?? 0} · 未知 {notes.quality_counts.unknown ?? 0}</span>}{providerStatus?.ollama && <span className={providerStatus.ollama.ready ? "progress-running" : "progress-failed"}>Ollama：{providerStatus.ollama.ready ? `已就绪${providerStatus.ollama.model ? ` · ${providerStatus.ollama.model}` : ""}` : providerStatus.ollama.model_available === false ? `模型未安装${providerStatus.ollama.model ? ` · ${providerStatus.ollama.model}` : ""}` : "未就绪"}</span>}{(providerStatus?.external?.configured || notes.provider_summary?.external_configured) && <span>外部提供方已配置</span>}</div>
+          <div className="note-action-buttons"><button className="button primary note-generate-button" type="button" disabled={noteBusy || notes.not_queued === 0} onClick={onGenerateNotes}>
+            {noteBusy ? <LoaderCircle className="spin" size={15} aria-hidden="true" /> : <FileText size={15} aria-hidden="true" />}
+            {noteBusy ? "正在入队" : notes.not_queued === 0 ? "笔记已齐全" : "生成缺失笔记"}
+          </button>{(notes.quality_counts?.legacy ?? notes.upgrade?.eligible ?? 0) > 0 && <button className="button subtle note-generate-button" type="button" disabled={noteBusy || !providerReady} onClick={onUpgradeNotes}><RefreshCw size={15} aria-hidden="true" />升级旧笔记</button>}</div>
+        </div>
+        {noteMessage && <p className={`progress-action-message ${noteMessage.tone}`} role="status">{noteMessage.text}</p>}
+      </div>}
+    </section>
   )
 }
 
@@ -265,13 +436,14 @@ const stageLabels: Record<string, string> = {
   download: "下载视频",
   extract: "提取音频",
   transcribe: "转写文本",
-  analyze: "整理主题",
+  analyze: "生成知识笔记",
   complete: "已完成",
 }
 
 function JobsView() {
   const [jobs, setJobs] = useState<Job[]>([])
   const [error, setError] = useState<string | null>(null)
+  const [cancelBusy, setCancelBusy] = useState<number | null>(null)
   useEffect(() => {
     let active = true
     const load = async () => {
@@ -286,15 +458,27 @@ function JobsView() {
     const timer = window.setInterval(() => void load(), 5000)
     return () => { active = false; window.clearInterval(timer) }
   }, [])
+  const cancelJob = async (jobId: number) => {
+    setCancelBusy(jobId)
+    try {
+      const cancelled = await apiJson<Job>(`/api/jobs/${jobId}/cancel`, { method: "POST" })
+      setJobs((current) => current.map((job) => job.id === jobId ? cancelled : job))
+      setError(null)
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : "无法取消任务")
+    } finally {
+      setCancelBusy(null)
+    }
+  }
   return (
     <div className="content-grid wide-grid">
-      <section className="intro-panel compact-intro"><p className="section-kicker">PROCESSING</p><h2>每一步都留下可追踪状态。</h2><p className="muted-copy">下载、抽取、转写和主题整理在同一个任务队列里串联。</p></section>
+      <section className="intro-panel compact-intro"><p className="section-kicker">PROCESSING</p><h2>每一步都留下可追踪状态。</h2><p className="muted-copy">下载、抽取、转写和知识笔记生成在同一个任务队列里串联。</p></section>
       <section className="panel table-panel" aria-labelledby="jobs-title">
         <div className="panel-heading"><div><p className="eyebrow">实时队列</p><h3 id="jobs-title">最近任务</h3></div><ListChecks size={20} aria-hidden="true" /></div>
         {error && <StatusMessage tone="error">{error}</StatusMessage>}
         {jobs.length === 0 && !error ? <p className="empty-copy">还没有处理任务。同步主播或收藏后，任务会显示在这里。</p> : (
-          <div className="table-scroll"><table><thead><tr><th>任务</th><th>作品</th><th>阶段</th><th>进度</th><th>状态</th></tr></thead><tbody>
-            {jobs.map((job) => <tr key={job.id}><td><strong>{job.kind}</strong><span className="cell-sub">#{job.id}</span></td><td>{job.work_id ?? "批量同步"}</td><td>{stageLabels[job.stage] || job.stage}</td><td><div className="progress-wrap"><div className="progress-track"><span style={{ width: `${Math.max(0, Math.min(100, job.progress * 100))}%` }} /></div><span>{Math.round(job.progress * 100)}%</span></div></td><td><span className={`state state-${job.status}`}>{job.status}</span></td></tr>)}
+          <div className="table-scroll"><table><thead><tr><th>任务</th><th>作品</th><th>阶段</th><th>进度</th><th>状态</th><th aria-label="操作" /></tr></thead><tbody>
+            {jobs.map((job) => <tr key={job.id}><td><strong>{job.kind}</strong><span className="cell-sub">#{job.id}</span></td><td>{job.work_id ?? "批量同步"}</td><td>{stageLabels[job.stage] || job.stage}</td><td><div className="progress-wrap"><div className="progress-track"><span style={{ width: `${Math.max(0, Math.min(100, job.progress * 100))}%` }} /></div><span>{Math.round(job.progress * 100)}%</span></div></td><td><span className={`state state-${job.status}`}>{job.status}</span></td><td>{job.status === "running" || job.status === "pending" ? <button className="icon-button danger-button" type="button" aria-label={`取消任务 ${job.id}`} title="取消任务" disabled={cancelBusy === job.id} onClick={() => void cancelJob(job.id)}>{cancelBusy === job.id ? <LoaderCircle className="spin" size={15} aria-hidden="true" /> : <Square size={14} aria-hidden="true" />}</button> : null}</td></tr>)}
           </tbody></table></div>
         )}
       </section>
@@ -305,33 +489,94 @@ function JobsView() {
 function LibraryView() {
   const [works, setWorks] = useState<Work[]>([])
   const [query, setQuery] = useState("")
+  const [page, setPage] = useState(0)
+  const [total, setTotal] = useState(0)
+  const [failedTotal, setFailedTotal] = useState(0)
+  const [failedOnly, setFailedOnly] = useState(false)
   const [error, setError] = useState<string | null>(null)
   const [selected, setSelected] = useState<WorkDetail | null>(null)
   const [detailBusy, setDetailBusy] = useState(false)
+  const [generateBusy, setGenerateBusy] = useState<number | null>(null)
   useEffect(() => {
-    void apiJson<{ items: Work[] }>("/api/works?limit=100").then((result) => setWorks(result.items)).catch((reason) => setError(reason instanceof Error ? reason.message : "无法读取资料库"))
-  }, [])
-  const filtered = useMemo(() => {
-    const normalized = query.trim().toLowerCase()
-    if (!normalized) return works
-    return works.filter((work) => `${work.description || ""} ${work.creator_nickname || ""} ${work.topics.join(" ")}`.toLowerCase().includes(normalized))
-  }, [query, works])
-  const openTranscript = async (work: Work) => {
+    const controller = new AbortController()
+    let active = true
+    const params = new URLSearchParams({ limit: "100" })
+    if (page > 0) params.set("offset", String(page * 100))
+    if (query.trim()) params.set("query", query.trim())
+    if (failedOnly) params.set("failed_only", "true")
+    void apiJson<WorkListResponse>(`/api/works?${params.toString()}`, { signal: controller.signal })
+      .then((result) => {
+        if (!active) return
+        setWorks(result.items)
+        setTotal(result.total ?? result.items.length)
+        setFailedTotal(result.failed_total ?? 0)
+        setError(null)
+      })
+      .catch((reason) => {
+        if (active) setError(reason instanceof Error ? reason.message : "无法读取资料库")
+      })
+    return () => {
+      active = false
+      controller.abort()
+    }
+  }, [failedOnly, page, query])
+  const openWork = async (work: Work) => {
     setDetailBusy(true)
     setError(null)
     try {
       setSelected(await apiJson<WorkDetail>(`/api/works/${work.id}`))
     } catch (reason) {
-      setError(reason instanceof Error ? reason.message : "无法读取转写")
+      setError(reason instanceof Error ? reason.message : "无法读取资料")
     } finally {
       setDetailBusy(false)
     }
   }
+  const generateWorkNote = async (work: Work) => {
+    setGenerateBusy(work.id)
+    try {
+      await apiJson<NoteQueueResult>("/api/notes/generate", { method: "POST", body: JSON.stringify({ aweme_ids: [work.aweme_id], provider_policy: "auto", force: false }) })
+      setError(null)
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : "无法创建笔记任务")
+    } finally {
+      setGenerateBusy(null)
+    }
+  }
+  useEffect(() => {
+    if (!selected) return undefined
+    const closeOnEscape = (event: KeyboardEvent) => {
+      if (event.key === "Escape") setSelected(null)
+    }
+    const previousOverflow = document.body.style.overflow
+    document.body.style.overflow = "hidden"
+    window.addEventListener("keydown", closeOnEscape)
+    return () => {
+      document.body.style.overflow = previousOverflow
+      window.removeEventListener("keydown", closeOnEscape)
+    }
+  }, [selected])
+  const pageCount = Math.max(1, Math.ceil(total / 100))
+  const selectedNote = selected?.note?.text || null
+  const selectedTranscript = selected?.transcript?.text || null
+  const selectedContent = selectedNote || selectedTranscript
+  const selectedIsNote = Boolean(selectedNote)
+  const stageLabels: Record<string, string> = {
+    audio_extraction: "音频提取",
+    transcription: "ASR 转写",
+    note_generation: "笔记生成",
+  }
+  const statusLabels: Record<string, string> = {
+    succeeded: "已完成",
+    failed: "失败",
+    running: "处理中",
+    pending: "排队中",
+    not_queued: "未排队",
+  }
   return (
     <div className="content-grid wide-grid">
-      <section className="library-toolbar"><div><p className="section-kicker">LIBRARY</p><h2>从转写里找到知识。</h2></div><label className="search-field"><Search size={17} aria-hidden="true" /><input aria-label="筛选资料" value={query} onChange={(event) => setQuery(event.target.value)} placeholder="筛选主播、主题或关键词" /></label></section>
-      <section className="panel table-panel"><div className="panel-heading"><div><p className="eyebrow">已收集作品</p><h3>{filtered.length} 条资料</h3></div><BookOpenText size={20} aria-hidden="true" /></div>{error ? <StatusMessage tone="error">{error}</StatusMessage> : filtered.length === 0 ? <p className="empty-copy">还没有匹配的资料。先同步主播或收藏，再回来筛选。</p> : <div className="table-scroll"><table><thead><tr><th>内容</th><th>主播</th><th>主题</th><th>资产</th><th aria-label="操作" /></tr></thead><tbody>{filtered.map((work) => <tr key={work.id}><td><strong>{work.description || "无标题作品"}</strong><span className="cell-sub">{work.transcript_preview || `aweme ${work.aweme_id}`}</span></td><td>{work.creator_nickname || "未知主播"}</td><td><div className="topic-list">{work.topics.slice(0, 3).map((topic) => <span key={topic}>{topic}</span>)}</div></td><td>{work.asset_kinds.length ? work.asset_kinds.join(" · ") : "待处理"}</td><td>{work.transcript_status === "succeeded" ? <button className="icon-button" type="button" aria-label={`阅读${work.description || "无标题作品"}的转写`} title="阅读转写" disabled={detailBusy} onClick={() => void openTranscript(work)}><BookOpenText size={16} aria-hidden="true" /></button> : <span className="cell-sub">待转写</span>}</td></tr>)}</tbody></table></div>}</section>
-      {selected && <section className="transcript-reader" aria-labelledby="transcript-title"><div className="reader-heading"><div><p className="eyebrow">TRANSCRIPT</p><h3 id="transcript-title">{selected.description || "作品转写"}</h3><span>{selected.transcript?.model || "尚无转写"}</span></div><button className="icon-button" type="button" aria-label="关闭转写" title="关闭" onClick={() => setSelected(null)}><X size={16} aria-hidden="true" /></button></div>{selected.transcript ? <article>{selected.transcript.text}</article> : <p className="empty-copy">这条作品尚无成功转写。</p>}</section>}
+      <section className="library-toolbar"><div><p className="section-kicker">LIBRARY</p><h2>从转写里找到知识。</h2><p className="library-count">{total} 条资料 · 第 {page + 1} / {pageCount} 页</p></div><div className="library-controls"><label className="search-field"><Search size={17} aria-hidden="true" /><input aria-label="筛选资料" value={query} onChange={(event) => { setQuery(event.target.value); setPage(0) }} placeholder="筛选主播或关键词" /></label><button className={failedOnly ? "button subtle is-active" : "button subtle"} type="button" onClick={() => { setFailedOnly((current) => !current); setPage(0) }}><CircleAlert size={15} aria-hidden="true" />仅看提取失败 ({failedTotal})</button></div></section>
+      <section className="panel table-panel"><div className="panel-heading"><div><p className="eyebrow">已收集作品</p><h3>{works.length} 条当前页资料</h3></div><BookOpenText size={20} aria-hidden="true" /></div>{error ? <StatusMessage tone="error">{error}</StatusMessage> : works.length === 0 ? <p className="empty-copy">还没有匹配的资料。先同步主播或收藏，再回来筛选。</p> : <div className="table-scroll"><table><thead><tr><th>内容</th><th>主播</th><th>主题</th><th>处理状态</th><th aria-label="操作" /></tr></thead><tbody>{works.map((work) => <tr key={work.id}><td><strong>{work.description || "无标题作品"}</strong><span className="cell-sub">{work.note_preview || work.transcript_preview || `aweme ${work.aweme_id}`}</span>{work.failure && <span className="failure-reason">{stageLabels[work.failure.stage] || work.failure.stage}：{work.failure.reason}</span>}</td><td>{work.creator_nickname || "未知主播"}</td><td><div className="topic-list">{work.topics.slice(0, 3).map((topic) => <span key={topic}>{topic}</span>)}</div></td><td><span className={`state state-${work.extraction_status}`}>{statusLabels[work.extraction_status] || work.extraction_status}</span><span className="cell-sub">笔记：{statusLabels[work.note_status] || work.note_status}</span></td><td className="library-actions">{work.note_available ? <button className="icon-button" type="button" aria-label={`阅读${work.description || "无标题作品"}的学习笔记`} title="阅读学习笔记" disabled={detailBusy} onClick={() => void openWork(work)}><FileText size={16} aria-hidden="true" /></button> : work.transcript_status === "succeeded" ? <button className="icon-button" type="button" aria-label={`阅读${work.description || "无标题作品"}的转写`} title="阅读转写" disabled={detailBusy} onClick={() => void openWork(work)}><BookOpenText size={16} aria-hidden="true" /></button> : <span className="cell-sub">无可读内容</span>}{work.transcript_status === "succeeded" && <button className="button subtle single-note-button" type="button" aria-label={`生成${work.description || "无标题作品"}的完整笔记`} disabled={generateBusy === work.id} onClick={() => void generateWorkNote(work)}>{generateBusy === work.id ? <LoaderCircle className="spin" size={14} aria-hidden="true" /> : <FileText size={14} aria-hidden="true" />}生成完整笔记</button>}</td></tr>)}</tbody></table></div>}<div className="pagination" aria-label="资料分页"><button className="icon-button" type="button" aria-label="上一页" title="上一页" disabled={page === 0} onClick={() => setPage((current) => Math.max(0, current - 1))}><ChevronLeft size={17} aria-hidden="true" /></button><span>第 {page + 1} / {pageCount} 页</span><button className="icon-button" type="button" aria-label="下一页" title="下一页" disabled={page + 1 >= pageCount} onClick={() => setPage((current) => current + 1)}><ChevronRight size={17} aria-hidden="true" /></button></div></section>
+      {selected && <div className="note-modal-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) setSelected(null) }}><section className="note-modal" role="dialog" aria-modal="true" aria-labelledby="note-modal-title"><NoteReader title={selected.description || (selectedIsNote ? "学习笔记" : "作品转写")} markdown={selectedContent || ""} onClose={() => setSelected(null)} subtitle={selectedIsNote ? "learning_note.md · 基于 ASR 转写生成" : selected.transcript?.model || "尚无转写"} provenance={selectedIsNote ? { variant: selected.transcript_variant, sourceKind: selected.transcript_source_kind, cleanerModel: selected.cleaner_model, fallback: selected.cleaning_fallback } : selected.transcript ? { variant: selected.transcript.variant, sourceKind: selected.transcript.source_kind, cleanerModel: selected.transcript.cleaner_model, fallback: selected.transcript.cleaning_fallback } : null} provider={selected.note_provider} model={selected.note_model} qualityStatus={selected.note_quality_status} coverage={selected.note_coverage} segmentCoverage={selected.note_segment_coverage} atomCoverage={selected.note_atom_coverage} warning={selected.note_quality_status === "fallback" ? "这是规则回退笔记，未通过语义完整性审查。" : selected.failure ? `处理失败：${stageLabels[selected.failure.stage] || selected.failure.stage}：${selected.failure.reason}` : !selectedContent ? "这条作品尚无可读内容。" : null} /></section></div>}
     </div>
   )
 }
@@ -448,6 +693,11 @@ function SettingsView() {
 export function App() {
   const [activeView, setActiveView] = useState<ViewKey>("creator")
   const [connectionState, setConnectionState] = useState<ConnectionState>("connecting")
+  const [processingProgress, setProcessingProgress] = useState<ProcessingProgress | null>(null)
+  const [noteProgress, setNoteProgress] = useState<NoteProgress | null>(null)
+  const [noteBusy, setNoteBusy] = useState(false)
+  const [noteMessage, setNoteMessage] = useState<{ tone: "success" | "error"; text: string } | null>(null)
+  const [providerStatus, setProviderStatus] = useState<ProviderStatus | null>(null)
 
   useEffect(() => {
     let active = true
@@ -455,7 +705,9 @@ export function App() {
     const checkHealth = async () => {
       try {
         const result = await apiJson<{ status: string }>("/api/health")
-        if (active) setConnectionState(result.status === "ok" ? "connected" : "disconnected")
+        if (active) {
+          setConnectionState(result.status === "ok" ? "connected" : result.status === "degraded" ? "degraded" : "disconnected")
+        }
       } catch {
         if (active) setConnectionState("disconnected")
       } finally {
@@ -469,11 +721,94 @@ export function App() {
     }
   }, [])
 
+  useEffect(() => {
+    void apiJson<ProviderStatus>("/api/notes/provider-status").then(setProviderStatus).catch(() => setProviderStatus(null))
+  }, [])
+
+  useEffect(() => {
+    let active = true
+    let timer: number | undefined
+    const loadNoteProgress = async () => {
+      try {
+        const result = await apiJson<NoteProgress>("/api/notes/progress")
+        if (active && typeof result?.total === "number") setNoteProgress(result)
+      } catch {
+        // Keep the latest valid snapshot visible during a brief service interruption.
+      } finally {
+        if (active) timer = window.setTimeout(() => void loadNoteProgress(), 5000)
+      }
+    }
+    void loadNoteProgress()
+    return () => {
+      active = false
+      if (timer !== undefined) window.clearTimeout(timer)
+    }
+  }, [])
+
+  const generateMissingNotes = async () => {
+    setNoteBusy(true)
+    setNoteMessage(null)
+    try {
+      const result = await apiJson<NoteQueueResult>("/api/notes/generate", {
+        method: "POST",
+        body: JSON.stringify({ force: false }),
+      })
+      setNoteMessage({
+        tone: "success",
+        text: result.queued > 0 ? `已加入 ${result.queued} 条笔记任务。` : result.already_queued > 0 ? "缺失笔记已在队列中。" : "当前没有缺失笔记。",
+      })
+      setNoteProgress((current) => current ? {
+        ...current,
+        pending: current.pending + result.queued,
+        not_queued: Math.max(0, current.not_queued - result.queued),
+      } : current)
+    } catch (reason) {
+      setNoteMessage({ tone: "error", text: reason instanceof Error ? reason.message : "无法创建笔记任务" })
+    } finally {
+      setNoteBusy(false)
+    }
+  }
+
+  const upgradeLegacyNotes = async () => {
+    setNoteBusy(true)
+    setNoteMessage(null)
+    try {
+      const result = await apiJson<NoteQueueResult>("/api/notes/generate", { method: "POST", body: JSON.stringify({ legacy_only: true, provider_policy: "auto" }) })
+      setNoteMessage({ tone: "success", text: result.queued > 0 ? `已加入 ${result.queued} 条旧笔记升级任务。` : "当前没有可升级的旧笔记。" })
+    } catch (reason) {
+      setNoteMessage({ tone: "error", text: reason instanceof Error ? reason.message : "无法升级旧笔记" })
+    } finally {
+      setNoteBusy(false)
+    }
+  }
+
+  useEffect(() => {
+    let active = true
+    let timer: number | undefined
+    const loadProgress = async () => {
+      try {
+        const result = await apiJson<ProcessingProgress>("/api/jobs/progress")
+        if (active && result?.works && result?.transcription) setProcessingProgress(result)
+      } catch {
+        // Keep the latest valid snapshot visible during a brief service interruption.
+      } finally {
+        if (active) timer = window.setTimeout(() => void loadProgress(), 5000)
+      }
+    }
+    void loadProgress()
+    return () => {
+      active = false
+      if (timer !== undefined) window.clearTimeout(timer)
+    }
+  }, [])
+
   const content = { creator: <CreatorView />, favorites: <FavoritesView />, jobs: <JobsView />, library: <LibraryView />, settings: <SettingsView /> }[activeView]
   const connectionLabel = {
     connecting: "正在连接本地服务",
     connected: "本地服务已连接",
+    degraded: "本地服务已连接（存储暂不可用）",
     disconnected: "本地服务未连接",
   }[connectionState]
-  return <div className="app-shell"><aside className="sidebar"><div className="brand-mark" aria-hidden="true">知</div><nav aria-label="主要导航">{navigation.map(({ key, label, icon: Icon }) => <button className={activeView === key ? "nav-item is-active" : "nav-item"} key={key} type="button" onClick={() => setActiveView(key)}><Icon aria-hidden="true" size={18} /><span>{label}</span></button>)}</nav></aside><main className="workspace"><header className="topbar"><div><p className="topbar-kicker">{viewTitles[activeView]}</p><h1>抖音知识资料库</h1></div><span className={`connection-status is-${connectionState}`} aria-live="polite"><span aria-hidden="true" className="status-dot" />{connectionLabel}</span></header><div className="page-content">{content}</div></main></div>
+  const semanticProviderReady = Boolean(providerStatus?.ready || providerStatus?.ollama?.ready || providerStatus?.external_configured || noteProgress?.provider_summary?.ready || noteProgress?.provider_summary?.external_configured)
+  return <div className="app-shell"><aside className="sidebar"><div className="brand-mark" aria-hidden="true">知</div><nav aria-label="主要导航">{navigation.map(({ key, label, icon: Icon }) => <button className={activeView === key ? "nav-item is-active" : "nav-item"} key={key} type="button" onClick={() => setActiveView(key)}><Icon aria-hidden="true" size={18} /><span>{label}</span></button>)}</nav></aside><main className="workspace"><header className="topbar"><div><p className="topbar-kicker">{viewTitles[activeView]}</p><h1>抖音知识资料库</h1></div><span className={`connection-status is-${connectionState}`} aria-live="polite"><span aria-hidden="true" className="status-dot" />{connectionLabel}</span></header><GlobalProgress progress={processingProgress} notes={noteProgress} noteBusy={noteBusy} noteMessage={noteMessage} onGenerateNotes={() => void generateMissingNotes()} onUpgradeNotes={() => void upgradeLegacyNotes()} providerReady={semanticProviderReady} providerStatus={providerStatus} /><div className="page-content">{content}</div></main></div>
 }

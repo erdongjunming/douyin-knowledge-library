@@ -190,6 +190,11 @@ def build_worker_runtime(
         session.commit()
         cleaner = make_cleaner(settings)
         payload = _job_payload(job)
+        provider = payload.get("provider", "auto")
+        if provider == "local":
+            provider = "ollama"
+        if provider not in {"auto", "ollama"}:
+            raise ValueError(f"unsupported_cleaner_provider:{provider}")
         await TranscriptCleaningService(
             session,
             storage_layout,

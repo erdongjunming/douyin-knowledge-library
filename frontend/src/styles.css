@@ -27,8 +27,32 @@ button:disabled { cursor: not-allowed; opacity: 0.55; }
 .connection-status.is-connected .status-dot { background: #27845f; }
 .connection-status.is-disconnected { color: #9c3f3f; }
 .connection-status.is-disconnected .status-dot { background: #c84f4f; }
-.page-content { max-width: 1180px; padding: 42px; }
+.connection-status.is-degraded { color: #a46d2b; }
+.connection-status.is-degraded .status-dot { background: #d0923a; }
+.progress-dock { position: sticky; top: 0; z-index: 8; display: grid; gap: 10px; border-bottom: 1px solid #dce5e1; padding: 12px 42px; background: rgb(250 252 251 / 96%); backdrop-filter: blur(10px); }
+.progress-lane { display: grid; grid-template-columns: minmax(210px, 0.7fr) minmax(180px, 1.3fr) auto; align-items: center; gap: 22px; }
+.progress-dock.is-loading { grid-template-columns: auto 1fr; min-height: 48px; color: #71807a; font-size: 13px; }
+.progress-summary { display: flex; min-width: 0; align-items: center; justify-content: space-between; gap: 16px; }
+.progress-title { display: flex; min-width: 0; align-items: center; gap: 10px; color: #176b62; }
+.progress-title > div { display: grid; min-width: 0; gap: 1px; }
+.progress-title strong { color: #25342f; font-size: 13px; }
+.progress-title span { overflow: hidden; color: #73817c; font-size: 11px; text-overflow: ellipsis; white-space: nowrap; }
+.progress-count { color: #24332e; font-size: 15px; white-space: nowrap; }
+.global-progress-track { height: 9px; overflow: hidden; border-radius: 5px; background: #dfe8e4; }
+.global-progress-track > span { display: block; height: 100%; border-radius: inherit; background: #27845f; transition: width 400ms ease; }
+.progress-meta { display: flex; align-items: center; justify-content: flex-end; gap: 12px; color: #687771; font-size: 11px; white-space: nowrap; }
+.progress-meta strong { color: #176b62; font-size: 14px; }
+.progress-running { color: #176b62; }
+.progress-failed { color: #b23b3b; }
+.note-progress-actions { display: grid; justify-items: end; gap: 7px; }
+.note-progress-actions .progress-meta { flex-wrap: wrap; }
+.note-generate-button { min-height: 32px; }
+.progress-action-message { grid-column: 1 / -1; margin: -2px 0 0; font-size: 11px; }
+.progress-action-message.success { color: #1f7a56; }
+.progress-action-message.error { color: #b23b3b; }
+.page-content { min-width: 0; max-width: 1180px; padding: 42px; }
 .content-grid { display: grid; grid-template-columns: minmax(260px, 0.74fr) minmax(0, 1.26fr); gap: 24px; align-items: start; }
+.content-grid > * { min-width: 0; }
 .wide-grid { grid-template-columns: 1fr; }
 .intro-panel { padding: 12px 0 18px; }
 .intro-panel h2, .library-toolbar h2 { max-width: 540px; margin: 10px 0 12px; font-size: clamp(28px, 3vw, 42px); line-height: 1.15; letter-spacing: 0; }
@@ -81,17 +105,53 @@ td strong, .cell-sub { display: block; }
 .state-succeeded { color: #1f7a56; }
 .state-failed { color: #b23b3b; }
 .state-running { color: #176b62; }
+.state-pending, .state-not_queued { color: #8a7460; }
+.failure-reason { display: block; max-width: 360px; margin-top: 4px; color: #a13f3f; font-size: 11px; line-height: 1.45; }
 .topic-list { display: flex; flex-wrap: wrap; gap: 5px; }
 .topic-list span { border: 1px solid #d5e5df; border-radius: 4px; padding: 3px 6px; color: #256d61; font-size: 11px; }
 .icon-button { display: inline-grid; width: 32px; height: 32px; place-items: center; border: 1px solid #d5e0dc; border-radius: 5px; color: #176b62; background: #fff; font-size: 20px; line-height: 1; }
 .icon-button:hover { border-color: #176b62; background: #f1f7f5; }
+.danger-button { color: #a43131; }
+.danger-button:hover { border-color: #d7aaaa; background: #fff2f2; color: #8f2222; }
 .transcript-reader { border-top: 3px solid #176b62; padding: 24px 0 8px; }
 .reader-heading { display: flex; align-items: flex-start; justify-content: space-between; gap: 16px; }
 .reader-heading h3 { margin: 4px 0 5px; font-size: 20px; }
 .reader-heading span { color: #74817c; font-size: 12px; }
 .transcript-reader article { max-width: 820px; margin-top: 22px; color: #26332f; font-size: 15px; line-height: 1.95; white-space: pre-wrap; }
+.note-modal-backdrop { position: fixed; z-index: 20; inset: 0; display: grid; place-items: center; padding: 28px; background: rgb(23 33 30 / 42%); }
+.note-modal { display: flex; width: min(920px, 100%); max-height: min(820px, calc(100vh - 56px)); flex-direction: column; overflow: hidden; border: 1px solid #cbd9d3; border-radius: 8px; background: #fff; box-shadow: 0 22px 70px rgb(20 35 30 / 22%); }
+.note-modal .reader-heading { flex: 0 0 auto; border-bottom: 1px solid #e5ece8; padding: 22px 24px 18px; }
+.note-modal-body { overflow-y: auto; padding: 0 24px 28px; overscroll-behavior: contain; }
+.note-modal article { max-width: 820px; margin-top: 22px; color: #26332f; font-size: 15px; line-height: 1.95; white-space: pre-wrap; }
+.note-modal .note-content { max-width: 920px; }
+.note-reader { display: flex; min-height: 0; flex-direction: column; }
+.note-reader > .reader-heading { flex: 0 0 auto; border-bottom: 1px solid #e5ece8; padding: 22px 24px 18px; }
+.note-reader-body { overflow-y: auto; padding: 0 24px 28px; overscroll-behavior: contain; }
+.note-reader-body article { max-width: 820px; margin-top: 22px; color: #26332f; font-size: 15px; line-height: 1.8; }
+.note-content h1 { margin: 0 0 18px; font-size: 28px; line-height: 1.25; }
+.note-content h2 { scroll-margin-top: 18px; margin: 28px 0 10px; border-top: 1px solid #e5ece8; padding-top: 18px; font-size: 20px; line-height: 1.35; }
+.note-content h3 { margin: 20px 0 8px; font-size: 17px; }
+.note-content p { margin: 10px 0; white-space: normal; }
+.note-content ul, .note-content ol { margin: 10px 0; padding-left: 24px; }
+.note-content li { margin: 5px 0; }
+.note-content blockquote { margin: 14px 0; border-left: 3px solid #9ac4b6; padding-left: 14px; color: #52645d; }
+.note-content code { border-radius: 3px; padding: 2px 4px; background: #eef4f1; font-size: .9em; }
+.note-content a { color: #176b62; }
+.note-section-nav { position: sticky; top: 0; z-index: 1; display: flex; flex-wrap: wrap; gap: 8px; border-bottom: 1px solid #e5ece8; padding: 10px 24px; background: rgb(255 255 255 / 96%); }
+.note-quality { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; border-bottom: 1px solid #e5ece8; padding: 10px 24px; color: #66756f; font-size: 12px; }
+.quality-badge { border-radius: 4px; padding: 3px 7px; background: #e8f3ee; color: #1f7a56; font-weight: 700; }
+.quality-fallback, .quality-legacy, .quality-unknown { background: #fff3df; color: #9a672c; }
+.quality-missing { background: #f1f3f2; color: #65736e; }
+.note-warning { color: #a13f3f; font-weight: 650; }
+.transcript-provenance { color: #176b62; font-weight: 650; }
+.note-action-buttons { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 7px; }
+.library-actions { min-width: 190px; }
+.single-note-button { min-height: 30px; margin-left: 6px; padding-inline: 8px; font-size: 11px; }
 .library-toolbar { display: flex; align-items: end; justify-content: space-between; gap: 24px; }
 .library-toolbar h2 { margin-bottom: 0; font-size: 30px; }
+.library-count { margin: 8px 0 0; color: #74817c; font-size: 12px; }
+.library-controls { display: flex; align-items: center; gap: 12px; }
+.button.subtle.is-active { border-color: #c98b8b; background: #fff5f5; color: #a13f3f; }
 .search-field { display: flex; width: min(320px, 100%); align-items: center; gap: 8px; border-bottom: 1px solid #cdd9d4; padding: 0 0 8px; color: #65756e; }
 .search-field input { width: 100%; border: 0; padding: 0; box-shadow: none; }
 .search-field input:focus { box-shadow: none; }
@@ -100,6 +160,7 @@ td strong, .cell-sub { display: block; }
 .diagnostic-row .ok { color: #1f7a56; font-size: 12px; }
 .diagnostic-row .warning { color: #a46d2b; font-size: 12px; }
 .settings-stack { display: grid; gap: 18px; }
+.pagination { display: flex; align-items: center; justify-content: center; gap: 14px; margin-top: 22px; color: #687771; font-size: 12px; }
 .credential-panel { padding: 22px; }
 .credential-status-row { display: flex; min-height: 38px; align-items: center; justify-content: space-between; gap: 12px; margin: -8px 0 18px; }
 .credential-status { display: flex; align-items: center; gap: 7px; margin: 0; color: #66756f; font-size: 13px; }
@@ -109,10 +170,16 @@ td strong, .cell-sub { display: block; }
 @keyframes spin { to { transform: rotate(360deg); } }
 
 @media (max-width: 860px) {
+  .progress-dock { gap: 8px; padding-inline: 24px; }
+  .progress-lane { grid-template-columns: minmax(0, 1fr) auto; gap: 10px 18px; }
+  .progress-lane .global-progress-track { grid-column: 1 / -1; grid-row: 2; }
+  .progress-lane .progress-meta { grid-column: 1 / -1; justify-content: flex-start; }
+  .note-progress-actions { grid-column: 1 / -1; justify-items: start; }
   .page-content { padding: 30px 24px; }
-  .content-grid { grid-template-columns: 1fr; }
+  .content-grid { grid-template-columns: minmax(0, 1fr); }
   .signal-band { grid-column: auto; }
   .library-toolbar { align-items: start; flex-direction: column; }
+  .library-controls { width: 100%; align-items: stretch; flex-direction: column; }
   .search-field { width: 100%; }
 }
 
@@ -127,6 +194,11 @@ td strong, .cell-sub { display: block; }
   .topbar h1 { font-size: 17px; }
   .connection-status { font-size: 0; }
   .connection-status .status-dot { width: 8px; height: 8px; }
+  .progress-dock { min-height: 240px; padding: 12px 18px; }
+  .progress-lane { grid-template-columns: minmax(0, 1fr) auto; }
+  .progress-summary { grid-column: 1 / -1; }
+  .progress-meta { gap: 9px; overflow-x: auto; }
+  .progress-title span { max-width: 190px; }
   .page-content { padding: 24px 18px; }
   .intro-panel h2 { font-size: 30px; }
   .input-row { align-items: stretch; flex-direction: column; }
@@ -136,4 +208,12 @@ td strong, .cell-sub { display: block; }
   .signal-band div { border-right: 0; border-bottom: 1px solid #dce5e1; }
   .signal-band div:last-child { border-bottom: 0; }
   .form-panel, .action-panel, .credential-panel, .diagnostics-panel, .table-panel { padding: 18px; }
+  .note-modal-backdrop { padding: 12px; }
+  .note-modal { max-height: calc(100vh - 24px); }
+  .note-modal .reader-heading { padding: 18px 18px 14px; }
+  .note-modal-body { padding-inline: 18px; }
+  .note-reader > .reader-heading { padding: 18px 18px 14px; }
+  .note-reader-body { padding-inline: 18px; }
+  .note-section-nav, .note-quality { padding-inline: 18px; }
+  .note-action-buttons { justify-content: flex-start; }
 }
