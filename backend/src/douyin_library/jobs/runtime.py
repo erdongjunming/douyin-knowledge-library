@@ -171,14 +171,15 @@ def build_worker_runtime(
             lease_store=lease_store,
             worker_id=job.worker_id,
         ).process(job, work, cancel_event=cancel_event)
-        _enqueue_generate_note(
-            queue,
-            storage_layout,
-            aweme_id=work.aweme_id,
-            work_id=work.id,
-        )
         if settings.transcription_cleaning_enabled:
             _enqueue_clean_transcript(queue, work, settings)
+        else:
+            _enqueue_generate_note(
+                queue,
+                storage_layout,
+                aweme_id=work.aweme_id,
+                work_id=work.id,
+            )
 
     async def clean_transcript_work(job: Job, cancel_event: asyncio.Event) -> None:
         if job.work_id is None:
@@ -216,6 +217,12 @@ def build_worker_runtime(
             prompt_version=str(payload["prompt_version"])
             if payload.get("prompt_version") is not None
             else None,
+        )
+        _enqueue_generate_note(
+            queue,
+            storage_layout,
+            aweme_id=work.aweme_id,
+            work_id=work.id,
         )
 
     async def sync_favorites(job: Job, cancel_event: asyncio.Event) -> None:
@@ -300,6 +307,16 @@ def build_worker_runtime(
         force = payload.get("force", False)
         if not isinstance(force, bool):
             raise ValueError("generate_note_force_invalid")
+        if settings.transcription_cleaning_enabled and work is not None:
+            cleaner_pending = session.scalar(
+                select(Job).where(
+                    Job.kind == "clean_transcript_work",
+                    Job.work_id == work.id,
+                    Job.status.in_(("pending", "running")),
+                )
+            )
+            if cleaner_pending is not None:
+                raise RuntimeError("transcript_cleaning_pending")
         job.stage = "analyze"
         job.progress = 0.1
         session.commit()
@@ -482,6 +499,8 @@ def _enqueue_clean_transcript(queue: JobQueue, work: Work, settings: Settings) -
     payload = {
         "raw_transcript_id": raw.id,
         "raw_fingerprint": fingerprint,
+        "provider": "ollama",
+        "provider_policy": "local",
         "model": settings.transcription_cleaner_model,
         "prompt_version": settings.transcription_cleaner_prompt_version,
     }
