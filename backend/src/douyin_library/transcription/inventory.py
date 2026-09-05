@@ -112,7 +112,7 @@ def _sha256(path: Path) -> str:
 
 def _audio(asset: Asset | None) -> AudioInventory:
     if asset is None:
-        return AudioInventory("missing", reason="audio_asset_missing")
+        return AudioInventory("blocked", reason="audio_asset_missing")
     path = Path(asset.path)
     exists = path.is_file()
     if not exists:
@@ -198,10 +198,17 @@ def _transcript(
         fp = None
     if row.variant == "cleaned":
         meta = _json(row.word_timestamps_json)
+        parent_fingerprint = None
+        if parent is not None:
+            try:
+                parent_fingerprint = _transcript_fingerprint(parent)
+            except (TypeError, ValueError, json.JSONDecodeError):
+                parent_fingerprint = None
         if (
             parent is None
             or not isinstance(meta, dict)
-            or meta.get("raw_fingerprint") != _transcript_fingerprint(parent)
+            or parent_fingerprint is None
+            or meta.get("raw_fingerprint") != parent_fingerprint
         ):
             return TranscriptInventory(
                 "blocked",
@@ -285,8 +292,15 @@ def build_inventory(
             None,
         )
         parent = (
-            raw_row
-            if cleaned_row and raw_row and cleaned_row.parent_transcript_id == raw_row.id
+            next(
+                (
+                    candidate
+                    for candidate in raws
+                    if candidate.id == cleaned_row.parent_transcript_id
+                ),
+                None,
+            )
+            if cleaned_row is not None and cleaned_row.parent_transcript_id is not None
             else None
         )
         cleaned = _transcript(cleaned_row, layout, work.aweme_id, parent=parent)
@@ -307,8 +321,13 @@ def build_inventory(
             .order_by(Job.id)
         ).all():
             heartbeat = job.heartbeat_at or job.started_at
+            heartbeat_utc = _as_utc(heartbeat)
+            now_utc = _as_utc(now)
             stale = (
-                job.status == "running" and heartbeat is not None and now - heartbeat > stale_after
+                job.status == "running"
+                and heartbeat_utc is not None
+                and now_utc is not None
+                and now_utc - heartbeat_utc > stale_after
             )
             retry = (
                 job.status == "pending"
@@ -343,10 +362,19 @@ def build_inventory(
                 cleaned,
                 note,
                 tuple(jobs),
+                reason=blocked,
                 blocked_reason=blocked,
             )
         )
     return InventoryReport(tuple(items))
+
+
+def _as_utc(value: datetime | None) -> datetime | None:
+    if value is None:
+        return None
+    if value.tzinfo is None:
+        return value.replace(tzinfo=UTC)
+    return value.astimezone(UTC)
 
 
 def select_raw_asr_candidates(
