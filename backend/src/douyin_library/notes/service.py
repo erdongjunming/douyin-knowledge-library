@@ -281,6 +281,11 @@ class NoteGenerationService:
             else:
                 if item.status == "generated":
                     result.generated += 1
+                elif legacy_only:
+                    # An upgrade candidate that remains preserved, skipped, or
+                    # otherwise non-semantic is a failed upgrade attempt.  It
+                    # must stay visible for retry instead of looking complete.
+                    result.failed += 1
                 else:
                     result.skipped += 1
                 _append_item(result, asdict(item))
@@ -396,6 +401,8 @@ class NoteGenerationService:
                 provider: NoteProvider | None = None
                 try:
                     provider = await self._make_provider(provider_name)
+                    if legacy_only and getattr(provider, "name", None) != "ollama":
+                        raise RuntimeError("legacy_upgrade_provider_not_ollama")
                     lease_handle = await self._acquire_gpu_if_needed(
                         provider,
                         job=job,
