@@ -1,4 +1,5 @@
 import asyncio
+import hashlib
 import json
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -16,6 +17,7 @@ from douyin_library.jobs.queue import JobQueue
 from douyin_library.jobs.runtime import build_worker_runtime
 from douyin_library.media.storage import StorageLayout
 from douyin_library.models import Asset, Job, ProcessingAudit, ResourceLease, Transcript, Work
+from douyin_library.transcription.contracts import TranscriptDraft, TranscriptSegment
 from douyin_library.transcription.service import SubprocessResult, TranscriptionService
 
 
@@ -68,7 +70,7 @@ async def test_transcribe_job_writes_assets_database_audit_and_fts(tmp_path: Pat
                 kind="audio",
                 path=str(audio_path),
                 bytes=audio_path.stat().st_size,
-                sha256="audio-sha",
+                    sha256=hashlib.sha256(b"existing-audio").hexdigest(),
             )
         )
         setup_session.commit()
@@ -141,12 +143,30 @@ async def test_existing_successful_transcript_is_reused_without_subprocess(tmp_p
                     work_id=work.id,
                     engine="qwen3-asr",
                     model="Qwen/Qwen3-ASR-0.6B",
+                    source_kind="asr",
+                    variant="raw",
                     text="已经存在",
+                    segments_json=json.dumps(
+                        [{"id": "s1", "start": 0.0, "end": 1.0, "text": "已经存在"}],
+                        ensure_ascii=False,
+                    ),
                     status="succeeded",
                 ),
             ]
         )
         setup_session.commit()
+    transcript_dir = storage / "transcript" / "732"
+    transcript_dir.mkdir(parents=True)
+    (transcript_dir / "transcript.txt").write_text("已经存在", encoding="utf-8")
+    segments = [{"id": "s1", "start": 0.0, "end": 1.0, "text": "已经存在"}]
+    (transcript_dir / "segments.json").write_text(
+        json.dumps(segments, ensure_ascii=False),
+        encoding="utf-8",
+    )
+    (transcript_dir / "qwen3_asr.json").write_text(
+        json.dumps({"text": "已经存在", "segments": segments}, ensure_ascii=False),
+        encoding="utf-8",
+    )
 
     class MustNotRun:
         async def run(self, **kwargs):
@@ -167,6 +187,131 @@ async def test_existing_successful_transcript_is_reused_without_subprocess(tmp_p
     finally:
         runtime.close()
         engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_existing_raw_asr_wins_before_late_subtitle_discovery(tmp_path: Path) -> None:
+    engine = create_engine(f"sqlite:///{tmp_path / 'library.db'}")
+    create_schema(engine)
+    storage = tmp_path / "storage"
+    audio_path = storage / "audio" / "late-subtitle.m4a"
+    audio_path.parent.mkdir(parents=True)
+    audio_path.write_bytes(b"existing-audio")
+    raw_text = "已有原始转写"
+    raw_segments = [{"id": "s1", "start": 0.0, "end": 1.0, "text": raw_text}]
+    with Session(engine) as session:
+        work = Work(aweme_id="late-subtitle")
+        session.add(work)
+        session.flush()
+        session.add(
+            Asset(
+                work_id=work.id,
+                kind="audio",
+                path=str(audio_path),
+                bytes=audio_path.stat().st_size,
+                sha256="audio-sha",
+            )
+        )
+        raw = Transcript(
+            work_id=work.id,
+            engine="qwen3-asr",
+            model="Qwen/Qwen3-ASR-0.6B",
+            source_kind="asr",
+            variant="raw",
+            text=raw_text,
+            segments_json=json.dumps(raw_segments, ensure_ascii=False),
+            status="succeeded",
+        )
+        session.add(raw)
+        session.commit()
+        work_id = work.id
+    transcript_dir = storage / "transcript" / "late-subtitle"
+    transcript_dir.mkdir(parents=True)
+    (transcript_dir / "transcript.txt").write_text(raw_text, encoding="utf-8")
+    (transcript_dir / "segments.json").write_text(
+        json.dumps(raw_segments, ensure_ascii=False),
+        encoding="utf-8",
+    )
+    (transcript_dir / "qwen3_asr.json").write_text(
+        json.dumps({"text": raw_text, "segments": raw_segments}, ensure_ascii=False),
+        encoding="utf-8",
+    )
+
+    class LateSubtitle:
+        def discover(self, work: Work) -> TranscriptDraft:
+            return TranscriptDraft(
+                segments=(TranscriptSegment("s1", 0.0, 1.0, "后来的字幕"),),
+                text="后来的字幕",
+                language="zh",
+            )
+
+    class MustNotRun:
+        async def run(self, **kwargs):
+            raise AssertionError("existing raw ASR must win before subtitle discovery")
+
+    with Session(engine) as session:
+        queue = JobQueue(session)
+        job = queue.create(kind="transcribe_work", work_id=work_id)
+        queue.claim(job.id)
+        work = session.get(Work, work_id)
+        result = await TranscriptionService(
+            session,
+            StorageLayout(storage),
+            Settings(storage_root=storage),
+            MustNotRun(),
+            subtitle_provider=LateSubtitle(),
+        ).process(job, work)
+        assert result.text == raw_text
+        assert (
+            session.scalar(select(Transcript).where(Transcript.work_id == work_id)).text
+            == raw_text
+        )
+    engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_audio_hash_mismatch_aborts_before_qwen_and_preserves_source(tmp_path: Path) -> None:
+    engine = create_engine(f"sqlite:///{tmp_path / 'library.db'}")
+    create_schema(engine)
+    storage = tmp_path / "storage"
+    audio_path = storage / "audio" / "changed.m4a"
+    audio_path.parent.mkdir(parents=True)
+    original = b"original-audio"
+    audio_path.write_bytes(original)
+    with Session(engine) as session:
+        work = Work(aweme_id="changed")
+        session.add(work)
+        session.flush()
+        session.add(
+            Asset(
+                work_id=work.id,
+                kind="audio",
+                path=str(audio_path),
+                bytes=len(original),
+                sha256="wrong-hash",
+            )
+        )
+        session.commit()
+        work_id = work.id
+
+    class MustNotRun:
+        async def run(self, **kwargs):
+            raise AssertionError("audio mismatch must stop before Qwen")
+
+    with Session(engine) as session:
+        queue = JobQueue(session)
+        job = queue.create(kind="transcribe_work", work_id=work_id)
+        queue.claim(job.id)
+        work = session.get(Work, work_id)
+        with pytest.raises(RuntimeError, match="audio_asset_changed"):
+            await TranscriptionService(
+                session,
+                StorageLayout(storage),
+                Settings(storage_root=storage),
+                MustNotRun(),
+            ).process(job, work)
+        assert audio_path.read_bytes() == original
+    engine.dispose()
 
 
 @pytest.mark.asyncio

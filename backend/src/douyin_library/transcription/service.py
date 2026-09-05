@@ -202,19 +202,47 @@ class TranscriptionService:
         cancel_event: asyncio.Event | None = None,
     ) -> Transcript:
         self.layout.initialize()
+        existing_raw = self._existing_raw_asr(work)
+        if existing_raw is not None:
+            recorder = ProcessingAuditRecorder(
+                self.session,
+                audit_root=self.settings.storage_root / "audit",
+                inline_max_bytes=self.settings.audit_inline_max_bytes,
+            )
+            audit = recorder.start(
+                operation="transcribe_work",
+                processor=self.engine,
+                model=self.settings.transcription_model,
+                version=self.audit_version,
+                job=job,
+                request={
+                    "reused_existing": True,
+                    "transcript_id": existing_raw.id,
+                    "raw_fingerprint": _transcript_fingerprint(existing_raw),
+                },
+            )
+            recorder.succeed(
+                audit,
+                response={"reused_existing": True, "transcript_id": existing_raw.id},
+            )
+            return existing_raw
         subtitle_provider = self.subtitle_provider
         if subtitle_provider is not None:
             subtitle = subtitle_provider.discover(work)
             if subtitle is not None:
-                return self._process_subtitle(job, work, subtitle, cancel_event=cancel_event)
+                return await self._process_subtitle(
+                    job,
+                    work,
+                    subtitle,
+                    cancel_event=cancel_event,
+                )
         audio = self.session.scalar(
             select(Asset).where(Asset.work_id == work.id, Asset.kind == "audio")
         )
         if audio is None:
             raise RuntimeError("audio_asset_missing")
         audio_path = Path(audio.path)
-        if not audio_path.is_file():
-            raise RuntimeError(f"audio_file_missing:{audio_path}")
+        audio_bytes, audio_sha256 = _validate_audio_asset(audio)
 
         recorder = ProcessingAuditRecorder(
             self.session,
@@ -238,6 +266,8 @@ class TranscriptionService:
         request = {
             "audio_path": str(audio_path),
             "result_path": str(result_path),
+            "audio_bytes": audio_bytes,
+            "audio_sha256": audio_sha256,
             "model": self.settings.transcription_model,
             "language": self.settings.transcription_language,
             "chunk_seconds": self.settings.qwen_chunk_seconds,
@@ -251,23 +281,6 @@ class TranscriptionService:
             request=request,
             input_files=[audio_path],
         )
-        existing = self.session.scalar(
-            select(Transcript).where(
-                Transcript.work_id == work.id,
-                Transcript.engine == self.engine,
-                Transcript.model == self.settings.transcription_model,
-                Transcript.source_kind == "asr",
-                Transcript.variant == "raw",
-                Transcript.status == "succeeded",
-            )
-        )
-        if existing is not None:
-            recorder.succeed(
-                audit,
-                response={"reused_existing": True, "transcript_id": existing.id},
-            )
-            return existing
-
         run_result = SubprocessResult(returncode=-1, stdout="", stderr="")
         lease_handle = None
         published_snapshot: dict[Path, bytes | None] | None = None
@@ -350,6 +363,24 @@ class TranscriptionService:
         finally:
             attempt_result_path.unlink(missing_ok=True)
             await self._release_gpu(lease_handle)
+
+    def _existing_raw_asr(self, work: Work) -> Transcript | None:
+        rows = self.session.scalars(
+            select(Transcript)
+            .where(
+                Transcript.work_id == work.id,
+                Transcript.source_kind == "asr",
+                Transcript.variant == "raw",
+                Transcript.status == "succeeded",
+            )
+            .order_by(Transcript.id.desc())
+        ).all()
+        if not rows:
+            return None
+        for row in rows:
+            if _raw_transcript_files_match(self.layout, work.aweme_id, row):
+                return row
+        raise RuntimeError("raw_transcript_inconsistent")
 
     async def _process_subtitle(
         self, job: Job, work: Work, draft: Any, *, cancel_event: asyncio.Event | None
@@ -904,6 +935,53 @@ def _transcript_fingerprint(raw: Transcript) -> str:
         sort_keys=True,
     )
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _validate_audio_asset(asset: Asset) -> tuple[int, str]:
+    audio_path = Path(asset.path)
+    if not audio_path.is_file():
+        raise RuntimeError(f"audio_file_missing:{audio_path}")
+    try:
+        audio_bytes = audio_path.stat().st_size
+    except OSError as exc:
+        raise RuntimeError(f"audio_file_unreadable:{audio_path}") from exc
+    if audio_bytes <= 0:
+        raise RuntimeError("audio_asset_empty")
+    try:
+        audio_sha256 = file_sha256(audio_path)
+    except OSError as exc:
+        raise RuntimeError(f"audio_file_unreadable:{audio_path}") from exc
+    if asset.bytes is not None and int(asset.bytes) != audio_bytes:
+        raise RuntimeError("audio_asset_changed")
+    if asset.sha256 and asset.sha256 != audio_sha256:
+        raise RuntimeError("audio_asset_changed")
+    return audio_bytes, audio_sha256
+
+
+def _raw_transcript_files_match(
+    layout: StorageLayout,
+    aweme_id: str,
+    raw: Transcript,
+) -> bool:
+    try:
+        segments = json.loads(raw.segments_json or "[]")
+        if not isinstance(segments, list) or not segments or not raw.text:
+            return False
+        if any(
+            not isinstance(value, dict) or not isinstance(value.get("text"), str)
+            for value in segments
+        ):
+            return False
+        if layout.transcript_text_path(aweme_id).read_text(encoding="utf-8") != raw.text:
+            return False
+        file_segments = json.loads(
+            layout.transcript_segments_path(aweme_id).read_text(encoding="utf-8")
+        )
+        if file_segments != segments:
+            return False
+        return layout.transcript_qwen_path(aweme_id).is_file()
+    except (OSError, UnicodeError, TypeError, ValueError, json.JSONDecodeError):
+        return False
 
 
 def _snapshot_files(paths: tuple[Path, ...]) -> dict[Path, bytes | None]:
