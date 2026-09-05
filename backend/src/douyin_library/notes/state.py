@@ -31,6 +31,10 @@ class NoteBundleState:
     legacy_eligible: bool = False
     coverage: dict[str, Any] | None = None
 
+    @property
+    def upgrade_eligible(self) -> bool:
+        return self.quality_status in {"legacy", "fallback", "unknown"}
+
 
 def classify_note_bundle(note_dir: Path) -> NoteBundleState:
     if not (note_dir / "learning_note.md").is_file():

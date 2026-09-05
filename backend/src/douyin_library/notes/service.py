@@ -158,7 +158,7 @@ class NoteGenerationService:
             note_dir = self.layout.note_dir(aweme_id)
             state = classify_note_bundle(note_dir)
             completed = (note_dir / "learning_note.md").is_file()
-            if legacy_only and not state.legacy_eligible:
+            if legacy_only and not state.upgrade_eligible:
                 continue
             if not legacy_only and completed and not force:
                 continue
@@ -323,7 +323,7 @@ class NoteGenerationService:
         note_dir = self.layout.note_dir(aweme_id)
         current_state = classify_note_bundle(note_dir)
         learning_note = note_dir / "learning_note.md"
-        if legacy_only and not current_state.legacy_eligible:
+        if legacy_only and not current_state.upgrade_eligible:
             return GenerationResult(aweme_id, "skipped", str(note_dir))
         if learning_note.is_file() and not force and not legacy_only:
             return GenerationResult(aweme_id, "skipped", str(note_dir))
@@ -334,8 +334,11 @@ class NoteGenerationService:
         work = self.session.scalar(select(Work).where(Work.aweme_id == aweme_id))
         note_input = NoteInputLoader(self.layout, self.session).load(aweme_id)
         source_files = dict(note_input.source_files)
-        policy = provider_policy or self.settings.note_provider_policy
-        provider_names = select_provider_names(self.settings, policy)
+        # Existing-note upgrades are intentionally Ollama-only.  In
+        # particular, do not let an old ``auto`` payload fall through to an
+        # external provider or the deterministic rule generator.
+        policy = "local" if legacy_only else (provider_policy or self.settings.note_provider_policy)
+        provider_names = ["ollama"] if legacy_only else select_provider_names(self.settings, policy)
         recorder = ProcessingAuditRecorder(
             self.session,
             audit_root=self.layout.root / "audit",
@@ -963,7 +966,9 @@ def _legacy_state_unchanged(note_dir: Path, expected_state: Any) -> bool:
     """Keep a legacy-only upgrade from replacing a newer protected bundle."""
 
     current = classify_note_bundle(note_dir)
-    if current.quality_status != "legacy" or expected_state.quality_status != "legacy":
+    if not current.upgrade_eligible or not expected_state.upgrade_eligible:
+        return False
+    if current.quality_status != expected_state.quality_status:
         return False
     return all(
         getattr(current, field) == getattr(expected_state, field)

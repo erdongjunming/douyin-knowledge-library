@@ -13,6 +13,7 @@ def _write_json(path: Path, value: object) -> None:
 
 
 def _note_dir(tmp_path: Path) -> Path:
+    tmp_path.mkdir(parents=True, exist_ok=True)
     (tmp_path / "learning_note.md").write_text("# note", encoding="utf-8")
     return tmp_path
 
@@ -36,6 +37,42 @@ def test_unknown_bundle_is_not_eligible_for_legacy_upgrade(tmp_path: Path) -> No
 
     assert state.quality_status == "unknown"
     assert state.legacy_eligible is False
+
+
+def test_upgrade_eligibility_includes_fallback_and_unknown_but_not_missing(
+    tmp_path: Path,
+) -> None:
+    unknown = classify_note_bundle(_note_dir(tmp_path / "unknown"))
+    missing = classify_note_bundle(tmp_path / "missing")
+
+    fallback_dir = _note_dir(tmp_path / "fallback")
+    _write_json(
+        fallback_dir / "generation_manifest.json",
+        {"provider": "rule", "model": "local-rule-v1", "quality_gate": "fallback"},
+    )
+    fallback = classify_note_bundle(fallback_dir)
+
+    legacy_dir = _note_dir(tmp_path / "legacy")
+    _write_json(legacy_dir / "generation_audit.json", {"model": "local-rule-v1"})
+    legacy = classify_note_bundle(legacy_dir)
+
+    semantic_dir = _note_dir(tmp_path / "semantic")
+    _write_json(
+        semantic_dir / "generation_manifest.json",
+        {
+            "provider": "ollama",
+            "model": "qwen3:8b",
+            "quality_gate": "passed",
+            "generator_version": "semantic-v2",
+        },
+    )
+    semantic = classify_note_bundle(semantic_dir)
+
+    assert unknown.upgrade_eligible is True
+    assert fallback.upgrade_eligible is True
+    assert legacy.upgrade_eligible is True
+    assert semantic.upgrade_eligible is False
+    assert missing.upgrade_eligible is False
 
 
 def test_passed_ollama_manifest_is_semantic_complete(tmp_path: Path) -> None:

@@ -1,13 +1,40 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from collections.abc import Awaitable, Callable
+from dataclasses import dataclass
 from typing import Any
 
 from douyin_library.jobs.control import JobCancelledError, JobControl
 from douyin_library.jobs.queue import JobQueue
+from douyin_library.notes.service import GenerationResult
 
-JobHandler = Callable[[Any, asyncio.Event], Awaitable[None]]
+
+class JobOutcomeError(RuntimeError):
+    """Raised when a handler returns an explicit unsuccessful outcome."""
+
+
+@dataclass(frozen=True, slots=True)
+class JobHandlerOutcome:
+    """Optional explicit result contract for handlers with semantic outcomes.
+
+    Existing handlers may continue to return ``None``.  A handler that returns
+    a ``GenerationResult`` or wraps one in this type is validated before the
+    queue is allowed to transition the job to ``succeeded``.
+    """
+
+    result: Any = None
+    success: bool = True
+    error_code: str | None = None
+    error_detail: str | None = None
+
+    @property
+    def succeeded(self) -> bool:
+        return self.success
+
+
+JobHandler = Callable[[Any, asyncio.Event], Awaitable[Any]]
 
 
 class JobHandlers:
@@ -65,7 +92,8 @@ class JobHandlers:
         try:
             if cancel_event.is_set():
                 raise JobCancelledError("cancelled_by_user")
-            await handler(job, cancel_event)
+            outcome = await handler(job, cancel_event)
+            validate_handler_outcome(job, outcome)
         except JobCancelledError:
             self.queue.session.expire_all()
             current = self.queue.get(job.id)
@@ -85,3 +113,57 @@ class JobHandlers:
             self.queue.session.expire_all()
             if self.queue.get(job.id).status == "running":
                 self.queue.transition(job.id, "succeeded")
+
+
+def validate_handler_outcome(job: Any, outcome: Any) -> None:
+    if outcome is None:
+        return
+
+    if isinstance(outcome, JobHandlerOutcome):
+        if not outcome.success:
+            detail = outcome.error_detail or "handler_outcome_failed"
+            if outcome.error_code:
+                detail = f"{outcome.error_code}:{detail}"
+            raise JobOutcomeError(detail)
+        outcome = outcome.result
+        if outcome is None:
+            raise JobOutcomeError("handler_outcome_missing_result")
+
+    if not isinstance(outcome, GenerationResult):
+        raise JobOutcomeError("handler_returned_unrecognized_outcome")
+    if outcome.status != "generated":
+        detail = outcome.error or f"generation_status:{outcome.status}"
+        raise JobOutcomeError(f"generation_outcome_failed:{detail}")
+
+    # Normal missing-note generation may still use the deterministic rule
+    # fallback.  Existing-note upgrades are stricter: only a published,
+    # semantic Ollama result is a successful job outcome.
+    payload = getattr(job, "payload_json", None)
+    if payload is None:
+        payload = getattr(job, "payload", None)
+    if isinstance(payload, dict):
+        is_upgrade = payload.get("legacy_only") is True
+    else:
+        try:
+            is_upgrade = json.loads(payload or "{}").get("legacy_only") is True
+        except (TypeError, ValueError, AttributeError):
+            is_upgrade = False
+    if not is_upgrade:
+        return
+    if outcome.provider != "ollama":
+        raise JobOutcomeError(
+            f"generation_outcome_failed:upgrade_provider:{outcome.provider or 'missing'}"
+        )
+    if outcome.quality_gate != "passed":
+        raise JobOutcomeError(
+            "generation_outcome_failed:upgrade_quality_gate:"
+            f"{outcome.quality_gate or 'missing'}"
+        )
+
+
+__all__ = [
+    "JobHandlerOutcome",
+    "JobHandlers",
+    "JobOutcomeError",
+    "validate_handler_outcome",
+]

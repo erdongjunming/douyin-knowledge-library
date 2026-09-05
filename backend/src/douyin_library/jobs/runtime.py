@@ -14,14 +14,14 @@ from sqlalchemy.orm import Session
 from douyin_library.audit import ProcessingAuditRecorder
 from douyin_library.config import Settings
 from douyin_library.jobs.control import JobCancelledError, JobControl
-from douyin_library.jobs.handlers import JobHandlers
+from douyin_library.jobs.handlers import JobHandlers, validate_handler_outcome
 from douyin_library.jobs.leases import ResourceLeaseStore
 from douyin_library.jobs.queue import DuplicateActiveJobError, JobQueue
 from douyin_library.jobs.worker import JobWorker
 from douyin_library.media.service import WorkMediaService
 from douyin_library.media.storage import StorageLayout
 from douyin_library.models import Asset, Job, Transcript, Work
-from douyin_library.notes.service import NoteGenerationService
+from douyin_library.notes.service import GenerationResult, NoteGenerationService
 from douyin_library.security.cookie_store import CookieStore
 from douyin_library.sync.creator_sync import CreatorSyncService
 from douyin_library.sync.favorites_sync import FavoritesSyncService
@@ -297,7 +297,7 @@ def build_worker_runtime(
         _raise_if_cancelled(cancel_event)
         _enqueue_work(queue, "transcribe_work", work.id)
 
-    async def generate_note(job: Job, cancel_event: asyncio.Event) -> None:
+    async def generate_note(job: Job, cancel_event: asyncio.Event) -> GenerationResult:
         _raise_if_cancelled(cancel_event)
         payload = _job_payload(job)
         work = session.get(Work, job.work_id) if job.work_id is not None else None
@@ -320,6 +320,11 @@ def build_worker_runtime(
         job.stage = "analyze"
         job.progress = 0.1
         session.commit()
+        legacy_only = bool(payload.get("legacy_only", False))
+        # Upgrade jobs are always local semantic attempts.  This normalization
+        # protects older queued payloads that recorded ``auto`` before the
+        # upgrade contract was tightened.
+        effective_provider_policy = "local" if legacy_only else payload.get("provider_policy")
         generation_result = NoteGenerationService(
             session,
             StorageLayout(settings.storage_root),
@@ -331,13 +336,17 @@ def build_worker_runtime(
             force=force,
             job=job,
             cancel_event=cancel_event,
-            provider_policy=payload.get("provider_policy"),
-            legacy_only=bool(payload.get("legacy_only", False)),
+            provider_policy=effective_provider_policy,
+            legacy_only=legacy_only,
         )
         if inspect.isawaitable(generation_result):
-            await generation_result
+            generation_result = await generation_result
+        if not isinstance(generation_result, GenerationResult):
+            raise TypeError("generate_note_result_invalid")
+        validate_handler_outcome(job, generation_result)
         job.progress = 0.95
         session.commit()
+        return generation_result
 
     handlers.register("sync_creator", sync_creator)
     handlers.register("sync_favorites", sync_favorites)
