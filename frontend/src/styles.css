@@ -46,6 +46,8 @@ button:disabled { cursor: not-allowed; opacity: 0.55; }
 .progress-failed { color: #b23b3b; }
 .note-progress-actions { display: grid; justify-items: end; gap: 7px; }
 .note-progress-actions .progress-meta { flex-wrap: wrap; }
+.upgrade-progress-lane { display: grid; grid-template-columns: minmax(210px, 0.7fr) minmax(180px, 1.3fr) auto; align-items: center; gap: 22px; margin-top: 8px; padding-top: 8px; border-top: 1px solid #e5ece8; }
+.upgrade-progress-lane .progress-meta { flex-wrap: wrap; }
 .note-generate-button { min-height: 32px; }
 .progress-action-message { grid-column: 1 / -1; margin: -2px 0 0; font-size: 11px; }
 .progress-action-message.success { color: #1f7a56; }
@@ -175,6 +177,9 @@ td strong, .cell-sub { display: block; }
   .progress-lane .global-progress-track { grid-column: 1 / -1; grid-row: 2; }
   .progress-lane .progress-meta { grid-column: 1 / -1; justify-content: flex-start; }
   .note-progress-actions { grid-column: 1 / -1; justify-items: start; }
+  .upgrade-progress-lane { grid-template-columns: minmax(0, 1fr) auto; gap: 10px 18px; }
+  .upgrade-progress-lane .global-progress-track { grid-column: 1 / -1; grid-row: 2; }
+  .upgrade-progress-lane .progress-meta { grid-column: 1 / -1; justify-content: flex-start; }
   .page-content { padding: 30px 24px; }
   .content-grid { grid-template-columns: minmax(0, 1fr); }
   .signal-band { grid-column: auto; }
@@ -199,6 +204,7 @@ td strong, .cell-sub { display: block; }
   .progress-summary { grid-column: 1 / -1; }
   .progress-meta { gap: 9px; overflow-x: auto; }
   .progress-title span { max-width: 190px; }
+  .upgrade-progress-lane { grid-template-columns: minmax(0, 1fr) auto; }
   .page-content { padding: 24px 18px; }
   .intro-panel h2 { font-size: 30px; }
   .input-row { align-items: stretch; flex-direction: column; }

@@ -168,57 +168,112 @@ def note_progress(
         work.id: work.aweme_id
         for work in queue.session.scalars(select(Work).where(Work.id.in_(work_ids))).all()
     } if work_ids else {}
-    latest: dict[str, Job] = {}
+    latest_normal: dict[str, Job] = {}
+    latest_upgrade: dict[str, Job] = {}
     recent_aweme_id: str | None = None
     for job in jobs:
         aweme_id = work_map.get(job.work_id) or _payload_aweme_id(job)
         if aweme_id is None:
             continue
-        if recent_aweme_id is None:
-            recent_aweme_id = aweme_id
-        latest.setdefault(aweme_id, job)
+        if _job_is_upgrade(job):
+            latest_upgrade.setdefault(aweme_id, job)
+        else:
+            if recent_aweme_id is None:
+                recent_aweme_id = aweme_id
+            latest_normal.setdefault(aweme_id, job)
 
     counts = {"pending": 0, "running": 0, "failed": 0}
-    upgrade = {"total": 0, "completed": 0, "pending": 0, "running": 0, "failed": 0}
+    quality_by_aweme = _quality_snapshot(service)
     failures: list[dict[str, str]] = []
-    for aweme_id, job in latest.items():
-        is_upgrade = _job_is_upgrade(job)
-        if is_upgrade:
-            upgrade["total"] += 1
-            if job.status == "succeeded":
-                upgrade["completed"] += 1
-            elif job.status in upgrade:
-                upgrade[job.status] += 1
-        if (
-            (service.layout.note_dir(aweme_id) / "learning_note.md").is_file()
-            and not is_upgrade
-        ):
-            continue
+    for job in latest_normal.values():
         if job.status in counts:
             counts[job.status] += 1
         if job.status == "failed" and len(failures) < 5:
+            aweme_id = work_map.get(job.work_id) or _payload_aweme_id(job)
+            if aweme_id is None:
+                continue
             failures.append(
                 {
                     "aweme_id": aweme_id,
                     "reason": job.error_detail or job.error_code or "unknown_error",
                 }
             )
+
+    upgrade_candidates = {
+        aweme_id
+        for aweme_id, quality in quality_by_aweme.items()
+        if quality in _UPGRADE_QUALITY_STATUSES
+    }
+    upgrade_cohort = upgrade_candidates | set(latest_upgrade)
+    upgrade_completed = 0
+    upgrade_pending = 0
+    upgrade_running = 0
+    upgrade_failed = 0
+    upgrade_not_queued = 0
+    upgrade_failures: list[dict[str, str]] = []
+
+    # Job order is newest-first, so this preserves the most recent failure
+    # details while the remaining unqueued candidates are added deterministically.
+    ordered_upgrade_ids = list(latest_upgrade)
+    ordered_upgrade_ids.extend(sorted(upgrade_cohort.difference(latest_upgrade)))
+    for aweme_id in ordered_upgrade_ids:
+        if quality_by_aweme.get(aweme_id) == "semantic_complete":
+            upgrade_completed += 1
+            continue
+        job = latest_upgrade.get(aweme_id)
+        if job is None:
+            upgrade_not_queued += 1
+        elif job.status == "pending":
+            upgrade_pending += 1
+        elif job.status == "running":
+            upgrade_running += 1
+        elif job.status == "failed":
+            upgrade_failed += 1
+            if len(upgrade_failures) < 5:
+                upgrade_failures.append(
+                    {
+                        "aweme_id": aweme_id,
+                        "reason": job.error_detail or job.error_code or "unknown_error",
+                    }
+                )
+        elif job.status == "succeeded":
+            # Historical workers could mark a preserved/no-op result as
+            # succeeded.  Keep it visible as an unresolved semantic failure.
+            upgrade_failed += 1
+            if len(upgrade_failures) < 5:
+                upgrade_failures.append(
+                    {
+                        "aweme_id": aweme_id,
+                        "reason": "upgrade_completed_without_semantic_note",
+                    }
+                )
+        else:
+            upgrade_not_queued += 1
+
+    upgrade_total = len(upgrade_cohort)
+    upgrade_remaining = max(upgrade_total - upgrade_completed, 0)
+    upgrade = {
+        "total": upgrade_total,
+        "completed": upgrade_completed,
+        "remaining": upgrade_remaining,
+        "pending": upgrade_pending,
+        "running": upgrade_running,
+        "active": upgrade_pending + upgrade_running,
+        "failed": upgrade_failed,
+        "not_queued": upgrade_not_queued,
+        "eligible": len(upgrade_candidates),
+        "queued": len(latest_upgrade),
+        "percent": round(
+            (upgrade_completed / upgrade_total * 100) if upgrade_total else 0.0,
+            1,
+        ),
+        "failures": upgrade_failures,
+    }
     not_queued = max(
         total - completed - counts["pending"] - counts["running"] - counts["failed"],
         0,
     )
-    quality_counts = _quality_counts(service, work_map)
-    upgrade["not_queued"] = max(
-        quality_counts["legacy"] - upgrade["total"],
-        0,
-    )
-    upgrade["eligible"] = quality_counts["legacy"]
-    upgrade["queued"] = upgrade["total"]
-    upgrade["percent"] = round(
-        (upgrade["completed"] / quality_counts["legacy"] * 100)
-        if quality_counts["legacy"] else 0.0,
-        1,
-    )
+    quality_counts = _quality_counts(service)
     return {
         "total": total,
         "completed": completed,
@@ -272,19 +327,26 @@ def _job_is_upgrade(job: Job) -> bool:
 
 def _quality_counts(
     service: NoteGenerationService,
-    work_map: dict[int, str],
 ) -> dict[str, int]:
     # Inventory is filesystem-backed, while the work map is database-backed.
     # Count all transcript bundles so an orphaned transcript remains visible.
-    del work_map
     counts = {"semantic_complete": 0, "fallback": 0, "legacy": 0, "unknown": 0, "missing": 0}
-    if not service.layout.transcript.is_dir():
-        return counts
-    from douyin_library.notes.state import classify_note_bundle
-
-    for transcript in service.layout.transcript.glob("*/transcript.txt"):
-        quality = classify_note_bundle(
-            service.layout.note_dir(transcript.parent.name)
-        ).quality_status
+    for quality in _quality_snapshot(service).values():
         counts[quality] = counts.get(quality, 0) + 1
     return counts
+
+
+_UPGRADE_QUALITY_STATUSES = {"legacy", "fallback", "unknown"}
+
+
+def _quality_snapshot(service: NoteGenerationService) -> dict[str, str]:
+    from douyin_library.notes.state import classify_note_bundle
+
+    if not service.layout.transcript.is_dir():
+        return {}
+    return {
+        transcript.parent.name: classify_note_bundle(
+            service.layout.note_dir(transcript.parent.name)
+        ).quality_status
+        for transcript in service.layout.transcript.glob("*/transcript.txt")
+    }

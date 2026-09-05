@@ -164,7 +164,20 @@ type NoteProgress = {
   recent_aweme_id: string | null
   failures: Array<{ aweme_id: string; reason: string }>
   quality_counts?: Record<string, number>
-  upgrade?: { eligible?: number; queued?: number; running?: number; failed?: number }
+  upgrade?: {
+    total?: number
+    completed?: number
+    remaining?: number
+    active?: number
+    pending?: number
+    running?: number
+    failed?: number
+    not_queued?: number
+    eligible?: number
+    queued?: number
+    percent?: number
+    failures?: Array<{ aweme_id: string; reason: string }>
+  }
   provider_summary?: { provider?: string | null; model?: string | null; ready?: boolean; external_configured?: boolean }
 }
 
@@ -267,6 +280,12 @@ function GlobalProgress({
   const { works, audio_extraction: extraction, transcription } = progress
   const audioPercent = Math.max(0, Math.min(100, extraction?.percent ?? (works.collected ? works.audio_ready / works.collected * 100 : 0)))
   const transcriptionPercent = Math.max(0, Math.min(100, transcription.percent))
+  const upgrade = notes?.upgrade
+  const upgradeCandidates = (notes?.quality_counts?.legacy ?? 0) + (notes?.quality_counts?.fallback ?? 0) + (notes?.quality_counts?.unknown ?? 0)
+  const upgradeRemaining = notes?.upgrade?.remaining ?? upgradeCandidates
+  const upgradeTotal = notes?.upgrade?.total ?? notes?.upgrade?.eligible ?? upgradeCandidates
+  const upgradeCompleted = notes?.upgrade?.completed ?? Math.max(0, upgradeTotal - upgradeRemaining)
+  const upgradePercent = notes?.upgrade?.percent ?? (upgradeTotal ? upgradeCompleted / upgradeTotal * 100 : 0)
   return (
     <section className="progress-dock" aria-label="处理总进度">
       <div className="progress-lane">
@@ -293,9 +312,14 @@ function GlobalProgress({
           <div className="note-action-buttons"><button className="button primary note-generate-button" type="button" disabled={noteBusy || notes.not_queued === 0} onClick={onGenerateNotes}>
             {noteBusy ? <LoaderCircle className="spin" size={15} aria-hidden="true" /> : <FileText size={15} aria-hidden="true" />}
             {noteBusy ? "正在入队" : notes.not_queued === 0 ? "笔记已齐全" : "生成缺失笔记"}
-          </button>{(notes.quality_counts?.legacy ?? notes.upgrade?.eligible ?? 0) > 0 && <button className="button subtle note-generate-button" type="button" disabled={noteBusy || !providerReady} onClick={onUpgradeNotes}><RefreshCw size={15} aria-hidden="true" />升级旧笔记</button>}</div>
+          </button>{upgradeRemaining > 0 && <button className="button subtle note-generate-button" type="button" disabled={noteBusy || !providerReady} onClick={onUpgradeNotes}><RefreshCw size={15} aria-hidden="true" />升级旧笔记</button>}</div>
         </div>
         {noteMessage && <p className={`progress-action-message ${noteMessage.tone}`} role="status">{noteMessage.text}</p>}
+        {upgradeTotal > 0 && <div className="upgrade-progress-lane" aria-label="旧笔记语义升级">
+          <div className="progress-summary"><div className="progress-title"><RefreshCw size={18} aria-hidden="true" /><div><strong>旧笔记语义升级</strong><span>{upgrade?.failures?.[0] ? `失败 ${upgrade.failures[0].aweme_id}：${upgrade.failures[0].reason}` : "仅接受本地 Ollama 的完整语义笔记"}</span></div></div><strong className="progress-count">{upgradeCompleted} / {upgradeTotal}</strong></div>
+          <div className="global-progress-track" role="progressbar" aria-label="旧笔记语义升级进度" aria-valuemin={0} aria-valuemax={100} aria-valuenow={Math.max(0, Math.min(100, upgradePercent))} aria-valuetext={`${upgradeCompleted} / ${upgradeTotal}，${upgradePercent}%`}><span style={{ width: `${Math.max(0, Math.min(100, upgradePercent))}%` }} /></div>
+          <div className="progress-meta"><strong>{upgradePercent}%</strong><span className="progress-running">处理中 {upgrade?.active ?? ((upgrade?.pending ?? 0) + (upgrade?.running ?? 0))}</span><span>剩余 {upgradeRemaining}</span><span className={upgrade?.failed ? "progress-failed" : undefined}>失败 {upgrade?.failed ?? 0}</span></div>
+        </div>}
       </div>}
     </section>
   )
@@ -773,7 +797,7 @@ export function App() {
     setNoteBusy(true)
     setNoteMessage(null)
     try {
-      const result = await apiJson<NoteQueueResult>("/api/notes/generate", { method: "POST", body: JSON.stringify({ legacy_only: true, provider_policy: "auto" }) })
+      const result = await apiJson<NoteQueueResult>("/api/notes/generate", { method: "POST", body: JSON.stringify({ legacy_only: true, limit: 3, provider_policy: "local" }) })
       setNoteMessage({ tone: "success", text: result.queued > 0 ? `已加入 ${result.queued} 条旧笔记升级任务。` : "当前没有可升级的旧笔记。" })
     } catch (reason) {
       setNoteMessage({ tone: "error", text: reason instanceof Error ? reason.message : "无法升级旧笔记" })
@@ -809,6 +833,6 @@ export function App() {
     degraded: "本地服务已连接（存储暂不可用）",
     disconnected: "本地服务未连接",
   }[connectionState]
-  const semanticProviderReady = Boolean(providerStatus?.ready || providerStatus?.ollama?.ready || providerStatus?.external_configured || noteProgress?.provider_summary?.ready || noteProgress?.provider_summary?.external_configured)
+  const semanticProviderReady = Boolean(providerStatus?.ollama?.ready || (noteProgress?.provider_summary?.provider === "ollama" && noteProgress.provider_summary.ready))
   return <div className="app-shell"><aside className="sidebar"><div className="brand-mark" aria-hidden="true">知</div><nav aria-label="主要导航">{navigation.map(({ key, label, icon: Icon }) => <button className={activeView === key ? "nav-item is-active" : "nav-item"} key={key} type="button" onClick={() => setActiveView(key)}><Icon aria-hidden="true" size={18} /><span>{label}</span></button>)}</nav></aside><main className="workspace"><header className="topbar"><div><p className="topbar-kicker">{viewTitles[activeView]}</p><h1>抖音知识资料库</h1></div><span className={`connection-status is-${connectionState}`} aria-live="polite"><span aria-hidden="true" className="status-dot" />{connectionLabel}</span></header><GlobalProgress progress={processingProgress} notes={noteProgress} noteBusy={noteBusy} noteMessage={noteMessage} onGenerateNotes={() => void generateMissingNotes()} onUpgradeNotes={() => void upgradeLegacyNotes()} providerReady={semanticProviderReady} providerStatus={providerStatus} /><div className="page-content">{content}</div></main></div>
 }
