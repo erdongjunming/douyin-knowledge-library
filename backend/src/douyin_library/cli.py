@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+from dataclasses import asdict, replace
 from datetime import timedelta
 from pathlib import Path
 
@@ -21,7 +22,14 @@ from douyin_library.notes.input import NoteInputLoader
 from douyin_library.notes.providers.selector import ProviderPolicy
 from douyin_library.notes.service import NoteGenerationService
 from douyin_library.runtime import initialize_runtime
+from douyin_library.transcription.inventory import (
+    InventoryReport,
+    build_inventory,
+    select_raw_asr_candidates,
+)
 from douyin_library.transcription.service import _transcript_fingerprint
+
+DEFAULT_RAW_ASR_MODEL = "Qwen/Qwen3-ASR-0.6B"
 
 
 def _database_url(path: Path) -> str:
@@ -46,6 +54,14 @@ def main(argv: list[str] | None = None) -> int:
     clean_parser.add_argument("--provider", choices=("auto", "local", "ollama"), default="auto")
     clean_parser.add_argument("--model")
     clean_parser.add_argument("--dry-run", action="store_true")
+    inventory_parser = subparsers.add_parser("inventory-transcripts")
+    inventory_parser.add_argument("--aweme-id", action="append", dest="aweme_ids")
+    inventory_parser.add_argument("--limit", type=int)
+    backfill_parser = subparsers.add_parser("backfill-transcripts")
+    backfill_parser.add_argument("--aweme-id", action="append", dest="aweme_ids")
+    backfill_parser.add_argument("--limit", type=int)
+    backfill_parser.add_argument("--execute", action="store_true")
+    backfill_parser.add_argument("--dry-run", action="store_true")
     notes_parser = subparsers.add_parser("generate-notes")
     scope = notes_parser.add_mutually_exclusive_group()
     scope.add_argument("--limit", type=int)
@@ -118,6 +134,27 @@ def main(argv: list[str] | None = None) -> int:
         )
         print(json.dumps(result, ensure_ascii=False, indent=2))
         return 1 if result.get("failed", 0) else 0
+
+    if args.command in {"inventory-transcripts", "backfill-transcripts"}:
+        if args.limit is not None and args.limit < 1:
+            parser.error("--limit must be at least 1")
+        if args.aweme_ids is not None and any(not value.strip() for value in args.aweme_ids):
+            parser.error("--aweme-id must not be empty")
+        if args.command == "backfill-transcripts":
+            if args.execute and args.dry_run:
+                parser.error("--execute cannot be combined with --dry-run")
+            result = run_transcript_backfill(
+                aweme_ids=args.aweme_ids,
+                limit=args.limit,
+                execute=args.execute,
+            )
+        else:
+            result = run_transcript_inventory(
+                aweme_ids=args.aweme_ids,
+                limit=args.limit,
+            )
+        print(json.dumps(result, ensure_ascii=False, indent=2, sort_keys=True))
+        return 1 if result.get("error") else 0
 
     if args.command == "generate-notes":
         if args.limit is not None and args.limit < 1:
@@ -206,6 +243,155 @@ def run_generate_notes(
             ).as_dict()
     finally:
         runtime.engine.dispose()
+
+
+def _inventory_result(report: InventoryReport) -> dict[str, object]:
+    items = [asdict(item) for item in report.items]
+    quality_counts: dict[str, int] = {}
+    for item in report.items:
+        quality_counts[item.note.quality_status] = (
+            quality_counts.get(item.note.quality_status, 0) + 1
+        )
+    counts = {
+        "works": len(report.items),
+        "audio_ready": sum(item.audio.status == "ready" for item in report.items),
+        "audio_blocked": sum(item.audio.status == "blocked" for item in report.items),
+        "raw_succeeded": sum(item.raw.status == "succeeded" for item in report.items),
+        "raw_missing": sum(item.raw.status == "missing" for item in report.items),
+        "raw_blocked": sum(item.raw.status == "blocked" for item in report.items),
+        "cleaned_succeeded": sum(
+            item.cleaned.status == "succeeded" for item in report.items
+        ),
+        "notes": dict(sorted(quality_counts.items())),
+    }
+    return {
+        "items": items,
+        "counts": counts,
+        "selected_ids": list(report.selected_ids),
+        "selection_reasons": [list(reason) for reason in report.selection_reasons],
+    }
+
+
+def _load_inventory_report(settings: Settings, *, aweme_ids, limit) -> InventoryReport:
+    database_path = settings.storage_root / "data" / "library.db"
+    if not database_path.is_file():
+        raise FileNotFoundError("database_not_found")
+    engine = create_engine(_database_url(database_path))
+    try:
+        with Session(engine) as session:
+            report = build_inventory(session, StorageLayout(settings.storage_root))
+            selection = select_raw_asr_candidates(
+                report,
+                aweme_ids=aweme_ids,
+                limit=limit,
+            )
+            return replace(
+                report,
+                selected_ids=selection.selected_ids,
+                selection_reasons=selection.reasons,
+            )
+    finally:
+        engine.dispose()
+
+
+def run_transcript_inventory(*, aweme_ids, limit: int | None) -> dict[str, object]:
+    settings = Settings()
+    try:
+        report = _load_inventory_report(settings, aweme_ids=aweme_ids, limit=limit)
+    except FileNotFoundError as exc:
+        return {
+            "items": [],
+            "counts": {"works": 0},
+            "selected_ids": [],
+            "selection_reasons": [],
+            "error": str(exc),
+        }
+    return _inventory_result(report)
+
+
+def _sanitized_audio_path(path: str | None, root: Path) -> str | None:
+    if not path:
+        return None
+    candidate = Path(path)
+    try:
+        return candidate.resolve().relative_to(root.resolve()).as_posix()
+    except (OSError, ValueError):
+        return candidate.name
+
+
+def run_transcript_backfill(
+    *, aweme_ids, limit: int | None, execute: bool = False
+) -> dict[str, object]:
+    settings = Settings()
+    try:
+        report = _load_inventory_report(settings, aweme_ids=aweme_ids, limit=limit)
+    except FileNotFoundError as exc:
+        return {
+            "selected": 0,
+            "queued": 0,
+            "failed": 1,
+            "dry_run": not execute,
+            "items": [],
+            "error": str(exc),
+        }
+    selected = {
+        item.aweme_id: item
+        for item in report.items
+        if item.aweme_id in report.selected_ids
+    }
+    if not execute:
+        return {
+            "selected": len(report.selected_ids),
+            "queued": 0,
+            "failed": 0,
+            "dry_run": True,
+            "items": [
+                {"aweme_id": aweme_id, "status": "would_transcribe"}
+                for aweme_id in report.selected_ids
+            ],
+        }
+
+    database_path = settings.storage_root / "data" / "library.db"
+    engine = create_engine(_database_url(database_path))
+    items: list[dict[str, object]] = []
+    queued = 0
+    try:
+        with Session(engine) as session:
+            queue = JobQueue(session)
+            model = getattr(settings, "transcription_model", DEFAULT_RAW_ASR_MODEL)
+            for aweme_id in report.selected_ids:
+                item = selected[aweme_id]
+                payload = {
+                    "phase": "raw_asr",
+                    "provider_policy": "local",
+                    "provider": "qwen3-asr",
+                    "model": model,
+                    "audio_sha256": item.audio.sha256,
+                    "audio_path": _sanitized_audio_path(
+                        item.audio.path,
+                        settings.storage_root,
+                    ),
+                }
+                try:
+                    job = queue.create(
+                        kind="transcribe_work",
+                        work_id=item.work_id,
+                        payload=payload,
+                    )
+                except DuplicateActiveJobError:
+                    items.append({"aweme_id": aweme_id, "status": "already_queued"})
+                    continue
+                queued += 1
+                items.append({"aweme_id": aweme_id, "job_id": job.id, "status": "queued"})
+    finally:
+        engine.dispose()
+    return {
+        "selected": len(report.selected_ids),
+        "queued": queued,
+        "failed": 0,
+        "dry_run": False,
+        "items": items,
+    }
 
 
 def run_clean_transcripts(
