@@ -236,23 +236,25 @@ class SemanticNotePipeline:
                 }
                 for atom in all_prior_atoms
             ]
-            payload = _extraction_payload(
-                note_input,
-                batch,
-                prior_catalog,
-                prior_atoms,
-            )
-            while prior_atoms and not self._request_fits(
-                "extract", payload, ExtractionResult
-            ):
-                _check_cancellation(cancel_event)
-                prior_atoms = prior_atoms[1:]
+            while True:
                 payload = _extraction_payload(
                     note_input,
                     batch,
                     prior_catalog,
                     prior_atoms,
                 )
+                if self._request_fits("extract", payload, ExtractionResult):
+                    break
+                _check_cancellation(cancel_event)
+                if prior_atoms:
+                    # Keep the compact catalog available for relation lookup,
+                    # but drop the verbose prior atom bodies first.
+                    prior_atoms = prior_atoms[1:]
+                    continue
+                if len(prior_catalog) > 1:
+                    prior_catalog = _shrink_atom_catalog(prior_catalog)
+                    continue
+                break
             if not self._request_fits("extract", payload, ExtractionResult):
                 split_batches = _split_segment_batch(batch)
                 if split_batches:
@@ -338,9 +340,15 @@ class SemanticNotePipeline:
                     audit_sink,
                     records,
                 )
-                input_sufficient = outline.input_sufficient and all(
-                    not draft.unprovided_items for draft in section_drafts
+                # ``unprovided_items`` normally records honest evidence gaps
+                # (for example, a video with no counterexample).  Only the
+                # section-id marker is an orchestration failure emitted by our
+                # bounded section retry path.
+                section_failed = any(
+                    draft.section_id in draft.unprovided_items
+                    for draft in section_drafts
                 )
+                input_sufficient = outline.input_sufficient and not section_failed
                 synthesis = _teaching_synthesis(
                     note_input,
                     extraction,
@@ -453,7 +461,13 @@ class SemanticNotePipeline:
             context_failures,
         )
         _check_cancellation(cancel_event)
-        coverage = self._validate(note_input, extraction, synthesis, review)
+        coverage = self._validate(
+            note_input,
+            extraction,
+            synthesis,
+            review,
+            input_sufficient=input_sufficient,
+        )
         if context_failures:
             return self._failed_generation(
                 note_input=note_input,
@@ -585,7 +599,11 @@ class SemanticNotePipeline:
                 )
                 _check_cancellation(cancel_event)
                 coverage = self._validate(
-                    note_input, extraction, synthesis, review
+                    note_input,
+                    extraction,
+                    synthesis,
+                    review,
+                    input_sufficient=input_sufficient,
                 )
                 if context_failures:
                     coverage = coverage.model_copy(
@@ -938,21 +956,37 @@ class SemanticNotePipeline:
                 "input_sufficient": bool(note_input.transcript.strip()),
             }
             if not self._request_fits("outline", payload, TeachingOutline):
-                if len(chunk) <= 1:
-                    raise ProviderContextBudgetError("outline")
-                midpoint = max(1, len(chunk) // 2)
-                chunks = [chunk[:midpoint], chunk[midpoint:], *chunks]
-                continue
-            outlines.append(
-                await self._call(
-                    stage="outline",
-                    payload=payload,
-                    schema=TeachingOutline,
-                    cancel_event=cancel_event,
-                    audit_sink=audit_sink,
-                    records=records,
+                compact_payload = dict(payload)
+                compact_payload["atom_catalog"] = _compact_catalog(
+                    chunk,
+                    max_chars=max(256, int(self.provider.context_tokens * 0.35)),
                 )
+                compact_payload["source_segments"] = _compact_source_segments(
+                    note_input,
+                    indexes,
+                    chunk,
+                    max_chars=max(256, int(self.provider.context_tokens * 0.35)),
+                )
+                if self._request_fits(
+                    "outline", compact_payload, TeachingOutline
+                ):
+                    payload = compact_payload
+                else:
+                    if len(chunk) <= 1:
+                        raise ProviderContextBudgetError("outline")
+                    midpoint = max(1, len(chunk) // 2)
+                    chunks = [chunk[:midpoint], chunk[midpoint:], *chunks]
+                    continue
+            outline = await self._call(
+                stage="outline",
+                payload=payload,
+                schema=TeachingOutline,
+                cancel_event=cancel_event,
+                audit_sink=audit_sink,
+                records=records,
             )
+            _validate_outline_response(outline)
+            outlines.append(outline)
         merged = _merge_outlines(outlines)
         return _normalize_outline(merged, extraction)
 
@@ -982,23 +1016,44 @@ class SemanticNotePipeline:
                 chunk = chunks.pop(0)
                 payload = _section_payload(note_input, section, chunk)
                 if not self._request_fits("section", payload, SectionDraft):
-                    if len(chunk) <= 1:
-                        failed = True
-                        break
-                    midpoint = max(1, len(chunk) // 2)
-                    chunks = [chunk[:midpoint], chunk[midpoint:], *chunks]
-                    continue
+                    compact_payload = _section_payload(
+                        note_input,
+                        section,
+                        chunk,
+                        compact=True,
+                        max_chars=max(256, int(self.provider.context_tokens * 0.35)),
+                    )
+                    if self._request_fits(
+                        "section", compact_payload, SectionDraft
+                    ):
+                        payload = compact_payload
+                    else:
+                        if len(chunk) <= 1:
+                            failed = True
+                            break
+                        midpoint = max(1, len(chunk) // 2)
+                        chunks = [chunk[:midpoint], chunk[midpoint:], *chunks]
+                        continue
                 result: SectionDraft | None = None
                 for attempt in range(1, 3):
                     attempts[section.section_id] += 1
                     try:
-                        result = await self._call(
+                        raw_result = await self._call(
                             stage="section",
                             payload=payload,
                             schema=SectionDraft,
                             cancel_event=cancel_event,
                             audit_sink=audit_sink,
                             records=records,
+                        )
+                        # Normalize inside the retry boundary so an otherwise
+                        # valid JSON response with unauthorized atom references
+                        # is treated as a failed section attempt, not as a
+                        # pipeline-wide crash.
+                        result = _normalize_section(
+                            raw_result,
+                            section,
+                            atom_by_id,
                         )
                         break
                     except (ValueError, ProviderContextBudgetError):
@@ -1009,14 +1064,31 @@ class SemanticNotePipeline:
                 if failed:
                     break
             if failed or not chunk_drafts:
-                result = SectionDraft(
-                    section_id=section.section_id,
-                    title=section.title,
-                    content="视频未提供这一类信息。",
-                    included_atom_ids=[],
-                    unprovided_items=[section.section_id],
-                )
-                drafts.append(_normalize_section(result, section, atom_by_id))
+                if chunk_drafts:
+                    # Preserve successful atom chunks when one oversized or
+                    # malformed chunk fails.  The explicit marker keeps the
+                    # section readable while the quality gate can reject it.
+                    partial = _merge_section_drafts(chunk_drafts, section)
+                    partial = partial.model_copy(
+                        update={
+                            "unprovided_items": [
+                                *partial.unprovided_items,
+                                section.section_id,
+                            ]
+                        }
+                    )
+                    drafts.append(
+                        _normalize_section(partial, section, atom_by_id)
+                    )
+                else:
+                    result = SectionDraft(
+                        section_id=section.section_id,
+                        title=section.title,
+                        content="视频未提供这一类信息。",
+                        included_atom_ids=[],
+                        unprovided_items=[section.section_id],
+                    )
+                    drafts.append(_normalize_section(result, section, atom_by_id))
             else:
                 drafts.append(
                     _normalize_section(
@@ -1159,6 +1231,9 @@ class SemanticNotePipeline:
         extraction: ExtractionResult,
         synthesis: SynthesisResult,
         review: CoverageReview,
+        *,
+        depth_review: DepthReview | None = None,
+        input_sufficient: bool = True,
     ) -> CoverageReport:
         return self.validator.validate(
             segment_count=len(note_input.segments),
@@ -1166,6 +1241,8 @@ class SemanticNotePipeline:
             synthesis=synthesis,
             review=review,
             semantic_generator=f"{self.provider.name}/{self.provider.model}",
+            depth_review=depth_review,
+            input_sufficient=input_sufficient,
         )
 
     def _failed_generation(
@@ -1201,6 +1278,7 @@ class SemanticNotePipeline:
                 candidate_extraction,
                 candidate_synthesis,
                 candidate_review,
+                input_sufficient=False,
             )
         coverage = coverage.model_copy(
             update={"quality_gate": "failed", "repairable": False}
@@ -1455,6 +1533,17 @@ def _atom_catalog_entry(atom: Any) -> dict[str, Any]:
     }
 
 
+def _shrink_atom_catalog(catalog: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Reduce catalog overhead while retaining the oldest and newest links."""
+
+    if len(catalog) <= 1:
+        return catalog
+    keep = max(1, len(catalog) // 2)
+    if keep == 1:
+        return [catalog[0]]
+    return [catalog[0], *catalog[-(keep - 1) :]]
+
+
 _TEACHING_SECTION_IDS = (
     "overview",
     "core_points",
@@ -1467,6 +1556,16 @@ _TEACHING_SECTION_IDS = (
 )
 
 
+def _validate_outline_response(outline: TeachingOutline) -> None:
+    section_ids = [section.section_id for section in outline.sections]
+    if (
+        len(section_ids) != len(_TEACHING_SECTION_IDS)
+        or len(set(section_ids)) != len(section_ids)
+        or set(section_ids) != set(_TEACHING_SECTION_IDS)
+    ):
+        raise ValueError("outline must contain each fixed teaching section exactly once")
+
+
 def _normalize_outline(
     outline: TeachingOutline,
     extraction: ExtractionResult,
@@ -1474,19 +1573,38 @@ def _normalize_outline(
     atom_ids = {atom.id for atom in extraction.atoms}
     by_id = {section.section_id: section for section in outline.sections}
     if (
-        len(by_id) != len(outline.sections)
+        len(outline.sections) != len(_TEACHING_SECTION_IDS)
+        or len(by_id) != len(outline.sections)
         or set(by_id) != set(_TEACHING_SECTION_IDS)
     ):
         raise ValueError("outline must contain the fixed teaching sections")
+
+    referenced_ids = {
+        atom_id
+        for section in outline.sections
+        for atom_id in section.atom_ids
+    }
+    referenced_ids.update(outline.included_atom_ids)
+    referenced_ids.update(outline.unassigned_atom_ids)
+    unknown_ids = sorted(referenced_ids - atom_ids)
+    if unknown_ids:
+        raise ValueError(f"outline references unknown atoms: {unknown_ids}")
+
+    source_order = {atom.id: index for index, atom in enumerate(extraction.atoms)}
+
+    def ordered_unique(values: list[str]) -> list[str]:
+        return sorted(
+            dict.fromkeys(values),
+            key=lambda atom_id: source_order[atom_id],
+        )
+
     assigned: set[str] = set()
     sections: list[TeachingOutlineSection] = []
     for order, section_id in enumerate(_TEACHING_SECTION_IDS, 1):
         section = by_id[section_id]
-        ids = [
-            atom_id
-            for atom_id in section.atom_ids
-            if atom_id in atom_ids and atom_id not in assigned
-        ]
+        # An atom may legitimately support more than one teaching section.
+        # Only duplicate references inside the same section are collapsed.
+        ids = ordered_unique(section.atom_ids)
         assigned.update(ids)
         sections.append(
             section.model_copy(update={"order": order, "atom_ids": ids})
@@ -1495,7 +1613,11 @@ def _normalize_outline(
     if unassigned:
         limit_index = _TEACHING_SECTION_IDS.index("evidence_limits")
         sections[limit_index] = sections[limit_index].model_copy(
-            update={"atom_ids": [*sections[limit_index].atom_ids, *unassigned]}
+            update={
+                "atom_ids": ordered_unique(
+                    [*sections[limit_index].atom_ids, *unassigned]
+                )
+            }
         )
     return outline.model_copy(
         update={
@@ -1540,20 +1662,86 @@ def _section_payload(
     note_input: NoteInput,
     section: TeachingOutlineSection,
     atoms: list[Any],
+    *,
+    compact: bool = False,
+    max_chars: int | None = None,
 ) -> dict[str, Any]:
     indexes = {atom.source_segment for atom in atoms}
+    source_segments = [
+        _segment_payload(segment)
+        for segment in note_input.segments
+        if segment.index in indexes
+    ]
+    atom_catalog = [_atom_catalog_entry(atom) for atom in atoms]
+    if compact:
+        atom_catalog = _compact_catalog(atom_catalog, max_chars=max_chars or 1024)
+        source_segments = _compact_source_segments(
+            note_input,
+            indexes,
+            atoms,
+            max_chars=max_chars or 1024,
+        )
     return {
         "prompt_version": PROMPT_VERSIONS["section"],
         "aweme_id": note_input.aweme_id,
         "section": section.model_dump(mode="json"),
-        "atoms": [_atom_catalog_entry(atom) for atom in atoms],
-        "source_segments": [
+        "atoms": atom_catalog,
+        "source_segments": source_segments,
+        "input_truncated": compact,
+    }
+
+
+def _compact_catalog(
+    catalog: list[dict[str, Any]],
+    *,
+    max_chars: int,
+) -> list[dict[str, Any]]:
+    """Keep identifiers and traceability fields while bounding prompt size."""
+
+    remaining = max(1, max_chars)
+    per_item = max(1, remaining // max(1, len(catalog)))
+    compacted: list[dict[str, Any]] = []
+    for item in catalog:
+        value = {
+            "id": item["id"],
+            "kind": item["kind"],
+            "topic": item["topic"],
+            "statement": item["statement"][:per_item],
+            "source_segment": item["source_segment"],
+            "timestamps": item.get("timestamps", []),
+            "relations": item.get("relations", []),
+            "uncertainty": item.get("uncertainty", []),
+        }
+        compacted.append(value)
+    return compacted
+
+
+def _compact_source_segments(
+    note_input: NoteInput,
+    indexes: set[int],
+    atoms: list[Any] | list[dict[str, Any]],
+    *,
+    max_chars: int,
+) -> list[dict[str, Any]]:
+    atom_indexes = {
+        item.source_segment if hasattr(item, "source_segment") else item["source_segment"]
+        for item in atoms
+    }
+    selected = [
+        _segment_payload(segment)
+        for segment in note_input.segments
+        if segment.index in indexes and segment.index in atom_indexes
+    ]
+    if not selected:
+        selected = [
             _segment_payload(segment)
             for segment in note_input.segments
             if segment.index in indexes
-        ],
-        "input_truncated": False,
-    }
+        ]
+    budget_each = max(1, max_chars // max(1, len(selected)))
+    for item in selected:
+        item["text"] = item["text"][:budget_each]
+    return selected
 
 
 def _normalize_section(
@@ -1561,10 +1749,46 @@ def _normalize_section(
     outline_section: TeachingOutlineSection,
     atom_by_id: Mapping[str, Any],
 ) -> SectionDraft:
+    if draft.section_id != outline_section.section_id:
+        raise ValueError(
+            f"section draft id mismatch: {draft.section_id} != "
+            f"{outline_section.section_id}"
+        )
     allowed = set(outline_section.atom_ids)
-    included = [atom_id for atom_id in draft.included_atom_ids if atom_id in allowed]
+    referenced = set(draft.included_atom_ids)
+    for field_name in (
+        "claims",
+        "steps",
+        "examples",
+        "results",
+        "conditions",
+        "risks",
+        "actions",
+    ):
+        referenced.update(
+            atom_id
+            for claim in getattr(draft, field_name)
+            for atom_id in claim.atom_ids
+        )
+    unknown = sorted(
+        atom_id
+        for atom_id in referenced
+        if atom_id not in atom_by_id or atom_id not in allowed
+    )
+    if unknown:
+        raise ValueError(f"section references unauthorized atoms: {unknown}")
+
+    source_order = {atom_id: index for index, atom_id in enumerate(atom_by_id)}
+    included = sorted(
+        dict.fromkeys(draft.included_atom_ids),
+        key=lambda atom_id: source_order[atom_id],
+    )
     if not included:
-        included = [atom_id for atom_id in outline_section.atom_ids if atom_id in atom_by_id]
+        included = [
+            atom_id
+            for atom_id in outline_section.atom_ids
+            if atom_id in atom_by_id
+        ]
     return draft.model_copy(
         update={
             "section_id": outline_section.section_id,
@@ -1586,7 +1810,8 @@ def _merge_section_drafts(
             included_atom_ids=[],
         )
     data = values[0].model_dump(mode="json")
-    data["content"] = "\n".join(item.content for item in values)
+    content_parts = list(dict.fromkeys(item.content for item in values))
+    data["content"] = "\n".join(content_parts)
     for field_name in (
         "claims",
         "steps",
@@ -1598,13 +1823,34 @@ def _merge_section_drafts(
         "unprovided_items",
         "generated_interpretations",
     ):
-        data[field_name] = [
-            item.model_dump(mode="json")
-            if hasattr(item, "model_dump")
-            else item
-            for value in values
-            for item in getattr(value, field_name)
-        ]
+        if field_name in {"unprovided_items", "generated_interpretations"}:
+            data[field_name] = list(
+                dict.fromkeys(
+                    item
+                    for value in values
+                    for item in getattr(value, field_name)
+                )
+            )
+            continue
+        seen: set[tuple[Any, ...]] = set()
+        merged_items: list[dict[str, Any]] = []
+        for value in values:
+            for item in getattr(value, field_name):
+                item_data = (
+                    item.model_dump(mode="json")
+                    if hasattr(item, "model_dump")
+                    else item
+                )
+                key = (
+                    item_data.get("text"),
+                    tuple(item_data.get("atom_ids", [])),
+                    tuple(item_data.get("timestamps", [])),
+                )
+                if key in seen:
+                    continue
+                seen.add(key)
+                merged_items.append(item_data)
+        data[field_name] = merged_items
     data["included_atom_ids"] = _dedupe_text(
         atom_id for value in values for atom_id in value.included_atom_ids
     )

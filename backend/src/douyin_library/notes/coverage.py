@@ -224,7 +224,9 @@ class CoverageValidator:
             ),
             semantic_generator=semantic_generator,
             quality_gate=(
-                "passed" if passed and (depth_review is None or semantic_complete) else "failed"
+                "passed"
+                if passed and input_sufficient and (depth_review is None or semantic_complete)
+                else "failed"
             ),
             repairable=(
                 not depth_non_repairable and not passed and not foundational_error and repair_issue

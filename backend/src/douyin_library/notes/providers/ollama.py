@@ -25,6 +25,10 @@ AsyncClientFactory = Callable[[], httpx.AsyncClient]
 class OllamaNoteProvider:
     name = "ollama"
     is_local = True
+    # The Ollama JSON endpoint accepts every typed note stage.  Keeping this
+    # capability explicit lets the pipeline retain a legacy fallback for
+    # older test/external providers without disabling teaching notes locally.
+    supports_teaching_pipeline = True
 
     def __init__(
         self,
