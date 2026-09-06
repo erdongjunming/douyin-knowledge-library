@@ -7,7 +7,8 @@ SECTION_PROMPT_VERSION = "teaching-section-v1"
 REVIEW_PROMPT_VERSION = "raw-source-review-v1"
 DEPTH_REVIEW_PROMPT_VERSION = "teaching-depth-review-v1"
 LEGACY_REPAIR_PROMPT_VERSION = "coverage-repair-v1"
-REPAIR_PROMPT_VERSION = "teaching-bounded-repair-v2"
+REPAIR_PROMPT_VERSION = LEGACY_REPAIR_PROMPT_VERSION
+TEACHING_REPAIR_PROMPT_VERSION = "teaching-bounded-repair-v2"
 
 _COMMON_RULES = """
 只依据 payload 中完整提供的源材料工作，绝不得发明、补写或把常识冒充作者观点。
@@ -123,7 +124,7 @@ SYSTEM_PROMPTS = {
     "section": SECTION_SYSTEM_PROMPT,
     "review": REVIEW_SYSTEM_PROMPT,
     "depth_review": DEPTH_REVIEW_SYSTEM_PROMPT,
-    "repair": TEACHING_REPAIR_SYSTEM_PROMPT,
+    "repair": REPAIR_SYSTEM_PROMPT,
 }
 
 # Kept separate so historical audit records using the former repair prompt remain readable.
@@ -150,5 +151,6 @@ __all__ = [
     "SYNTHESIZE_PROMPT_VERSION",
     "SYNTHESIZE_SYSTEM_PROMPT",
     "SYSTEM_PROMPTS",
+    "TEACHING_REPAIR_PROMPT_VERSION",
     "TEACHING_REPAIR_SYSTEM_PROMPT",
 ]

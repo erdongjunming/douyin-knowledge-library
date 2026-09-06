@@ -8,8 +8,11 @@ from douyin_library.notes.prompts import (
     OUTLINE_PROMPT_VERSION,
     PROMPT_VERSIONS,
     REPAIR_PROMPT_VERSION,
+    REPAIR_SYSTEM_PROMPT,
     SECTION_PROMPT_VERSION,
     SYSTEM_PROMPTS,
+    TEACHING_REPAIR_PROMPT_VERSION,
+    TEACHING_REPAIR_SYSTEM_PROMPT,
 )
 from douyin_library.notes.providers.base import NoteStage
 
@@ -42,7 +45,9 @@ def test_prompt_versions_and_system_prompts_cover_all_stages() -> None:
     assert PROMPT_VERSIONS["section"] == SECTION_PROMPT_VERSION
     assert PROMPT_VERSIONS["depth_review"] == DEPTH_REVIEW_PROMPT_VERSION
     assert PROMPT_VERSIONS["repair"] == REPAIR_PROMPT_VERSION
-    assert REPAIR_PROMPT_VERSION == "teaching-bounded-repair-v2"
+    assert PROMPT_VERSIONS["repair"] == LEGACY_REPAIR_PROMPT_VERSION
+    assert REPAIR_PROMPT_VERSION == "coverage-repair-v1"
+    assert TEACHING_REPAIR_PROMPT_VERSION == "teaching-bounded-repair-v2"
     assert LEGACY_REPAIR_PROMPT_VERSION == "coverage-repair-v1"
     assert len(set(PROMPT_VERSIONS.values())) == len(PROMPT_VERSIONS)
 
@@ -52,7 +57,7 @@ def test_teaching_prompts_preserve_required_evidence_rules() -> None:
         SYSTEM_PROMPTS["outline"],
         SYSTEM_PROMPTS["section"],
         SYSTEM_PROMPTS["depth_review"],
-        SYSTEM_PROMPTS["repair"],
+        TEACHING_REPAIR_SYSTEM_PROMPT,
     )
     required_phrases = (
         "视频未提供这一类信息。",
@@ -78,7 +83,16 @@ def test_teaching_prompts_preserve_required_evidence_rules() -> None:
     assert "overview" in SYSTEM_PROMPTS["outline"]
     assert "evidence_limits" in SYSTEM_PROMPTS["outline"]
     assert "不修复" in SYSTEM_PROMPTS["depth_review"]
-    assert "只修复" in SYSTEM_PROMPTS["repair"]
+    assert "只修复" in TEACHING_REPAIR_SYSTEM_PROMPT
+
+
+def test_pipeline_repair_mapping_remains_legacy_compatible() -> None:
+    assert SYSTEM_PROMPTS["repair"] == REPAIR_SYSTEM_PROMPT
+    assert "coverage_report" in REPAIR_SYSTEM_PROMPT
+    assert "payload.review" in REPAIR_SYSTEM_PROMPT
+    assert "payload.extraction" in REPAIR_SYSTEM_PROMPT
+    assert "draft" in REPAIR_SYSTEM_PROMPT
+    assert "bounded repair patch" in REPAIR_SYSTEM_PROMPT
 
 
 def test_legacy_prompt_constants_remain_readable() -> None:
