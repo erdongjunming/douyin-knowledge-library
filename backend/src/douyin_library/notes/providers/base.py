@@ -13,7 +13,15 @@ from urllib.parse import urlsplit, urlunsplit
 from douyin_library.jobs.control import JobCancelledError
 from douyin_library.notes.contracts import ProviderUsage
 
-NoteStage = Literal["extract", "synthesize", "review", "repair"]
+NoteStage = Literal[
+    "extract",
+    "outline",
+    "synthesize",
+    "section",
+    "review",
+    "depth_review",
+    "repair",
+]
 _SAFE_ERROR_PART = re.compile(r"[^A-Za-z0-9_.-]+")
 
 

@@ -1,9 +1,13 @@
 from __future__ import annotations
 
 EXTRACT_PROMPT_VERSION = "evidence-extract-v1"
+OUTLINE_PROMPT_VERSION = "teaching-outline-v1"
 SYNTHESIZE_PROMPT_VERSION = "evidence-synthesize-v1"
+SECTION_PROMPT_VERSION = "teaching-section-v1"
 REVIEW_PROMPT_VERSION = "raw-source-review-v1"
-REPAIR_PROMPT_VERSION = "coverage-repair-v1"
+DEPTH_REVIEW_PROMPT_VERSION = "teaching-depth-review-v1"
+LEGACY_REPAIR_PROMPT_VERSION = "coverage-repair-v1"
+REPAIR_PROMPT_VERSION = "teaching-bounded-repair-v2"
 
 _COMMON_RULES = """
 只依据 payload 中完整提供的源材料工作，绝不得发明、补写或把常识冒充作者观点。
@@ -62,28 +66,89 @@ REPAIR_SYSTEM_PROMPT = f"""你是一次性语义覆盖修复器。
 修复结果仍须让每个 atom 同时出现在主题结构和完整源顺序时间线；不得借修复压缩或删除其他内容。
 这是唯一一次 repair，必须一次完成。"""
 
+OUTLINE_SYSTEM_PROMPT = """你是教学笔记结构规划器。
+只依据 payload 中提供的 evidence atoms、atom_ids、timestamps 和源片段工作，不得发明。
+输出 TeachingOutline JSON 对象，必须按以下固定顺序恰好生成八个 section_id：
+1. overview，2. core_points，3. methods_steps，4. examples_results，
+5. boundaries_risks，6. actions，7. timeline，8. evidence_limits。
+每个 section 必须有稳定 title、order、atom_ids、required_evidence_types、timestamps，
+并使用固定缺失文案“视频未提供这一类信息。”作为 missing_evidence_policy。
+每个 evidence atom 至少分配到一个 section；atom_ids 只能引用输入 atom，且按源顺序去重。
+必须保留例子与结果、条件与风险、数字与专名、推广内容和 ASR uncertainty 标记。
+明确区分作者原话与生成理解；生成理解不得冒充作者原话。不得发明或补写输入没有的信息。
+只能输出 JSON-only 的 JSON 对象，不得输出 Markdown、解释或代码围栏。"""
+
+SECTION_SYSTEM_PROMPT = """你是单个教学 section 的证据写作者。
+只处理 payload 指定的一个 section 及其 atom_ids、timestamps、源片段，不得引用 section 外信息，
+也不得发明任何输入没有的事实。输出严格的 SectionDraft JSON 对象，保留 source order、atom_ids
+和 timestamps；claims、steps、examples、results、conditions、risks、actions 都必须逐项可追溯。
+每个例子必须和对应结果放在一起；每个条件和风险必须紧邻其关联 claim 或 step。
+保留数字、专名、推广、警告及 ASR uncertainty，并明确区分作者原话与生成理解。
+没有某类证据时，使用固定文案“视频未提供这一类信息。”，不得用常识补齐。
+included_atom_ids 只能来自 payload，unprovided_items 必须明确缺失类别。
+只能输出 JSON-only 的 JSON 对象，不得输出 Markdown、解释或代码围栏。"""
+
+DEPTH_REVIEW_SYSTEM_PROMPT = """你是独立的教学笔记深度审查器。
+必须同时直接检查 payload.raw_segments 与 payload.section_drafts，并独立核对 atom_ids、timestamps
+和 source order，不能只相信生成结果。不得发明任何内容；作者原话必须和生成理解明确区分。
+报告所有损失类别：抽象化步骤、例子缺结果、条件脱离范围、步骤重排、数字或专名丢失、
+警告或推广丢失、ASR uncertainty 丢失、无来源主张，以及未知 atom/section。
+保留例子、结果、条件、风险、数字、专名、推广及 timestamps 的证据关联；缺失类别使用
+固定文案“视频未提供这一类信息。”。返回严格 DepthReview JSON 对象，包含 repair_section_ids。
+这是只读审查阶段：只报告问题，绝不修复、改写或生成 section 内容（不修复）。
+只能输出 JSON-only 的 JSON 对象，不得输出 Markdown、解释或代码围栏。"""
+
+TEACHING_REPAIR_SYSTEM_PROMPT = """你是一次性 bounded teaching repair 修复器。
+只依据 payload 中的 flagged sections、flagged atoms、原始 evidence、atom_ids 和 timestamps 工作，
+不得发明或补写来源没有的信息。只修复 coverage/review/depth_review 标记的 section 或 atom，
+保持其他 section 和 atom 完全不变；一次调用完成，禁止第二轮 repair。
+恢复丢失的步骤、例子及结果、条件与风险、数字、专名、警告、推广和 ASR uncertainty，
+并保持 source order 与证据关联。明确区分作者原话和生成理解；无证据类别使用固定文案
+“视频未提供这一类信息。”。返回与 payload 要求相符的 bounded repair JSON patch。
+只能输出 JSON-only 的 JSON 对象，不得输出 Markdown、解释或代码围栏。"""
+
 PROMPT_VERSIONS = {
     "extract": EXTRACT_PROMPT_VERSION,
+    "outline": OUTLINE_PROMPT_VERSION,
     "synthesize": SYNTHESIZE_PROMPT_VERSION,
+    "section": SECTION_PROMPT_VERSION,
     "review": REVIEW_PROMPT_VERSION,
+    "depth_review": DEPTH_REVIEW_PROMPT_VERSION,
     "repair": REPAIR_PROMPT_VERSION,
 }
 SYSTEM_PROMPTS = {
     "extract": EXTRACT_SYSTEM_PROMPT,
+    "outline": OUTLINE_SYSTEM_PROMPT,
     "synthesize": SYNTHESIZE_SYSTEM_PROMPT,
+    "section": SECTION_SYSTEM_PROMPT,
     "review": REVIEW_SYSTEM_PROMPT,
-    "repair": REPAIR_SYSTEM_PROMPT,
+    "depth_review": DEPTH_REVIEW_SYSTEM_PROMPT,
+    "repair": TEACHING_REPAIR_SYSTEM_PROMPT,
 }
+
+# Kept separate so historical audit records using the former repair prompt remain readable.
+LEGACY_PROMPT_VERSIONS = {"repair": LEGACY_REPAIR_PROMPT_VERSION}
+LEGACY_SYSTEM_PROMPTS = {"repair": REPAIR_SYSTEM_PROMPT}
 
 __all__ = [
     "EXTRACT_PROMPT_VERSION",
     "EXTRACT_SYSTEM_PROMPT",
+    "DEPTH_REVIEW_PROMPT_VERSION",
+    "DEPTH_REVIEW_SYSTEM_PROMPT",
+    "LEGACY_PROMPT_VERSIONS",
+    "LEGACY_REPAIR_PROMPT_VERSION",
+    "LEGACY_SYSTEM_PROMPTS",
+    "OUTLINE_PROMPT_VERSION",
+    "OUTLINE_SYSTEM_PROMPT",
     "PROMPT_VERSIONS",
     "REPAIR_PROMPT_VERSION",
     "REPAIR_SYSTEM_PROMPT",
     "REVIEW_PROMPT_VERSION",
     "REVIEW_SYSTEM_PROMPT",
+    "SECTION_PROMPT_VERSION",
+    "SECTION_SYSTEM_PROMPT",
     "SYNTHESIZE_PROMPT_VERSION",
     "SYNTHESIZE_SYSTEM_PROMPT",
     "SYSTEM_PROMPTS",
+    "TEACHING_REPAIR_SYSTEM_PROMPT",
 ]
