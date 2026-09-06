@@ -103,6 +103,16 @@ def test_missing_result_and_condition_scope_are_findings() -> None:
     assert review.condition_without_scope_atom_ids == ["condition"]
 
 
+def test_risk_without_same_chapter_scope_is_a_finding() -> None:
+    atoms, outline, sections = _fixture()
+    atoms[5].relations = []
+    sections[0].risks = [_claim("warning", "Unscoped risk")]
+
+    review = DepthValidator().validate(atoms, outline, sections)
+
+    assert "warning" in review.condition_without_scope_atom_ids
+
+
 def test_unknown_references_and_unsupported_claims_are_reported() -> None:
     atoms, outline, sections = _fixture()
     outline.included_atom_ids.append("unknown")

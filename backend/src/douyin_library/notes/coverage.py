@@ -193,6 +193,14 @@ class CoverageValidator:
                 depth_review.non_repairable_findings,
             )
         )
+        depth_non_repairable = bool(
+            depth_review
+            and (
+                depth_review.unknown_atom_ids
+                or depth_review.unknown_section_ids
+                or depth_review.non_repairable_findings
+            )
+        )
         semantic_complete = bool(depth_passed and passed and input_sufficient)
         report_values = dict(
             segment_total=segment_count,
@@ -218,7 +226,9 @@ class CoverageValidator:
             quality_gate=(
                 "passed" if passed and (depth_review is None or semantic_complete) else "failed"
             ),
-            repairable=not passed and not foundational_error and repair_issue,
+            repairable=(
+                not depth_non_repairable and not passed and not foundational_error and repair_issue
+            ),
             depth_passed=depth_passed,
             input_sufficient=input_sufficient,
             depth_review=(depth_review.model_dump(mode="json") if depth_review else None),

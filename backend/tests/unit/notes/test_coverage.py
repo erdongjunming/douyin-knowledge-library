@@ -192,6 +192,33 @@ def test_depth_failure_is_not_semantically_complete() -> None:
     assert getattr(checked, "semantic_complete", False) is False
 
 
+def test_depth_nonrepairable_finding_forces_nonrepairable_report() -> None:
+    extraction = _complete_extraction()
+    checked = CoverageValidator().validate(
+        segment_count=4,
+        extraction=extraction,
+        synthesis=_synthesis((atom.id for atom in extraction.atoms), extraction=extraction),
+        review=_review(range(4)),
+        semantic_generator="ollama/qwen3:8b",
+        depth_review=DepthReview(
+            abstracted_atom_ids=[],
+            example_without_result_atom_ids=[],
+            condition_without_scope_atom_ids=[],
+            reordered_step_atom_ids=[],
+            lost_literal_atom_ids=[],
+            lost_warning_or_promotion_atom_ids=[],
+            lost_uncertainty_markers=[],
+            unsupported_claims=[],
+            repair_section_ids=[],
+            input_sufficient=True,
+            unknown_atom_ids=["unknown"],
+        ),
+    )
+
+    assert checked.quality_gate == "failed"
+    assert checked.repairable is False
+
+
 def test_missing_segment_disposition_is_a_nonrepairable_failure() -> None:
     extraction = ExtractionResult(
         atoms=[_atom("A-1", 0)],

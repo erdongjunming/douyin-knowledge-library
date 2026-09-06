@@ -134,6 +134,17 @@ class DepthValidator:
                         if marker not in text:
                             lost_uncertainty.append(marker)
                             repair(section_id)
+            for risk in section.risks:
+                related = set(risk.atom_ids)
+                related.update(
+                    relation
+                    for atom_id in risk.atom_ids
+                    if (atom := next((item for item in atoms if item.id == atom_id), None))
+                    for relation in atom.relations
+                )
+                if not related & claim_ids:
+                    conditions_missing.extend(risk.atom_ids)
+                    repair(section_id)
             expected = sorted(steps, key=lambda atom: atom.sequence or 0)
             structured_order = [atom_id for claim in section.steps for atom_id in claim.atom_ids]
             if structured_order and [atom.id for atom in expected] != structured_order:
