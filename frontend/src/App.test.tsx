@@ -558,6 +558,87 @@ it("upgrades legacy notes when a semantic provider is ready", async () => {
   await waitFor(() => expect(fetchMock).toHaveBeenCalledWith("/api/notes/generate", expect.objectContaining({ method: "POST", body: JSON.stringify({ legacy_only: true, limit: 3, provider_policy: "local" }) })))
 })
 
+it("uses the legacy upgrade eligible count when quality counts are absent", async () => {
+  vi.spyOn(globalThis, "fetch").mockImplementation(async (input) => {
+    const path = String(input)
+    if (path === "/api/jobs/progress") {
+      return new Response(JSON.stringify({
+        works: { collected: 1, audio_ready: 1 },
+        audio_extraction: { total: 1, completed: 1, running: 0, pending: 0, failed: 0, not_queued: 0, percent: 100 },
+        transcription: { total: 1, completed: 1, running: 0, pending: 0, failed: 0, not_queued: 0, percent: 100 },
+      }), { status: 200 })
+    }
+    if (path === "/api/notes/progress") {
+      return new Response(JSON.stringify({
+        total: 1,
+        completed: 1,
+        running: 0,
+        pending: 0,
+        failed: 0,
+        skipped: 1,
+        not_queued: 0,
+        percent: 100,
+        recent_aweme_id: null,
+        failures: [],
+        upgrade: { eligible: 2 },
+      }), { status: 200 })
+    }
+    if (path === "/api/notes/provider-status") {
+      return new Response(JSON.stringify({ ollama: { ready: true, model: "qwen3:8b" } }), { status: 200 })
+    }
+    return new Response(JSON.stringify({ status: "ok" }), { status: 200 })
+  })
+
+  render(<App />)
+
+  expect(await screen.findByRole("button", { name: "升级旧笔记" })).toBeVisible()
+})
+
+it("shows queued and already-active upgrade counts and updates local progress", async () => {
+  const fetchMock = vi.spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
+    const path = String(input)
+    if (path === "/api/jobs/progress") {
+      return new Response(JSON.stringify({
+        works: { collected: 1, audio_ready: 1 },
+        audio_extraction: { total: 1, completed: 1, running: 0, pending: 0, failed: 0, not_queued: 0, percent: 100 },
+        transcription: { total: 1, completed: 1, running: 0, pending: 0, failed: 0, not_queued: 0, percent: 100 },
+      }), { status: 200 })
+    }
+    if (path === "/api/notes/progress") {
+      return new Response(JSON.stringify({
+        total: 1,
+        completed: 1,
+        running: 0,
+        pending: 0,
+        failed: 0,
+        skipped: 1,
+        not_queued: 0,
+        percent: 100,
+        recent_aweme_id: null,
+        failures: [],
+        upgrade: { total: 3, completed: 0, remaining: 3, active: 0, eligible: 3, percent: 0 },
+      }), { status: 200 })
+    }
+    if (path === "/api/notes/provider-status") {
+      return new Response(JSON.stringify({ ollama: { ready: true, model: "qwen3:8b" } }), { status: 200 })
+    }
+    if (path === "/api/notes/generate" && init?.method === "POST") {
+      return new Response(JSON.stringify({ queued: 2, already_queued: 1, skipped: 0 }), { status: 202 })
+    }
+    return new Response(JSON.stringify({ status: "ok" }), { status: 200 })
+  })
+
+  render(<App />)
+  fireEvent.click(await screen.findByRole("button", { name: "升级旧笔记" }))
+
+  await waitFor(() => expect(screen.getByText(/新加入 2 条，已有 1 条在队列中/)).toBeVisible())
+  expect(screen.getByText("处理中 2")).toBeVisible()
+  expect(fetchMock).toHaveBeenCalledWith(
+    "/api/notes/generate",
+    expect.objectContaining({ method: "POST", body: JSON.stringify({ legacy_only: true, limit: 3, provider_policy: "local" }) }),
+  )
+})
+
 it("includes fallback and unknown notes but disables upgrades without local Ollama", async () => {
   const fetchMock = vi.spyOn(globalThis, "fetch").mockImplementation(async (input) => {
     const path = String(input)

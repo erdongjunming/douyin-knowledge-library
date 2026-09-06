@@ -175,6 +175,8 @@ type NoteProgress = {
     not_queued?: number
     eligible?: number
     queued?: number
+    depth_failed?: number
+    input_insufficient?: number
     percent?: number
     failures?: Array<{ aweme_id: string; reason: string }>
   }
@@ -185,6 +187,8 @@ type NoteQueueResult = {
   queued: number
   already_queued: number
   skipped: number
+  eligible?: number
+  selected?: number
 }
 
 type ProviderStatus = {
@@ -282,7 +286,7 @@ function GlobalProgress({
   const transcriptionPercent = Math.max(0, Math.min(100, transcription.percent))
   const upgrade = notes?.upgrade
   const upgradeCandidates = (notes?.quality_counts?.legacy ?? 0) + (notes?.quality_counts?.fallback ?? 0) + (notes?.quality_counts?.unknown ?? 0)
-  const upgradeRemaining = notes?.upgrade?.remaining ?? upgradeCandidates
+  const upgradeRemaining = notes?.upgrade?.remaining ?? notes?.upgrade?.eligible ?? upgradeCandidates
   const upgradeTotal = notes?.upgrade?.total ?? notes?.upgrade?.eligible ?? upgradeCandidates
   const upgradeCompleted = notes?.upgrade?.completed ?? Math.max(0, upgradeTotal - upgradeRemaining)
   const upgradePercent = notes?.upgrade?.percent ?? (upgradeTotal ? upgradeCompleted / upgradeTotal * 100 : 0)
@@ -318,7 +322,7 @@ function GlobalProgress({
         {upgradeTotal > 0 && <div className="upgrade-progress-lane" aria-label="旧笔记语义升级">
           <div className="progress-summary"><div className="progress-title"><RefreshCw size={18} aria-hidden="true" /><div><strong>旧笔记语义升级</strong><span>{upgrade?.failures?.[0] ? `失败 ${upgrade.failures[0].aweme_id}：${upgrade.failures[0].reason}` : "仅接受本地 Ollama 的完整语义笔记"}</span></div></div><strong className="progress-count">{upgradeCompleted} / {upgradeTotal}</strong></div>
           <div className="global-progress-track" role="progressbar" aria-label="旧笔记语义升级进度" aria-valuemin={0} aria-valuemax={100} aria-valuenow={Math.max(0, Math.min(100, upgradePercent))} aria-valuetext={`${upgradeCompleted} / ${upgradeTotal}，${upgradePercent}%`}><span style={{ width: `${Math.max(0, Math.min(100, upgradePercent))}%` }} /></div>
-          <div className="progress-meta"><strong>{upgradePercent}%</strong><span className="progress-running">处理中 {upgrade?.active ?? ((upgrade?.pending ?? 0) + (upgrade?.running ?? 0))}</span><span>剩余 {upgradeRemaining}</span><span className={upgrade?.failed ? "progress-failed" : undefined}>失败 {upgrade?.failed ?? 0}</span></div>
+          <div className="progress-meta"><strong>{upgradePercent}%</strong><span className="progress-running">处理中 {upgrade?.active ?? ((upgrade?.pending ?? 0) + (upgrade?.running ?? 0))}</span><span>剩余 {upgradeRemaining}</span><span className={upgrade?.failed ? "progress-failed" : undefined}>失败 {upgrade?.failed ?? 0}</span>{(upgrade?.depth_failed || upgrade?.input_insufficient) ? <span>深度失败 {upgrade.depth_failed ?? 0} · 输入不足 {upgrade.input_insufficient ?? 0}</span> : null}</div>
         </div>}
       </div>}
     </section>
@@ -779,7 +783,11 @@ export function App() {
       })
       setNoteMessage({
         tone: "success",
-        text: result.queued > 0 ? `已加入 ${result.queued} 条笔记任务。` : result.already_queued > 0 ? "缺失笔记已在队列中。" : "当前没有缺失笔记。",
+        text: result.queued > 0
+          ? `已加入 ${result.queued} 条笔记任务${result.already_queued > 0 ? `，已有 ${result.already_queued} 条在队列中` : ""}。`
+          : result.already_queued > 0
+            ? `缺失笔记已有 ${result.already_queued} 条在队列中。`
+            : "当前没有缺失笔记。",
       })
       setNoteProgress((current) => current ? {
         ...current,
@@ -798,7 +806,37 @@ export function App() {
     setNoteMessage(null)
     try {
       const result = await apiJson<NoteQueueResult>("/api/notes/generate", { method: "POST", body: JSON.stringify({ legacy_only: true, limit: 3, provider_policy: "local" }) })
-      setNoteMessage({ tone: "success", text: result.queued > 0 ? `已加入 ${result.queued} 条旧笔记升级任务。` : "当前没有可升级的旧笔记。" })
+      setNoteMessage({
+        tone: "success",
+        text: result.queued > 0
+          ? `新加入 ${result.queued} 条${result.already_queued > 0 ? `，已有 ${result.already_queued} 条在队列中` : ""}。`
+          : result.already_queued > 0
+            ? `已有 ${result.already_queued} 条在队列中。`
+            : "当前没有可升级的旧笔记。",
+      })
+      setNoteProgress((current) => {
+        if (!current) return current
+        const currentUpgrade = current.upgrade
+        if (!currentUpgrade) return current
+        const currentTotal = currentUpgrade.total ?? currentUpgrade.eligible ?? result.eligible ?? 0
+        const currentCompleted = currentUpgrade.completed ?? 0
+        const currentActive = currentUpgrade.active ?? ((currentUpgrade.pending ?? 0) + (currentUpgrade.running ?? 0))
+        const currentRemaining = currentUpgrade.remaining ?? Math.max(0, currentTotal - currentCompleted)
+        const nextActive = currentActive + result.queued
+        return {
+          ...current,
+          upgrade: {
+            ...currentUpgrade,
+            total: currentTotal,
+            eligible: currentUpgrade.eligible ?? result.eligible,
+            queued: (currentUpgrade.queued ?? 0) + result.queued,
+            pending: (currentUpgrade.pending ?? 0) + result.queued,
+            active: nextActive,
+            remaining: currentRemaining,
+            percent: currentUpgrade.percent ?? (currentTotal ? currentCompleted / currentTotal * 100 : 0),
+          },
+        }
+      })
     } catch (reason) {
       setNoteMessage({ tone: "error", text: reason instanceof Error ? reason.message : "无法升级旧笔记" })
     } finally {

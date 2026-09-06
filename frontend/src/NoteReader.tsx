@@ -1,4 +1,4 @@
-import { FileText, List, X } from "lucide-react"
+import { BookOpenText, FileText, List, ShieldAlert, Sparkles, X } from "lucide-react"
 import { useMemo } from "react"
 import ReactMarkdown from "react-markdown"
 import type React from "react"
@@ -20,6 +20,9 @@ export type NoteReaderProps = {
 
 const sectionLabels = [
   { heading: "主题复盘", label: "主题复盘", icon: FileText },
+  { heading: "方法与步骤", label: "方法与步骤", icon: Sparkles },
+  { heading: "案例与反例", label: "案例与反例", icon: BookOpenText },
+  { heading: "前提、边界与风险", label: "前提、边界与风险", icon: ShieldAlert },
   { heading: "完整逐段时间线", label: "逐段时间线", icon: List },
 ]
 
