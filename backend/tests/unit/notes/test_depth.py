@@ -113,6 +113,27 @@ def test_risk_without_same_chapter_scope_is_a_finding() -> None:
     assert "warning" in review.condition_without_scope_atom_ids
 
 
+def test_structured_example_requires_result_even_for_claim_atom() -> None:
+    atoms, outline, sections = _fixture()
+    atoms[3].kind = "claim"
+    sections[0].results = []
+
+    review = DepthValidator().validate(atoms, outline, sections)
+
+    assert "example" in review.example_without_result_atom_ids
+
+
+def test_outline_section_atom_outside_included_is_nonrepairable() -> None:
+    atoms, outline, sections = _fixture()
+    outline.included_atom_ids.remove("claim")
+
+    review = DepthValidator().validate(atoms, outline, sections)
+
+    assert review.unknown_atom_ids == ["claim"]
+    assert review.repair_section_ids == []
+    assert review.non_repairable_findings
+
+
 def test_unknown_references_and_unsupported_claims_are_reported() -> None:
     atoms, outline, sections = _fixture()
     outline.included_atom_ids.append("unknown")

@@ -63,6 +63,12 @@ class DepthValidator:
                         if atom_id not in atom_by_id or atom_id not in allowed:
                             unknown_atoms.append(atom_id)
 
+        included_ids = set(outline.included_atom_ids)
+        for outline_section in outline.sections:
+            for atom_id in outline_section.atom_ids:
+                if atom_id not in included_ids:
+                    unknown_atoms.append(atom_id)
+
         unknown_atoms = self._unique(unknown_atoms)
         non_repairable.extend(f"unknown atom reference: {atom_id}" for atom_id in unknown_atoms)
 
@@ -109,6 +115,28 @@ class DepthValidator:
             if sequences and sequences != list(range(1, max(sequences) + 1)):
                 reordered_steps.extend(atom.id for atom in steps)
                 repair(section_id)
+            for example in section.examples:
+                related = set(example.atom_ids)
+                related.update(
+                    relation
+                    for atom_id in example.atom_ids
+                    if (atom := next((item for item in atoms if item.id == atom_id), None))
+                    for relation in atom.relations
+                )
+                if not related & result_ids:
+                    examples_missing.extend(example.atom_ids)
+                    repair(section_id)
+            for scoped in (*section.conditions, *section.risks):
+                related = set(scoped.atom_ids)
+                related.update(
+                    relation
+                    for atom_id in scoped.atom_ids
+                    if (atom := next((item for item in atoms if item.id == atom_id), None))
+                    for relation in atom.relations
+                )
+                if not related & claim_ids:
+                    conditions_missing.extend(scoped.atom_ids)
+                    repair(section_id)
             for atom in atoms:
                 if atom.id not in atom_ids:
                     continue
