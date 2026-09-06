@@ -396,6 +396,8 @@ def _candidate_outputs(
             "provider": metadata.get("provider", "unknown"),
             "model": metadata.get("model", "unknown"),
             "quality_gate": metadata.get("quality_gate", "failed"),
+            "semantic_complete": bool(metadata.get("semantic_complete", False)),
+            "input_sufficient": bool(metadata.get("input_sufficient", False)),
             "generator_version": generator_version,
             "generated_files": list(_ALL_GENERATED_FILES),
         }

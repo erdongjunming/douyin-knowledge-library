@@ -27,6 +27,7 @@ class NoteBundleState:
     provider: str | None = None
     model: str | None = None
     quality_gate: str | None = None
+    semantic_complete: bool | None = None
     generator_version: str | None = None
     legacy_eligible: bool = False
     coverage: dict[str, Any] | None = None
@@ -55,6 +56,7 @@ def classify_note_bundle(note_dir: Path) -> NoteBundleState:
     provider = _string_value(metadata, "provider", "provider_name")
     model = _string_value(metadata, "model", "model_name")
     quality_gate = _string_value(metadata, "quality_gate")
+    semantic_complete = _boolean_value(metadata, "semantic_complete")
     generator_version = _string_value(metadata, "generator_version", "version")
     identities = _string_values(
         metadata,
@@ -68,6 +70,7 @@ def classify_note_bundle(note_dir: Path) -> NoteBundleState:
         "provider": provider,
         "model": model,
         "quality_gate": quality_gate,
+        "semantic_complete": semantic_complete,
         "generator_version": generator_version,
         "coverage": coverage,
     }
@@ -86,7 +89,13 @@ def classify_note_bundle(note_dir: Path) -> NoteBundleState:
         _is_semantic_identity(value) for value in (provider, model, *identities)
     )
     rule_identity = any(_is_rule_identity(value) for value in (provider, model, *identities))
-    if normalized_gate == "passed" and semantic_identity and not rule_identity:
+    if (
+        normalized_gate == "passed"
+        and semantic_identity
+        and not rule_identity
+        and semantic_complete is True
+        and _coverage_is_semantic_complete(coverage)
+    ):
         return NoteBundleState(quality_status="semantic_complete", **common)
     return NoteBundleState(quality_status="unknown", **common)
 
@@ -129,8 +138,35 @@ def _string_values(metadata: dict[str, Any], *keys: str) -> list[str]:
     return values
 
 
+def _boolean_value(metadata: dict[str, Any], key: str) -> bool | None:
+    for container in _containers(metadata):
+        value = container.get(key)
+        if isinstance(value, bool):
+            return value
+    return None
+
+
+def _coverage_is_semantic_complete(coverage: dict[str, Any] | None) -> bool:
+    """Require the additive quality gates before claiming completeness.
+
+    A manifest is user-visible metadata and can outlive a failed or partial
+    publication attempt.  The coverage report is the authoritative record of
+    the source/depth/input checks, so missing fields intentionally fail closed
+    and remain eligible for a future upgrade.
+    """
+
+    if not isinstance(coverage, dict):
+        return False
+    return (
+        _normalized(coverage.get("quality_gate")) == "passed"
+        and coverage.get("depth_passed") is True
+        and coverage.get("input_sufficient") is True
+        and coverage.get("semantic_complete") is True
+    )
+
+
 def _normalized(value: str | None) -> str:
-    return value.strip().lower() if value else ""
+    return value.strip().lower() if isinstance(value, str) else ""
 
 
 def _is_semantic_identity(value: str | None) -> bool:

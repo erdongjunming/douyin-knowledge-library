@@ -39,7 +39,12 @@ def _seed_upgrade_candidates(root: Path) -> None:
             metadata = {"provider": "rule", "model": "local-rule-v1", "quality_gate": "fallback"}
             name = "generation_manifest.json"
         elif aweme_id == "733":
-            metadata = {"provider": "ollama", "model": "qwen3:8b", "quality_gate": "passed"}
+            metadata = {
+                "provider": "ollama",
+                "model": "qwen3:8b",
+                "quality_gate": "passed",
+                "semantic_complete": True,
+            }
             name = "generation_manifest.json"
         elif aweme_id == "734":
             metadata = {"provider": "legacy", "model": "local-rule-v1"}
@@ -52,6 +57,18 @@ def _seed_upgrade_candidates(root: Path) -> None:
             name = ""
         if metadata is not None:
             (note_dir / name).write_text(json.dumps(metadata), encoding="utf-8")
+        if aweme_id == "733":
+            (note_dir / "coverage_report.json").write_text(
+                json.dumps(
+                    {
+                        "quality_gate": "passed",
+                        "depth_passed": True,
+                        "input_sufficient": True,
+                        "semantic_complete": True,
+                    }
+                ),
+                encoding="utf-8",
+            )
 
 
 def _client_with_queue(db_path: Path):
@@ -146,15 +163,62 @@ async def test_upgrade_progress_uses_current_semantic_state_and_latest_upgrade_j
         encoding="utf-8",
     )
     (layout.note_dir("failed") / "generation_audit.json").write_text(
-        json.dumps({"provider": "legacy", "model": "local-rule-v1"}),
+        json.dumps(
+            {
+                "provider": "ollama",
+                "model": "qwen3:8b",
+                "quality_gate": "failed",
+                "semantic_complete": False,
+            }
+        ),
+        encoding="utf-8",
+    )
+    (layout.note_dir("failed") / "coverage_report.json").write_text(
+        json.dumps(
+            {
+                "quality_gate": "failed",
+                "depth_passed": False,
+                "input_sufficient": True,
+                "semantic_complete": False,
+            }
+        ),
         encoding="utf-8",
     )
     (layout.note_dir("false-success") / "generation_audit.json").write_text(
         json.dumps({"provider": "legacy", "model": "local-rule-v1"}),
         encoding="utf-8",
     )
+    (layout.note_dir("unknown") / "coverage_report.json").write_text(
+        json.dumps(
+            {
+                "quality_gate": "failed",
+                "depth_passed": True,
+                "input_sufficient": False,
+                "semantic_complete": False,
+            }
+        ),
+        encoding="utf-8",
+    )
     (layout.note_dir("semantic") / "generation_manifest.json").write_text(
-        json.dumps({"provider": "ollama", "model": "qwen3:8b", "quality_gate": "passed"}),
+        json.dumps(
+            {
+                "provider": "ollama",
+                "model": "qwen3:8b",
+                "quality_gate": "passed",
+                "semantic_complete": True,
+            }
+        ),
+        encoding="utf-8",
+    )
+    (layout.note_dir("semantic") / "coverage_report.json").write_text(
+        json.dumps(
+            {
+                "quality_gate": "passed",
+                "depth_passed": True,
+                "input_sufficient": True,
+                "semantic_complete": True,
+            }
+        ),
         encoding="utf-8",
     )
     monkeypatch.setenv("DKL_STORAGE_ROOT", str(storage))
@@ -208,6 +272,8 @@ async def test_upgrade_progress_uses_current_semantic_state_and_latest_upgrade_j
             "not_queued": 1,
             "eligible": 5,
             "queued": 5,
+            "depth_failed": 1,
+            "input_insufficient": 1,
             "percent": 16.7,
             "failures": [
                 {"aweme_id": "false-success", "reason": "upgrade_completed_without_semantic_note"},

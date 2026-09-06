@@ -183,7 +183,11 @@ def note_progress(
             latest_normal.setdefault(aweme_id, job)
 
     counts = {"pending": 0, "running": 0, "failed": 0}
-    quality_by_aweme = _quality_snapshot(service)
+    quality_details = _quality_details_snapshot(service)
+    quality_by_aweme = {
+        aweme_id: detail["quality_status"]
+        for aweme_id, detail in quality_details.items()
+    }
     failures: list[dict[str, str]] = []
     for job in latest_normal.values():
         if job.status in counts:
@@ -252,6 +256,26 @@ def note_progress(
 
     upgrade_total = len(upgrade_cohort)
     upgrade_remaining = max(upgrade_total - upgrade_completed, 0)
+    depth_failed = sum(
+        1
+        for aweme_id in upgrade_cohort
+        if (
+            quality_details.get(aweme_id, {}).get("coverage", {}).get("quality_gate")
+            == "failed"
+            and quality_details.get(aweme_id, {}).get("coverage", {}).get("depth_passed")
+            is False
+        )
+    )
+    input_insufficient = sum(
+        1
+        for aweme_id in upgrade_cohort
+        if (
+            quality_details.get(aweme_id, {}).get("coverage", {}).get("quality_gate")
+            == "failed"
+            and quality_details.get(aweme_id, {}).get("coverage", {}).get("input_sufficient")
+            is False
+        )
+    )
     upgrade = {
         "total": upgrade_total,
         "completed": upgrade_completed,
@@ -263,6 +287,8 @@ def note_progress(
         "not_queued": upgrade_not_queued,
         "eligible": len(upgrade_candidates),
         "queued": len(latest_upgrade),
+        "depth_failed": depth_failed,
+        "input_insufficient": input_insufficient,
         "percent": round(
             (upgrade_completed / upgrade_total * 100) if upgrade_total else 0.0,
             1,
@@ -273,7 +299,7 @@ def note_progress(
         total - completed - counts["pending"] - counts["running"] - counts["failed"],
         0,
     )
-    quality_counts = _quality_counts(service)
+    quality_counts = _quality_counts(service, snapshot=quality_details)
     return {
         "total": total,
         "completed": completed,
@@ -327,11 +353,15 @@ def _job_is_upgrade(job: Job) -> bool:
 
 def _quality_counts(
     service: NoteGenerationService,
+    *,
+    snapshot: dict[str, dict[str, Any]] | None = None,
 ) -> dict[str, int]:
     # Inventory is filesystem-backed, while the work map is database-backed.
     # Count all transcript bundles so an orphaned transcript remains visible.
     counts = {"semantic_complete": 0, "fallback": 0, "legacy": 0, "unknown": 0, "missing": 0}
-    for quality in _quality_snapshot(service).values():
+    details = snapshot if snapshot is not None else _quality_details_snapshot(service)
+    for detail in details.values():
+        quality = detail["quality_status"]
         counts[quality] = counts.get(quality, 0) + 1
     return counts
 
@@ -340,13 +370,22 @@ _UPGRADE_QUALITY_STATUSES = {"legacy", "fallback", "unknown"}
 
 
 def _quality_snapshot(service: NoteGenerationService) -> dict[str, str]:
+    return {
+        aweme_id: detail["quality_status"]
+        for aweme_id, detail in _quality_details_snapshot(service).items()
+    }
+
+
+def _quality_details_snapshot(service: NoteGenerationService) -> dict[str, dict[str, Any]]:
     from douyin_library.notes.state import classify_note_bundle
 
     if not service.layout.transcript.is_dir():
         return {}
-    return {
-        transcript.parent.name: classify_note_bundle(
-            service.layout.note_dir(transcript.parent.name)
-        ).quality_status
-        for transcript in service.layout.transcript.glob("*/transcript.txt")
-    }
+    details: dict[str, dict[str, Any]] = {}
+    for transcript in service.layout.transcript.glob("*/transcript.txt"):
+        state = classify_note_bundle(service.layout.note_dir(transcript.parent.name))
+        details[transcript.parent.name] = {
+            "quality_status": state.quality_status,
+            "coverage": state.coverage or {},
+        }
+    return details

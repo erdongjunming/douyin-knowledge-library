@@ -417,11 +417,18 @@ class NoteGenerationService:
                         cancel_event,
                         collector,
                     )
+                    publishable_degraded = (
+                        not legacy_only
+                        and not learning_note.is_file()
+                        and _degraded_generation_is_publishable(generation, note_input)
+                    )
                     attempt.update(
                         {
                             "status": (
                                 "succeeded"
                                 if generation.coverage.quality_gate == "passed"
+                                else "degraded"
+                                if publishable_degraded
                                 else "failed"
                             ),
                             "quality_gate": generation.coverage.quality_gate,
@@ -429,7 +436,11 @@ class NoteGenerationService:
                             "repair_count": generation.repair_count,
                         }
                     )
-                    if generation.coverage.quality_gate == "passed":
+                    accepted_semantic = bool(
+                        generation.coverage.quality_gate == "passed"
+                        and (not legacy_only or generation.coverage.semantic_complete)
+                    )
+                    if accepted_semantic or publishable_degraded:
                         selected_generation = generation
                         selected_provider = provider.name
                         selected_model = provider.model
@@ -816,6 +827,12 @@ class NoteGenerationService:
                 else None
             ),
             "quality_gate": quality_gate,
+            "semantic_complete": bool(
+                generation.coverage.semantic_complete if generation else False
+            ),
+            "input_sufficient": bool(
+                generation.input_sufficient if generation else False
+            ),
             "error": error,
             "started_at": started_at,
             "finished_at": datetime.now(UTC).isoformat(),
@@ -869,6 +886,33 @@ def _sync_or_coroutine[T](coroutine: Awaitable[T]) -> T | Awaitable[T]:
     return coroutine
 
 
+def _degraded_generation_is_publishable(
+    generation: SemanticGeneration,
+    note_input: NoteInput,
+) -> bool:
+    """Allow readable new candidates while keeping incomplete upgrades closed.
+
+    A failed semantic gate may be published only when the provider returned a
+    deterministic, source-shaped bundle.  Transport/context failures and
+    truncated timelines remain provider failures and must never replace an
+    existing note.
+    """
+
+    if generation.coverage.quality_gate != "failed":
+        return False
+    if generation.context_status == "failed" or generation.context_failures:
+        return False
+    if not generation.extraction.dispositions:
+        return False
+    expected_segments = {segment.index for segment in note_input.segments}
+    actual_segments = {
+        entry.segment_index for entry in generation.synthesis.timeline
+    }
+    if actual_segments != expected_segments:
+        return False
+    return generation.coverage.segment_disposition_count == len(expected_segments)
+
+
 def _bundle_outputs(
     bundle: NoteBundle,
     generation_audit: Mapping[str, Any],
@@ -898,6 +942,12 @@ def _bundle_outputs(
                 "provider": provider,
                 "model": model,
                 "quality_gate": quality_gate,
+                "semantic_complete": bool(
+                    bundle.page_metadata.get("semantic_complete", False)
+                ),
+                "input_sufficient": bool(
+                    bundle.page_metadata.get("input_sufficient", False)
+                ),
                 "generator_version": (
                     "semantic-v2" if quality_gate == "passed" else GENERATOR_VERSION
                 ),

@@ -71,7 +71,8 @@ def test_upgrade_eligibility_includes_fallback_and_unknown_but_not_missing(
     assert unknown.upgrade_eligible is True
     assert fallback.upgrade_eligible is True
     assert legacy.upgrade_eligible is True
-    assert semantic.upgrade_eligible is False
+    assert semantic.upgrade_eligible is True
+    assert semantic.quality_status == "unknown"
     assert missing.upgrade_eligible is False
 
 
@@ -84,11 +85,18 @@ def test_passed_ollama_manifest_is_semantic_complete(tmp_path: Path) -> None:
                 "provider": "ollama",
                 "model": "qwen3:8b",
                 "quality_gate": "passed",
+                "semantic_complete": True,
                 "generator_version": "semantic-v2",
             }
         },
     )
-    coverage = {"schema": "douyin-note-coverage-v1", "quality_gate": "passed"}
+    coverage = {
+        "schema": "douyin-note-coverage-v1",
+        "quality_gate": "passed",
+        "depth_passed": True,
+        "input_sufficient": True,
+        "semantic_complete": True,
+    }
     _write_json(note_dir / "coverage_report.json", coverage)
 
     state = classify_note_bundle(note_dir)
@@ -100,6 +108,90 @@ def test_passed_ollama_manifest_is_semantic_complete(tmp_path: Path) -> None:
     assert state.generator_version == "semantic-v2"
     assert state.legacy_eligible is False
     assert state.coverage == coverage
+
+
+def test_failed_coverage_cannot_be_marked_semantic_complete_by_manifest(
+    tmp_path: Path,
+) -> None:
+    note_dir = _note_dir(tmp_path)
+    _write_json(
+        note_dir / "generation_manifest.json",
+        {
+            "provider": "ollama",
+            "model": "qwen3:8b",
+            "quality_gate": "passed",
+            "semantic_complete": True,
+        },
+    )
+    _write_json(
+        note_dir / "coverage_report.json",
+        {
+            "quality_gate": "failed",
+            "depth_passed": False,
+            "input_sufficient": False,
+            "semantic_complete": False,
+        },
+    )
+
+    state = classify_note_bundle(note_dir)
+
+    assert state.quality_status == "unknown"
+    assert state.upgrade_eligible is True
+
+
+def test_missing_semantic_coverage_fields_are_not_complete(
+    tmp_path: Path,
+) -> None:
+    note_dir = _note_dir(tmp_path)
+    _write_json(
+        note_dir / "generation_manifest.json",
+        {
+            "provider": "ollama",
+            "model": "qwen3:8b",
+            "quality_gate": "passed",
+            "semantic_complete": True,
+        },
+    )
+    _write_json(
+        note_dir / "coverage_report.json",
+        {"quality_gate": "passed", "semantic_complete": True},
+    )
+
+    state = classify_note_bundle(note_dir)
+
+    assert state.quality_status == "unknown"
+    assert state.upgrade_eligible is True
+
+
+@pytest.mark.parametrize("quality_gate", [123, True, [], {}])
+def test_malformed_coverage_quality_gate_fails_closed(
+    tmp_path: Path,
+    quality_gate: object,
+) -> None:
+    note_dir = _note_dir(tmp_path)
+    _write_json(
+        note_dir / "generation_manifest.json",
+        {
+            "provider": "ollama",
+            "model": "qwen3:8b",
+            "quality_gate": "passed",
+            "semantic_complete": True,
+        },
+    )
+    _write_json(
+        note_dir / "coverage_report.json",
+        {
+            "quality_gate": quality_gate,
+            "depth_passed": True,
+            "input_sufficient": True,
+            "semantic_complete": True,
+        },
+    )
+
+    state = classify_note_bundle(note_dir)
+
+    assert state.quality_status == "unknown"
+    assert state.upgrade_eligible is True
 
 
 @pytest.mark.parametrize(
@@ -163,10 +255,24 @@ def test_manifest_has_priority_over_audit_and_budget(tmp_path: Path) -> None:
     note_dir = _note_dir(tmp_path)
     _write_json(
         note_dir / "generation_manifest.json",
-        {"provider": "external", "model": "semantic-v1", "quality_gate": "passed"},
+        {
+            "provider": "external",
+            "model": "semantic-v1",
+            "quality_gate": "passed",
+            "semantic_complete": True,
+        },
     )
     _write_json(note_dir / "generation_audit.json", {"model": "local-rule-v1"})
     _write_json(note_dir / "note_budget.json", {"model": "local-rule-v1"})
+    _write_json(
+        note_dir / "coverage_report.json",
+        {
+            "quality_gate": "passed",
+            "depth_passed": True,
+            "input_sufficient": True,
+            "semantic_complete": True,
+        },
+    )
 
     state = classify_note_bundle(note_dir)
 
