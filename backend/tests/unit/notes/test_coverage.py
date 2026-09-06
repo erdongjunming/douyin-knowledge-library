@@ -6,6 +6,7 @@ import pytest
 
 from douyin_library.notes.contracts import (
     CoverageReview,
+    DepthReview,
     EvidenceAtom,
     ExtractionResult,
     SegmentDisposition,
@@ -164,6 +165,35 @@ def test_complete_evidence_passes_every_gate() -> None:
     assert report.promotional_content_preserved is True
     assert report.semantic_generator == "ollama/qwen3:8b"
     assert report.repairable is False
+
+
+def test_depth_failure_is_not_semantically_complete() -> None:
+    report = _validate(_complete_extraction())
+    depth_review = DepthReview(
+        abstracted_atom_ids=[],
+        example_without_result_atom_ids=["A-example"],
+        condition_without_scope_atom_ids=[],
+        reordered_step_atom_ids=[],
+        lost_literal_atom_ids=[],
+        lost_warning_or_promotion_atom_ids=[],
+        lost_uncertainty_markers=[],
+        unsupported_claims=[],
+        repair_section_ids=["examples_results"],
+        input_sufficient=True,
+    )
+    extraction = _complete_extraction()
+    checked = CoverageValidator().validate(
+        segment_count=4,
+        extraction=extraction,
+        synthesis=_synthesis((atom.id for atom in extraction.atoms), extraction=extraction),
+        review=_review(range(4)),
+        semantic_generator="ollama/qwen3:8b",
+        depth_review=depth_review,
+    )
+
+    assert report.quality_gate == "passed"
+    assert checked.quality_gate == "failed"
+    assert getattr(checked, "semantic_complete", False) is False
 
 
 def test_missing_segment_disposition_is_a_nonrepairable_failure() -> None:
@@ -552,6 +582,36 @@ def test_each_included_atom_with_a_thematic_reference_passes() -> None:
     report = _validate(extraction, synthesis=synthesis)
 
     assert report.quality_gate == "passed"
+
+
+def test_theme_requires_timestamps_for_each_referenced_known_start() -> None:
+    extraction = _complete_extraction()
+    extraction.atoms[0].start = 1.5
+    extraction.atoms[1].start = 3.0
+    synthesis = _synthesis(
+        (atom.id for atom in extraction.atoms),
+        extraction=extraction,
+    )
+    synthesis.themes[0].timestamps = [1.5]
+
+    report = _validate(extraction, synthesis=synthesis)
+
+    assert report.quality_gate == "failed"
+    assert report.repairable is True
+
+
+def test_theme_does_not_fabricate_a_timestamp_for_unknown_atom_start() -> None:
+    extraction = ExtractionResult(
+        atoms=[_atom("A-1", 0, start=None)],
+        dispositions=[_disposition(0, ["A-1"])],
+    )
+    synthesis = _synthesis(["A-1"], extraction=extraction)
+    synthesis.themes[0].timestamps = [0.0]
+
+    report = _validate(extraction, segment_count=1, synthesis=synthesis)
+
+    assert report.quality_gate == "failed"
+    assert report.repairable is True
 
 
 def test_evidence_specific_theme_groups_may_be_empty() -> None:

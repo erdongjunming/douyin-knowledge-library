@@ -7,6 +7,7 @@ from collections import Counter, defaultdict
 from douyin_library.notes.contracts import (
     CoverageReport,
     CoverageReview,
+    DepthReview,
     EvidenceAtom,
     ExtractionResult,
     SegmentDisposition,
@@ -14,8 +15,22 @@ from douyin_library.notes.contracts import (
 )
 
 _COMMON_SENTENCE_OPENERS = {
-    "A", "An", "And", "First", "I", "It", "Next", "The", "This", "That", "Today", "We",
-    "Complete", "Segment", "Source", "Statement",
+    "A",
+    "An",
+    "And",
+    "First",
+    "I",
+    "It",
+    "Next",
+    "The",
+    "This",
+    "That",
+    "Today",
+    "We",
+    "Complete",
+    "Segment",
+    "Source",
+    "Statement",
 }
 
 
@@ -39,6 +54,8 @@ class CoverageValidator:
         synthesis: SynthesisResult,
         review: CoverageReview,
         semantic_generator: str,
+        depth_review: DepthReview | None = None,
+        input_sufficient: bool = True,
     ) -> CoverageReport:
         if segment_count < 0:
             raise ValueError("segment_count must be non-negative")
@@ -48,9 +65,8 @@ class CoverageValidator:
             disposition.segment_index for disposition in extraction.dispositions
         )
         missing_segment_indexes = sorted(expected_segments - disposition_counts.keys())
-        disposition_coverage_valid = (
-            set(disposition_counts) == expected_segments
-            and all(count == 1 for count in disposition_counts.values())
+        disposition_coverage_valid = set(disposition_counts) == expected_segments and all(
+            count == 1 for count in disposition_counts.values()
         )
 
         atom_counts = Counter(atom.id for atom in extraction.atoms)
@@ -63,9 +79,7 @@ class CoverageValidator:
         )
 
         included_ids = set(synthesis.included_atom_ids)
-        missing_atom_ids = [
-            atom.id for atom in extraction.atoms if atom.id not in included_ids
-        ]
+        missing_atom_ids = [atom.id for atom in extraction.atoms if atom.id not in included_ids]
         unknown_synthesis_references = any(
             atom_id not in atom_by_id for atom_id in synthesis.included_atom_ids
         )
@@ -98,9 +112,8 @@ class CoverageValidator:
         )
 
         review_counts = Counter(review.reviewed_segment_indexes)
-        review_coverage_valid = (
-            set(review_counts) == expected_segments
-            and all(count == 1 for count in review_counts.values())
+        review_coverage_valid = set(review_counts) == expected_segments and all(
+            count == 1 for count in review_counts.values()
         )
         independently_reviewed = len(expected_segments & review_counts.keys())
 
@@ -115,24 +128,18 @@ class CoverageValidator:
             atom_by_id,
             kinds={"condition"},
         )
-        quotations_verified = self._quotations_are_preserved(
-            extraction.atoms, synthesis
-        )
+        quotations_verified = self._quotations_are_preserved(extraction.atoms, synthesis)
         numbers_verified = self._text_categories_are_preserved(
             extraction.atoms, synthesis, category="number"
         )
-        named_entities_verified = self._named_entities_are_preserved(
-            extraction.atoms, synthesis
-        )
+        named_entities_verified = self._named_entities_are_preserved(extraction.atoms, synthesis)
         uncertainty_markers_verified = self._uncertainty_markers_are_preserved(
             extraction.atoms, synthesis
         )
-        promotion_inclusion_valid, promotion_dispositions_valid = (
-            self._promotions_are_preserved(
-                extraction.atoms,
-                extraction.dispositions,
-                included_ids,
-            )
+        promotion_inclusion_valid, promotion_dispositions_valid = self._promotions_are_preserved(
+            extraction.atoms,
+            extraction.dispositions,
+            included_ids,
         )
 
         foundational_error = any(
@@ -170,7 +177,21 @@ class CoverageValidator:
         )
         passed = not foundational_error and not repair_issue
 
-        return CoverageReport(
+        depth_passed = depth_review is not None and not any(
+            (
+                depth_review.abstracted_atom_ids,
+                depth_review.example_without_result_atom_ids,
+                depth_review.condition_without_scope_atom_ids,
+                depth_review.reordered_step_atom_ids,
+                depth_review.lost_literal_atom_ids,
+                depth_review.lost_warning_or_promotion_atom_ids,
+                depth_review.lost_uncertainty_markers,
+                depth_review.unsupported_claims,
+                depth_review.repair_section_ids,
+            )
+        )
+        semantic_complete = bool(depth_passed and passed and input_sufficient)
+        report_values = dict(
             segment_total=segment_count,
             segment_disposition_count=len(extraction.dispositions),
             missing_segment_indexes=missing_segment_indexes,
@@ -191,8 +212,19 @@ class CoverageValidator:
                 promotion_inclusion_valid and promotion_dispositions_valid
             ),
             semantic_generator=semantic_generator,
-            quality_gate="passed" if passed else "failed",
+            quality_gate=(
+                "passed" if passed and (depth_review is None or semantic_complete) else "failed"
+            ),
             repairable=not passed and not foundational_error and repair_issue,
+            depth_passed=depth_passed,
+            input_sufficient=input_sufficient,
+            depth_review=depth_review,
+            semantic_complete=semantic_complete,
+        )
+        # Keep callers compatible with a pre-Task1A contract during rolling upgrades.
+        supported = getattr(CoverageReport, "model_fields", {})
+        return CoverageReport(
+            **{key: value for key, value in report_values.items() if key in supported}
         )
 
     @staticmethod
@@ -205,15 +237,9 @@ class CoverageValidator:
         for disposition in dispositions:
             if disposition.segment_index not in expected_segments:
                 return False
-            if (
-                disposition.disposition in {"included", "promotion"}
-                and not disposition.atom_ids
-            ):
+            if disposition.disposition in {"included", "promotion"} and not disposition.atom_ids:
                 return False
-            if (
-                disposition.atom_ids
-                and disposition.disposition not in {"included", "promotion"}
-            ):
+            if disposition.atom_ids and disposition.disposition not in {"included", "promotion"}:
                 return False
             for atom_id in disposition.atom_ids:
                 atom = atom_by_id.get(atom_id)
@@ -249,8 +275,7 @@ class CoverageValidator:
     ) -> bool:
         relevant_atoms = [atom for atom in atoms if atom.kind in kinds]
         return all(
-            atom.relations
-            and all(relation_id in atom_by_id for relation_id in atom.relations)
+            atom.relations and all(relation_id in atom_by_id for relation_id in atom.relations)
             for atom in relevant_atoms
         )
 
@@ -279,9 +304,7 @@ class CoverageValidator:
         return inclusion_valid, disposition_valid
 
     @staticmethod
-    def _quotations_are_preserved(
-        atoms: list[EvidenceAtom], synthesis: SynthesisResult
-    ) -> bool:
+    def _quotations_are_preserved(atoms: list[EvidenceAtom], synthesis: SynthesisResult) -> bool:
         quote_atoms = [atom for atom in atoms if atom.kind == "quote"]
         if not quote_atoms:
             return True
@@ -289,8 +312,7 @@ class CoverageValidator:
         # by source text tolerates harmless punctuation around the quote.
         rendered = " ".join(synthesis.quotes)
         return all(
-            atom.source_excerpt in rendered or atom.statement in rendered
-            for atom in quote_atoms
+            atom.source_excerpt in rendered or atom.statement in rendered for atom in quote_atoms
         )
 
     @staticmethod
@@ -305,9 +327,7 @@ class CoverageValidator:
         if not relevant:
             return True
         text = cls._synthesis_text(synthesis)
-        return all(
-            atom.source_excerpt in text or atom.statement in text for atom in relevant
-        )
+        return all(atom.source_excerpt in text or atom.statement in text for atom in relevant)
 
     @classmethod
     def _named_entities_are_preserved(
@@ -369,8 +389,7 @@ class CoverageValidator:
                 expected = Counter(
                     atom.start
                     for atom_id in section.atom_ids
-                    if (atom := atom_by_id.get(atom_id)) is not None
-                    and atom.start is not None
+                    if (atom := atom_by_id.get(atom_id)) is not None and atom.start is not None
                 )
                 if Counter(section.timestamps) != expected:
                     return False
@@ -421,9 +440,7 @@ class CoverageValidator:
             if timeline_atom_counts == disposition_atom_counts:
                 continue
             included_disposition_counts = Counter(
-                atom_id
-                for atom_id in disposition.atom_ids
-                if atom_id in included_ids
+                atom_id for atom_id in disposition.atom_ids if atom_id in included_ids
             )
             if (
                 timeline_atom_counts == included_disposition_counts
@@ -433,9 +450,7 @@ class CoverageValidator:
                 continue
             mapping_foundational_valid = False
 
-        foundational_valid = (
-            structure_foundational_valid and mapping_foundational_valid
-        )
+        foundational_valid = structure_foundational_valid and mapping_foundational_valid
         complete = structure_complete and mapping_complete and mapping_foundational_valid
         return foundational_valid, complete
 
