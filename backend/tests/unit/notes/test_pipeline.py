@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Mapping
+from dataclasses import replace
 from typing import Any
 
 import pytest
@@ -9,20 +10,30 @@ import pytest
 from douyin_library.jobs.control import JobCancelledError
 from douyin_library.notes.contracts import (
     CoverageReview,
+    DepthReview,
+    EvidenceAtom,
     ExtractionResult,
     ProviderUsage,
     RepairResult,
+    SectionDraft,
     SynthesisResult,
+    TeachingOutline,
+    TeachingOutlineSection,
 )
 from douyin_library.notes.input import InputSegment, NoteInput
 from douyin_library.notes.pipeline import (
     ProviderContextBudgetError,
     SegmentBatch,
     SemanticNotePipeline,
+    _depth_repair_slice,
+    _depth_review_payload,
+    _input_is_sufficient,
     _merge_extractions,
     _merge_reviews,
+    _normalize_section,
     _provider_request_budget,
     _synthesis_payload,
+    _validate_depth_review_refs,
     build_segment_batches,
 )
 from douyin_library.notes.providers.base import ProviderResponse
@@ -489,6 +500,31 @@ async def test_teaching_provider_synthesizes_each_fixed_section_independently() 
             stage = kwargs["stage"]
             payload = kwargs["payload"]
             if stage not in {"outline", "section"}:
+                if stage == "depth_review":
+                    self.stages.append(stage)
+                    self.payloads.append((stage, payload))
+                    return ProviderResponse(
+                        raw_output="depth",
+                        parsed_json={
+                            "abstracted_atom_ids": [],
+                            "example_without_result_atom_ids": [],
+                            "condition_without_scope_atom_ids": [],
+                            "reordered_step_atom_ids": [],
+                            "lost_literal_atom_ids": [],
+                            "lost_warning_or_promotion_atom_ids": [],
+                            "lost_uncertainty_markers": [],
+                            "unsupported_claims": [],
+                            "repair_section_ids": [],
+                            "input_sufficient": True,
+                        },
+                        usage=ProviderUsage(
+                            input_tokens=10,
+                            output_tokens=5,
+                            api_cost=0.0,
+                            cost_status="zero_local",
+                        ),
+                        diagnostics={"scripted": True},
+                    )
                 return await super().complete_json(**kwargs)
             self.stages.append(stage)
             self.payloads.append((stage, payload))
@@ -570,6 +606,502 @@ async def test_teaching_provider_synthesizes_each_fixed_section_independently() 
     assert set(result.synthesis.included_atom_ids) == {
         atom.id for atom in result.extraction.atoms
     }
+
+
+def test_input_sufficiency_rejects_sparse_or_visual_dependent_inputs() -> None:
+    assert _input_is_sufficient(_note_input()) is True
+    sparse = replace(_note_input(), warnings=["synthetic segment"])
+    assert _input_is_sufficient(sparse) is False
+    synthetic_variant = replace(_note_input(), transcript_variant="synthetic")
+    assert _input_is_sufficient(synthetic_variant) is False
+    visual = replace(
+        _note_input(),
+        metadata={"visual_dependency": {"risk": "high"}},
+    )
+    assert _input_is_sufficient(visual) is False
+    budget = replace(
+        _note_input(),
+        note_budget={"visual_dependency": {"risk": "medium"}},
+    )
+    assert _input_is_sufficient(budget) is False
+
+
+def test_normalize_section_keeps_all_outline_atoms_when_provider_omits_one() -> None:
+    atom_a = {
+        "id": "A",
+        "kind": "claim",
+        "topic": "topic",
+        "statement": "A",
+        "source_segment": 0,
+        "source_excerpt": "A",
+    }
+    atom_b = {**atom_a, "id": "B", "statement": "B", "source_excerpt": "B"}
+    outline_section = TeachingOutlineSection(
+        section_id="core_points",
+        title="Core",
+        order=1,
+        atom_ids=["A", "B"],
+        required_evidence_types=["claim"],
+        missing_evidence_policy="视频未提供这一类信息。",
+    )
+    draft = SectionDraft(
+        section_id="core_points",
+        title="Core",
+        content="A",
+        included_atom_ids=["A"],
+    )
+
+    normalized = _normalize_section(
+        draft,
+        outline_section,
+        {"A": atom_a, "B": atom_b},
+    )
+
+    assert normalized.included_atom_ids == ["A", "B"]
+
+
+def test_depth_repair_slice_does_not_expand_empty_flagged_section_to_all_atoms() -> None:
+    atoms = [
+        EvidenceAtom(
+            id="A",
+            kind="claim",
+            topic="one",
+            statement="A",
+            source_segment=0,
+            source_excerpt="A",
+        ),
+        EvidenceAtom(
+            id="B",
+            kind="claim",
+            topic="two",
+            statement="B",
+            source_segment=1,
+            source_excerpt="B",
+        ),
+    ]
+    extraction = ExtractionResult(
+        atoms=atoms,
+        dispositions=[
+            {"segment_index": 0, "disposition": "included", "atom_ids": ["A"]},
+            {"segment_index": 1, "disposition": "included", "atom_ids": ["B"]},
+        ],
+    )
+    empty_section = SectionDraft(
+        section_id="methods_steps",
+        title="Methods",
+        content="视频未提供这一类信息。",
+        included_atom_ids=[],
+    )
+    review = DepthReview(
+        abstracted_atom_ids=[],
+        example_without_result_atom_ids=[],
+        condition_without_scope_atom_ids=[],
+        reordered_step_atom_ids=[],
+        lost_literal_atom_ids=[],
+        lost_warning_or_promotion_atom_ids=[],
+        lost_uncertainty_markers=[],
+        unsupported_claims=[],
+        repair_section_ids=["methods_steps"],
+        input_sufficient=True,
+    )
+
+    repaired, segments = _depth_repair_slice(
+        extraction,
+        (empty_section,),
+        review,
+    )
+
+    assert repaired.atoms == []
+    assert segments == set()
+
+
+def test_depth_review_payload_keeps_cross_section_relations_in_context() -> None:
+    note_input = _note_input()
+    atoms = [
+        EvidenceAtom(
+            id="example",
+            kind="example",
+            topic="case",
+            statement="例子",
+            source_segment=0,
+            source_excerpt="例子",
+            relations=["result"],
+        ),
+        EvidenceAtom(
+            id="result",
+            kind="claim",
+            topic="case",
+            statement="结果",
+            source_segment=1,
+            source_excerpt="结果",
+        ),
+    ]
+    extraction = ExtractionResult(
+        atoms=atoms,
+        dispositions=[
+            {"segment_index": 0, "disposition": "included", "atom_ids": ["example"]},
+            {"segment_index": 1, "disposition": "included", "atom_ids": ["result"]},
+        ],
+    )
+    outline = TeachingOutline(
+        sections=[
+            TeachingOutlineSection(
+                section_id="examples_results",
+                title="Examples",
+                order=1,
+                atom_ids=["example"],
+                required_evidence_types=["example", "result"],
+                missing_evidence_policy="视频未提供这一类信息。",
+            ),
+            TeachingOutlineSection(
+                section_id="core_points",
+                title="Core",
+                order=2,
+                atom_ids=["result"],
+                required_evidence_types=["claim"],
+                missing_evidence_policy="视频未提供这一类信息。",
+            ),
+        ],
+        included_atom_ids=["example", "result"],
+    )
+    section = SectionDraft(
+        section_id="examples_results",
+        title="Examples",
+        content="例子",
+        included_atom_ids=["example"],
+    )
+    context = SectionDraft(
+        section_id="core_points",
+        title="Core",
+        content="结果",
+        included_atom_ids=["result"],
+    )
+
+    payload = _depth_review_payload(
+        note_input,
+        extraction,
+        outline,
+        (section,),
+        all_sections=(section, context),
+    )
+
+    assert payload["section_context"]
+    assert {item["id"] for item in payload["atom_relation_context"]} == {"example", "result"}
+    assert "result" in payload["atom_relation_context"][0]["relations"]
+
+
+def test_depth_review_unknown_repair_section_is_fail_closed() -> None:
+    review = DepthReview.model_construct(
+        abstracted_atom_ids=[],
+        example_without_result_atom_ids=[],
+        condition_without_scope_atom_ids=[],
+        reordered_step_atom_ids=[],
+        lost_literal_atom_ids=[],
+        lost_warning_or_promotion_atom_ids=[],
+        lost_uncertainty_markers=[],
+        unsupported_claims=[],
+        repair_section_ids=["not-a-section"],
+        input_sufficient=True,
+        unknown_atom_ids=[],
+        unknown_section_ids=[],
+        non_repairable_findings=[],
+    )
+
+    checked = _validate_depth_review_refs(review, set(), section_ids={"overview"})
+
+    assert checked.repair_section_ids == []
+    assert checked.unknown_section_ids == ["not-a-section"]
+    assert checked.non_repairable_findings
+
+
+@pytest.mark.asyncio
+async def test_teaching_pipeline_runs_depth_review_and_gates_incomplete_input() -> None:
+    class DepthProvider(ScriptedProvider):
+        supports_teaching_pipeline = True
+
+        async def complete_json(self, **kwargs: Any) -> ProviderResponse:
+            if kwargs["stage"] == "outline":
+                payload = kwargs["payload"]
+                atom_ids = [atom["id"] for atom in payload["atom_catalog"]]
+                section_ids = [
+                    "overview",
+                    "core_points",
+                    "methods_steps",
+                    "examples_results",
+                    "boundaries_risks",
+                    "actions",
+                    "timeline",
+                    "evidence_limits",
+                ]
+                self.stages.append("outline")
+                self.payloads.append(("outline", payload))
+                parsed = {
+                    "sections": [
+                        {
+                            "section_id": section_id,
+                            "title": section_id,
+                            "order": order,
+                            "atom_ids": atom_ids if order == 1 else [],
+                            "required_evidence_types": [],
+                            "missing_evidence_policy": "视频未提供这一类信息。",
+                            "timestamps": [],
+                        }
+                        for order, section_id in enumerate(section_ids, 1)
+                    ],
+                    "included_atom_ids": atom_ids,
+                    "unassigned_atom_ids": [],
+                    "input_sufficient": True,
+                }
+            elif kwargs["stage"] == "section":
+                payload = kwargs["payload"]
+                section = payload["section"]
+                atom_ids = [atom["id"] for atom in payload["atoms"]]
+                self.stages.append("section")
+                self.payloads.append(("section", payload))
+                parsed = {
+                    "section_id": section["section_id"],
+                    "title": section["title"],
+                    "content": "；".join(
+                        atom["statement"] for atom in payload["atoms"]
+                    )
+                    or "视频未提供这一类信息。",
+                    "claims": [],
+                    "steps": [],
+                    "examples": [],
+                    "results": [],
+                    "conditions": [],
+                    "risks": [],
+                    "actions": [],
+                    "included_atom_ids": atom_ids,
+                    "unprovided_items": [],
+                    "generated_interpretations": [],
+                }
+            elif kwargs["stage"] == "depth_review":
+                self.stages.append("depth_review")
+                self.payloads.append(("depth_review", kwargs["payload"]))
+                parsed = {
+                        "abstracted_atom_ids": [],
+                        "example_without_result_atom_ids": [],
+                        "condition_without_scope_atom_ids": [],
+                        "reordered_step_atom_ids": [],
+                        "lost_literal_atom_ids": [],
+                        "lost_warning_or_promotion_atom_ids": [],
+                        "lost_uncertainty_markers": [],
+                        "unsupported_claims": [],
+                        "repair_section_ids": [],
+                        "input_sufficient": False,
+                    }
+            else:
+                return await super().complete_json(**kwargs)
+            return ProviderResponse(
+                raw_output="depth",
+                parsed_json=parsed,
+                usage=ProviderUsage(
+                    input_tokens=10,
+                    output_tokens=5,
+                    api_cost=0.0,
+                    cost_status="zero_local",
+                ),
+                diagnostics={"scripted": True},
+            )
+
+    provider = DepthProvider()
+    sparse = replace(_note_input(), warnings=["synthetic segment"])
+    result = await SemanticNotePipeline(provider).generate(sparse, asyncio.Event())
+
+    assert provider.stages.count("depth_review") >= 1
+    assert result.depth_review is not None
+    assert result.input_sufficient is False
+    assert result.coverage.quality_gate == "failed"
+    assert result.coverage.semantic_complete is False
+
+
+@pytest.mark.asyncio
+async def test_teaching_coverage_repair_authorizes_only_affected_sections() -> None:
+    class CoverageRepairTeachingProvider(ScriptedProvider):
+        supports_teaching_pipeline = True
+
+        def __init__(self) -> None:
+            super().__init__()
+            self.review_passes = 0
+
+        async def complete_json(self, **kwargs: Any) -> ProviderResponse:
+            stage = kwargs["stage"]
+            payload = kwargs["payload"]
+            if stage == "extract":
+                self.stages.append(stage)
+                self.payloads.append((stage, payload))
+                atoms = []
+                dispositions = []
+                for segment in payload["segments"]:
+                    atom_id = f"claim-{segment['index']}"
+                    atoms.append(
+                        {
+                            "id": atom_id,
+                            "kind": "claim",
+                            "topic": "topic",
+                            "statement": segment["text"],
+                            "source_segment": segment["index"],
+                            "start": segment["start"],
+                            "end": segment["end"],
+                            "source_excerpt": segment["text"],
+                            "relations": [],
+                            "sequence": None,
+                            "is_promotional": False,
+                            "asr_uncertainty": [],
+                        }
+                    )
+                    dispositions.append(
+                        {
+                            "segment_index": segment["index"],
+                            "disposition": "included",
+                            "atom_ids": [atom_id],
+                            "reason": None,
+                        }
+                    )
+                parsed = {"atoms": atoms, "dispositions": dispositions}
+            elif stage == "outline":
+                self.stages.append(stage)
+                self.payloads.append((stage, payload))
+                atom_ids = [item["id"] for item in payload["atom_catalog"]]
+                parsed = {
+                    "sections": [
+                        {
+                            "section_id": section_id,
+                            "title": section_id,
+                            "order": order,
+                            "atom_ids": atom_ids if order == 1 else [],
+                            "required_evidence_types": [],
+                            "missing_evidence_policy": "视频未提供这一类信息。",
+                            "timestamps": [],
+                        }
+                        for order, section_id in enumerate(
+                            (
+                                "overview",
+                                "core_points",
+                                "methods_steps",
+                                "examples_results",
+                                "boundaries_risks",
+                                "actions",
+                                "timeline",
+                                "evidence_limits",
+                            ),
+                            1,
+                        )
+                    ],
+                    "included_atom_ids": atom_ids,
+                    "unassigned_atom_ids": [],
+                    "input_sufficient": True,
+                }
+            elif stage == "section":
+                self.stages.append(stage)
+                self.payloads.append((stage, payload))
+                atoms = payload["atoms"]
+                parsed = {
+                    "section_id": payload["section"]["section_id"],
+                    "title": payload["section"]["title"],
+                    "content": "；".join(atom["statement"] for atom in atoms)
+                    or "视频未提供这一类信息。",
+                    "claims": [],
+                    "steps": [],
+                    "examples": [],
+                    "results": [],
+                    "conditions": [],
+                    "risks": [],
+                    "actions": [],
+                    "included_atom_ids": [atom["id"] for atom in atoms],
+                    "unprovided_items": [],
+                    "generated_interpretations": [],
+                }
+            elif stage == "depth_review":
+                self.stages.append(stage)
+                self.payloads.append((stage, payload))
+                parsed = {
+                    "abstracted_atom_ids": [],
+                    "example_without_result_atom_ids": [],
+                    "condition_without_scope_atom_ids": [],
+                    "reordered_step_atom_ids": [],
+                    "lost_literal_atom_ids": [],
+                    "lost_warning_or_promotion_atom_ids": [],
+                    "lost_uncertainty_markers": [],
+                    "unsupported_claims": [],
+                    "repair_section_ids": [],
+                    "input_sufficient": True,
+                }
+            elif stage == "review":
+                self.review_passes += 1
+                self.stages.append(stage)
+                self.payloads.append((stage, payload))
+                if payload.get("review_mode") == "draft_claims":
+                    claim_ids = [claim["id"] for claim in payload["draft_claims"]]
+                    parsed = {
+                        "reviewed_claim_ids": claim_ids,
+                        "supported_claim_ids": claim_ids,
+                        "contradicted_claim_ids": [],
+                    }
+                    return ProviderResponse(
+                        raw_output="coverage-review-claims",
+                        parsed_json=parsed,
+                        usage=ProviderUsage(
+                            input_tokens=10,
+                            output_tokens=5,
+                            api_cost=0.0,
+                            cost_status="zero_local",
+                        ),
+                        diagnostics={"scripted": True},
+                    )
+                parsed = {
+                    "reviewed_segment_indexes": [
+                        segment["index"] for segment in payload["source_segments"]
+                    ],
+                    "source_omission_candidates": (
+                        [
+                            {
+                                "segment_index": 0,
+                                "source_excerpt": payload["source_segments"][0]["text"],
+                                "missing_statement": "coverage omission",
+                                "suggested_kind": "claim",
+                            }
+                        ]
+                        if self.review_passes == 1
+                        else []
+                    ),
+                    "unsupported_draft_claims": [],
+                    "disposition_corrections": [],
+                }
+            elif stage == "repair":
+                self.stages.append(stage)
+                self.payloads.append((stage, payload))
+                section_drafts = payload["section_drafts"]
+                parsed = {
+                    "extraction_patch": {"atoms": [], "dispositions": []},
+                    "synthesis_patch": payload["draft"],
+                    "section_drafts": section_drafts[:1],
+                }
+            else:
+                raise AssertionError(stage)
+            return ProviderResponse(
+                raw_output="coverage-repair",
+                parsed_json=parsed,
+                usage=ProviderUsage(
+                    input_tokens=10,
+                    output_tokens=5,
+                    api_cost=0.0,
+                    cost_status="zero_local",
+                ),
+                diagnostics={"scripted": True},
+            )
+
+    provider = CoverageRepairTeachingProvider()
+    result = await SemanticNotePipeline(provider).generate(_note_input(), asyncio.Event())
+
+    assert result.repair_count == 1
+    assert provider.stages.count("repair") == 1
+    repair_payload = next(
+        payload for stage, payload in provider.payloads if stage == "repair"
+    )
+    assert repair_payload["repair_section_ids"]
+    assert result.depth_review is not None
 
 
 @pytest.mark.asyncio

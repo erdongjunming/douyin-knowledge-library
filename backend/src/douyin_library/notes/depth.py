@@ -35,12 +35,9 @@ class DepthValidator:
         outline_by_id = {section.section_id: section for section in outline.sections}
         section_by_id = {section.section_id: section for section in sections}
         body = {section.section_id: self._section_text(section) for section in sections}
-        outline_ids = set(outline.included_atom_ids)
-        outline_ids.update(atom_id for section in outline.sections for atom_id in section.atom_ids)
         assigned = {section.section_id: set(section.atom_ids) for section in outline.sections}
-        assigned.update(
-            {section.section_id: set(section.included_atom_ids) for section in sections}
-        )
+        for section in sections:
+            assigned.setdefault(section.section_id, set()).update(section.included_atom_ids)
         unknown_atoms: list[str] = []
         unknown_sections: list[str] = []
         non_repairable: list[str] = []
@@ -206,6 +203,11 @@ class DepthValidator:
             repair_section_ids=[],
             input_sufficient=outline.input_sufficient,
         )
+        if inherited.unsupported_claims:
+            non_repairable.extend(
+                f"unsupported claim: {claim}"
+                for claim in inherited.unsupported_claims
+            )
         return DepthReview(
             abstracted_atom_ids=self._unique([*inherited.abstracted_atom_ids, *abstracted]),
             example_without_result_atom_ids=self._unique(

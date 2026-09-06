@@ -31,8 +31,14 @@ from douyin_library.notes.contracts import (
     TimelineEntry,
 )
 from douyin_library.notes.coverage import CoverageValidator
+from douyin_library.notes.depth import DepthValidator
 from douyin_library.notes.input import InputSegment, NoteInput
-from douyin_library.notes.prompts import PROMPT_VERSIONS, SYSTEM_PROMPTS
+from douyin_library.notes.prompts import (
+    PROMPT_VERSIONS,
+    SYSTEM_PROMPTS,
+    TEACHING_REPAIR_PROMPT_VERSION,
+    TEACHING_REPAIR_SYSTEM_PROMPT,
+)
 from douyin_library.notes.providers.base import NoteProvider, NoteStage
 
 
@@ -450,6 +456,33 @@ class SemanticNotePipeline:
                 )
         if not teaching_enabled:
             synthesis = _merge_syntheses(synthesis_parts)
+        depth_review: DepthReview | None = None
+        if teaching_enabled:
+            try:
+                depth_review = await self._review_depth(
+                    note_input,
+                    extraction,
+                    outline,
+                    section_drafts,
+                    cancel_event,
+                    audit_sink,
+                    records,
+                    input_sufficient=_input_is_sufficient(note_input)
+                    and input_sufficient,
+                )
+            except ProviderContextBudgetError as exc:
+                failure = _exception_failure(exc, "depth_review", {})
+                _remember_context_failure(context_failures, failure)
+                return self._failed_generation(
+                    note_input=note_input,
+                    extraction=extraction,
+                    synthesis=synthesis,
+                    review=None,
+                    context_failures=context_failures,
+                    records=records,
+                    batches=batches,
+                )
+            input_sufficient = input_sufficient and depth_review.input_sufficient
         review = await self._review(
             note_input,
             extraction,
@@ -467,6 +500,7 @@ class SemanticNotePipeline:
             synthesis,
             review,
             input_sufficient=input_sufficient,
+            depth_review=depth_review,
         )
         if context_failures:
             return self._failed_generation(
@@ -480,10 +514,45 @@ class SemanticNotePipeline:
                 coverage=coverage,
             )
         repair_count = 0
-        if coverage.quality_gate == "failed" and coverage.repairable:
+        depth_repairable = bool(
+            teaching_enabled
+            and depth_review is not None
+            and depth_review.repair_section_ids
+            and not depth_review.non_repairable_findings
+            and not depth_review.unknown_atom_ids
+            and not depth_review.unknown_section_ids
+        )
+        if coverage.quality_gate == "failed" and (coverage.repairable or depth_repairable):
             _check_cancellation(cancel_event)
-            repair_extraction, relevant_segments = _repair_slice(
-                extraction, synthesis, review, coverage
+            if depth_repairable and depth_review is not None:
+                repair_extraction, relevant_segments = _depth_repair_slice(
+                    extraction,
+                    section_drafts,
+                    depth_review,
+                    outline=outline,
+                )
+            else:
+                repair_extraction, relevant_segments = _repair_slice(
+                    extraction, synthesis, review, coverage
+                )
+            teaching_repair_section_ids = (
+                list(depth_review.repair_section_ids)
+                if depth_repairable and depth_review is not None
+                else _coverage_repair_section_ids(
+                    outline,
+                    section_drafts,
+                    repair_extraction,
+                    relevant_segments,
+                )
+            )
+            repair_sections = (
+                tuple(
+                    draft
+                    for draft in section_drafts
+                    if draft.section_id in teaching_repair_section_ids
+                )
+                if teaching_enabled
+                else section_drafts
             )
             repair_payload = _repair_payload(
                 note_input,
@@ -494,10 +563,23 @@ class SemanticNotePipeline:
                 coverage,
                 relevant_segments,
                 compact_content=False,
+                outline=outline if teaching_enabled else None,
+                section_drafts=repair_sections if teaching_enabled else (),
+                depth_review=depth_review if teaching_enabled else None,
+                repair_section_ids=(
+                    teaching_repair_section_ids if teaching_enabled else []
+                ),
             )
+            repair_system_prompt = (
+                TEACHING_REPAIR_SYSTEM_PROMPT
+                if teaching_enabled
+                else SYSTEM_PROMPTS["repair"]
+            )
+            if teaching_enabled:
+                repair_payload["prompt_version"] = TEACHING_REPAIR_PROMPT_VERSION
             repair_budget = _provider_request_budget(
                 stage="repair",
-                system_prompt=SYSTEM_PROMPTS["repair"],
+                system_prompt=repair_system_prompt,
                 payload=repair_payload,
                 json_schema=RepairResult.model_json_schema(),
                 context_tokens=self.provider.context_tokens,
@@ -512,16 +594,24 @@ class SemanticNotePipeline:
                     coverage,
                     relevant_segments,
                     compact_content=True,
+                    outline=outline if teaching_enabled else None,
+                    section_drafts=repair_sections if teaching_enabled else (),
+                    depth_review=depth_review if teaching_enabled else None,
+                    repair_section_ids=(
+                        teaching_repair_section_ids if teaching_enabled else []
+                    ),
                 )
                 compact_budget = _provider_request_budget(
                     stage="repair",
-                    system_prompt=SYSTEM_PROMPTS["repair"],
+                    system_prompt=repair_system_prompt,
                     payload=compact_payload,
                     json_schema=RepairResult.model_json_schema(),
                     context_tokens=self.provider.context_tokens,
                 )
                 if compact_budget["within_budget"]:
                     repair_payload = compact_payload
+                    if teaching_enabled:
+                        repair_payload["prompt_version"] = TEACHING_REPAIR_PROMPT_VERSION
                     repair_budget = compact_budget
                 else:
                     failure = _budget_failure("repair", compact_budget)
@@ -553,6 +643,16 @@ class SemanticNotePipeline:
                     cancel_event=cancel_event,
                     audit_sink=audit_sink,
                     records=records,
+                    system_prompt_override=(
+                        TEACHING_REPAIR_SYSTEM_PROMPT
+                        if teaching_enabled
+                        else None
+                    ),
+                    prompt_version_override=(
+                        TEACHING_REPAIR_PROMPT_VERSION
+                        if teaching_enabled
+                        else None
+                    ),
                 )
             except ProviderContextBudgetError as exc:
                 failure = _exception_failure(exc, "repair", repair_payload)
@@ -586,6 +686,54 @@ class SemanticNotePipeline:
                 raise
             else:
                 extraction, synthesis = updated_extraction, updated_synthesis
+                if teaching_enabled and repair_result.section_drafts:
+                    outline_by_id = {
+                        section.section_id: section for section in outline.sections
+                    }
+                    normalized_repairs: dict[str, SectionDraft] = {}
+                    for repaired_draft in repair_result.section_drafts:
+                        if (
+                            depth_review is None
+                            or repaired_draft.section_id
+                            not in set(teaching_repair_section_ids)
+                            or repaired_draft.section_id not in outline_by_id
+                        ):
+                            raise ValueError("teaching repair section is not authorized")
+                        normalized_repairs[repaired_draft.section_id] = _normalize_section(
+                            repaired_draft,
+                            outline_by_id[repaired_draft.section_id],
+                            {atom.id: atom for atom in extraction.atoms},
+                        )
+                    updated_by_id = {
+                        draft.section_id: draft
+                        for draft in normalized_repairs.values()
+                    }
+                    section_drafts = tuple(
+                        updated_by_id.get(draft.section_id, draft)
+                        for draft in section_drafts
+                    )
+                    if depth_repairable or teaching_repair_section_ids:
+                        synthesis = _teaching_synthesis(
+                            note_input,
+                            extraction,
+                            outline,
+                            section_drafts,
+                        )
+                elif teaching_enabled and depth_repairable:
+                    # A depth repair without a returned section patch cannot
+                    # claim that the affected teaching section was repaired.
+                    input_sufficient = False
+                elif teaching_enabled:
+                    # Coverage-only repair may return only legacy extraction /
+                    # synthesis fields. Rebuild the teaching projection from
+                    # the merged extraction so section and timeline artifacts
+                    # cannot drift apart.
+                    synthesis = _teaching_synthesis(
+                        note_input,
+                        extraction,
+                        outline,
+                        section_drafts,
+                    )
                 repair_count = 1
                 review = await self._review(
                     note_input,
@@ -598,18 +746,49 @@ class SemanticNotePipeline:
                     context_failures,
                 )
                 _check_cancellation(cancel_event)
+                if teaching_enabled:
+                    try:
+                        depth_review = await self._review_depth(
+                            note_input,
+                            extraction,
+                            outline,
+                            section_drafts,
+                            cancel_event,
+                            audit_sink,
+                            records,
+                            input_sufficient=_input_is_sufficient(note_input)
+                            and input_sufficient,
+                        )
+                    except ProviderContextBudgetError as exc:
+                        failure = _exception_failure(exc, "depth_review", {})
+                        _remember_context_failure(context_failures, failure)
+                        return self._failed_generation(
+                            note_input=note_input,
+                            extraction=extraction,
+                            synthesis=synthesis,
+                            review=review,
+                            context_failures=context_failures,
+                            records=records,
+                            batches=batches,
+                            coverage=coverage,
+                        )
+                    input_sufficient = input_sufficient and depth_review.input_sufficient
                 coverage = self._validate(
                     note_input,
                     extraction,
                     synthesis,
                     review,
                     input_sufficient=input_sufficient,
+                    depth_review=depth_review,
                 )
                 if context_failures:
                     coverage = coverage.model_copy(
                         update={"quality_gate": "failed", "repairable": False}
                     )
         _check_cancellation(cancel_event)
+        prompt_versions = dict(PROMPT_VERSIONS)
+        if teaching_enabled:
+            prompt_versions["repair"] = TEACHING_REPAIR_PROMPT_VERSION
         return SemanticGeneration(
             extraction=extraction,
             synthesis=synthesis,
@@ -622,11 +801,12 @@ class SemanticNotePipeline:
             usage=_aggregate_usage(records),
             stage_records=tuple(records),
             batch_boundaries=tuple(batch.boundary() for batch in batches),
-            prompt_versions=dict(PROMPT_VERSIONS),
+            prompt_versions=prompt_versions,
             is_local=bool(self.provider.is_local),
             outline=outline,
             section_drafts=section_drafts,
             section_attempts=section_attempts,
+            depth_review=depth_review,
             input_sufficient=input_sufficient,
             context_status=(
                 "within_budget" if not context_failures else "failed"
@@ -929,6 +1109,102 @@ class SemanticNotePipeline:
             }
         )
 
+    async def _review_depth(
+        self,
+        note_input: NoteInput,
+        extraction: ExtractionResult,
+        outline: TeachingOutline,
+        sections: tuple[SectionDraft, ...],
+        cancel_event: asyncio.Event,
+        audit_sink: AuditSink | None,
+        records: list[StageRecord],
+        *,
+        input_sufficient: bool,
+    ) -> DepthReview:
+        groups: list[tuple[SectionDraft, ...]] = [sections]
+        provider_reviews: list[DepthReview] = []
+        while groups:
+            group = groups.pop(0)
+            payload = _depth_review_payload(
+                note_input,
+                extraction,
+                outline,
+                group,
+                all_sections=sections,
+            )
+            if not self._request_fits("depth_review", payload, DepthReview):
+                if len(group) > 1:
+                    midpoint = max(1, len(group) // 2)
+                    groups = [group[:midpoint], group[midpoint:], *groups]
+                    continue
+                section_chunks = _split_depth_section(group[0], outline)
+                if section_chunks:
+                    groups = [*section_chunks, *groups]
+                    continue
+                compact = _depth_review_payload(
+                    note_input,
+                    extraction,
+                    outline,
+                    group,
+                    all_sections=sections,
+                    compact=True,
+                    context_tokens=self.provider.context_tokens,
+                )
+                if self._request_fits("depth_review", compact, DepthReview):
+                    payload = compact
+                else:
+                    fragment_payloads = _depth_fragment_payloads(
+                        note_input,
+                        extraction,
+                        outline,
+                        group,
+                        all_sections=sections,
+                        context_tokens=self.provider.context_tokens,
+                    )
+                    if not fragment_payloads or any(
+                        not self._request_fits("depth_review", item, DepthReview)
+                        for item in fragment_payloads
+                    ):
+                        raise ProviderContextBudgetError("depth_review")
+                    for fragment_payload in fragment_payloads:
+                        provider_reviews.append(
+                            await self._call(
+                                stage="depth_review",
+                                payload=fragment_payload,
+                                schema=DepthReview,
+                                cancel_event=cancel_event,
+                                audit_sink=audit_sink,
+                                records=records,
+                            )
+                        )
+                    continue
+            provider_reviews.append(
+                await self._call(
+                    stage="depth_review",
+                    payload=payload,
+                    schema=DepthReview,
+                    cancel_event=cancel_event,
+                    audit_sink=audit_sink,
+                    records=records,
+                )
+            )
+        provider_review = _merge_depth_reviews(
+            provider_reviews,
+            input_sufficient=input_sufficient,
+        )
+        provider_review = _validate_depth_review_refs(
+            provider_review,
+            {atom.id for atom in extraction.atoms},
+            section_ids={section.section_id for section in outline.sections},
+        )
+        deterministic = DepthValidator().validate(
+            atoms=extraction.atoms,
+            outline=outline,
+            sections=list(sections),
+            review=provider_review,
+        )
+        return deterministic.model_copy(update={"input_sufficient": input_sufficient})
+
     async def _build_outline(
         self,
         note_input: NoteInput,
@@ -1109,9 +1385,12 @@ class SemanticNotePipeline:
         audit_sink: AuditSink | None,
         records: list[StageRecord],
         batch_boundary: dict[str, int] | None = None,
+        system_prompt_override: str | None = None,
+        prompt_version_override: str | None = None,
     ) -> T:
         _check_cancellation(cancel_event)
-        system_prompt = SYSTEM_PROMPTS[stage]
+        system_prompt = system_prompt_override or SYSTEM_PROMPTS[stage]
+        prompt_version = prompt_version_override or PROMPT_VERSIONS[stage]
         json_schema = schema.model_json_schema()
         request_payload = copy.deepcopy(dict(payload))
         budget = _provider_request_budget(
@@ -1143,7 +1422,7 @@ class SemanticNotePipeline:
         except Exception as exc:
             record = StageRecord(
                 stage=stage,
-                prompt_version=PROMPT_VERSIONS[stage],
+                prompt_version=prompt_version,
                 system_prompt=system_prompt,
                 payload=copy.deepcopy(dict(payload)),
                 raw_output="",
@@ -1170,7 +1449,7 @@ class SemanticNotePipeline:
             diagnostics["cancelled_after_provider_return"] = True
             record = StageRecord(
                 stage=stage,
-                prompt_version=PROMPT_VERSIONS[stage],
+                prompt_version=prompt_version,
                 system_prompt=system_prompt,
                 payload=copy.deepcopy(dict(payload)),
                 raw_output=response.raw_output,
@@ -1195,7 +1474,7 @@ class SemanticNotePipeline:
             diagnostics["schema_validation_error"] = str(exc)
             record = StageRecord(
                 stage=stage,
-                prompt_version=PROMPT_VERSIONS[stage],
+                prompt_version=prompt_version,
                 system_prompt=system_prompt,
                 payload=copy.deepcopy(dict(payload)),
                 raw_output=response.raw_output,
@@ -1210,7 +1489,7 @@ class SemanticNotePipeline:
             raise
         record = StageRecord(
             stage=stage,
-            prompt_version=PROMPT_VERSIONS[stage],
+            prompt_version=prompt_version,
             system_prompt=system_prompt,
             payload=copy.deepcopy(dict(payload)),
             raw_output=response.raw_output,
@@ -1281,7 +1560,13 @@ class SemanticNotePipeline:
                 input_sufficient=False,
             )
         coverage = coverage.model_copy(
-            update={"quality_gate": "failed", "repairable": False}
+            update={
+                "quality_gate": "failed",
+                "repairable": False,
+                "depth_passed": False,
+                "input_sufficient": False,
+                "semantic_complete": False,
+            }
         )
         return SemanticGeneration(
             extraction=candidate_extraction,
@@ -1408,6 +1693,44 @@ def _metadata_payload(note_input: NoteInput) -> dict[str, Any]:
         "source_url": note_input.source_url,
         "warnings": list(note_input.warnings),
     }
+
+
+def _input_is_sufficient(note_input: NoteInput) -> bool:
+    """Return whether the available transcript can support a complete note."""
+
+    if not note_input.transcript.strip() or not note_input.segments:
+        return False
+    if note_input.transcript_variant not in {"raw", "cleaned"}:
+        return False
+    warning_text = " ".join(note_input.warnings).casefold()
+    sparse_markers = (
+        "synthetic segment",
+        "segments.json",
+        "未覆盖完整 transcript",
+        "转写过少",
+        "转写稀疏",
+        "sparse transcript",
+    )
+    if any(marker.casefold() in warning_text for marker in sparse_markers):
+        return False
+
+    candidates: list[Any] = [
+        note_input.metadata,
+        getattr(note_input, "note_budget", None),
+    ]
+    if isinstance(note_input.metadata, Mapping):
+        candidates.extend(
+            value
+            for key in ("note_budget", "budget", "visual_dependency")
+            if isinstance((value := note_input.metadata.get(key)), Mapping)
+        )
+    for value in candidates:
+        if not isinstance(value, Mapping):
+            continue
+        visual = value.get("visual_dependency", value)
+        if isinstance(visual, Mapping) and visual.get("risk") in {"medium", "high"}:
+            return False
+    return True
 
 
 def _project_extraction(
@@ -1691,6 +2014,406 @@ def _section_payload(
     }
 
 
+def _depth_review_payload(
+    note_input: NoteInput,
+    extraction: ExtractionResult,
+    outline: TeachingOutline,
+    sections: tuple[SectionDraft, ...],
+    *,
+    all_sections: tuple[SectionDraft, ...] | None = None,
+    compact: bool = False,
+    context_tokens: int = 65_536,
+    source_segments_override: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    context_sections = all_sections or sections
+    outline_by_id = {section.section_id: section for section in outline.sections}
+    section_atom_ids = {
+        atom_id
+        for section in sections
+        for atom_id in section.included_atom_ids
+    }
+    for section in sections:
+        if section.included_atom_ids:
+            continue
+        outline_section = outline_by_id.get(section.section_id)
+        if outline_section is not None:
+            section_atom_ids.update(outline_section.atom_ids)
+    atom_by_id = {atom.id: atom for atom in extraction.atoms}
+    relation_ids = set(section_atom_ids)
+    for atom_id in tuple(section_atom_ids):
+        atom = atom_by_id.get(atom_id)
+        if atom is None:
+            continue
+        relation_ids.update(atom.relations)
+    target_indexes = {
+        atom_by_id[atom_id].source_segment
+        for atom_id in section_atom_ids
+        if atom_id in atom_by_id
+    }
+    relation_indexes = {
+        atom.source_segment
+        for atom in extraction.atoms
+        if atom.id in relation_ids
+    }
+    source_segments = source_segments_override or [
+        _segment_payload(segment)
+        for segment in note_input.segments
+        if segment.index in target_indexes
+    ]
+    related_source_segments = [
+        _segment_payload(segment)
+        for segment in note_input.segments
+        if segment.index in relation_indexes - target_indexes
+    ]
+    section_context = [_section_depth_context(item) for item in context_sections]
+    atom_relation_context = [
+        _atom_depth_context(atom, compact=compact)
+        for atom in extraction.atoms
+        if atom.id in relation_ids or atom.id in section_atom_ids
+    ]
+    outline_payload = (
+        _compact_depth_outline(outline, set(relation_ids))
+        if compact
+        else outline.model_dump(mode="json")
+    )
+    return {
+        "prompt_version": PROMPT_VERSIONS["depth_review"],
+        "aweme_id": note_input.aweme_id,
+        "raw_segments": source_segments,
+        "related_source_segments": related_source_segments,
+        "outline": outline_payload,
+        "section_drafts": [section.model_dump(mode="json") for section in sections],
+        "section_context": section_context,
+        "atom_relation_context": atom_relation_context,
+        "extraction": _project_extraction(
+            _subset_extraction(extraction, section_atom_ids, target_indexes),
+            include_source_excerpts=False if compact else True,
+        ),
+        "input_sufficient": bool(note_input.transcript.strip()),
+        "input_compacted": compact,
+        "input_truncated": False,
+    }
+
+
+def _section_depth_context(section: SectionDraft) -> dict[str, Any]:
+    return {
+        "section_id": section.section_id,
+        "title": section.title,
+        "included_atom_ids": list(section.included_atom_ids),
+        "claim_atom_ids": [
+            list(claim.atom_ids)
+            for field_name in (
+                "claims",
+                "steps",
+                "examples",
+                "results",
+                "conditions",
+                "risks",
+                "actions",
+            )
+            for claim in getattr(section, field_name)
+        ],
+    }
+
+
+def _compact_depth_outline(
+    outline: TeachingOutline,
+    relevant_atom_ids: set[str],
+) -> dict[str, Any]:
+    sections = []
+    for section in outline.sections:
+        sections.append(
+            {
+                "section_id": section.section_id,
+                "title": section.title,
+                "order": section.order,
+                "atom_ids": [
+                    atom_id
+                    for atom_id in section.atom_ids
+                    if atom_id in relevant_atom_ids
+                ],
+                "required_evidence_types": list(section.required_evidence_types),
+                "timestamps": list(section.timestamps),
+            }
+        )
+    return {
+        "sections": sections,
+        "included_atom_ids": [
+            atom_id
+            for atom_id in outline.included_atom_ids
+            if atom_id in relevant_atom_ids
+        ],
+        "unassigned_atom_ids": [],
+        "input_sufficient": outline.input_sufficient,
+    }
+
+
+def _atom_depth_context(atom: Any, *, compact: bool) -> dict[str, Any]:
+    value = {
+        "id": atom.id,
+        "kind": atom.kind,
+        "source_segment": atom.source_segment,
+        "relations": list(atom.relations),
+        "sequence": atom.sequence,
+        "is_promotional": atom.is_promotional,
+        "uncertainty": list(atom.asr_uncertainty),
+    }
+    if not compact:
+        value["statement"] = atom.statement
+        value["source_excerpt"] = atom.source_excerpt
+    return value
+
+
+def _split_depth_section(
+    section: SectionDraft,
+    outline: TeachingOutline,
+) -> list[tuple[SectionDraft, ...]]:
+    outline_section = next(
+        (item for item in outline.sections if item.section_id == section.section_id),
+        None,
+    )
+    atom_ids = list(section.included_atom_ids)
+    if not atom_ids and outline_section is not None:
+        atom_ids = list(outline_section.atom_ids)
+    if len(atom_ids) <= 1:
+        return []
+    midpoint = max(1, len(atom_ids) // 2)
+    return [
+        (_project_depth_section(section, set(atom_ids[:midpoint])),),
+        (_project_depth_section(section, set(atom_ids[midpoint:])),),
+    ]
+
+
+def _project_depth_section(section: SectionDraft, atom_ids: set[str]) -> SectionDraft:
+    fields = (
+        "claims",
+        "steps",
+        "examples",
+        "results",
+        "conditions",
+        "risks",
+        "actions",
+    )
+    updates: dict[str, Any] = {
+        "included_atom_ids": list(
+            dict.fromkeys(
+                item
+                for item in [*section.included_atom_ids, *sorted(atom_ids)]
+                if item in atom_ids
+            )
+        ),
+        "generated_interpretations": [],
+    }
+    for field_name in fields:
+        updates[field_name] = [
+            claim
+            for claim in getattr(section, field_name)
+            if set(claim.atom_ids) & atom_ids
+        ]
+    texts = [
+        claim.text
+        for field_name in fields
+        for claim in updates[field_name]
+    ]
+    updates["content"] = "\n".join(dict.fromkeys(texts)) or "视频未提供这一类信息。"
+    return section.model_copy(update=updates)
+
+
+def _depth_fragment_payloads(
+    note_input: NoteInput,
+    extraction: ExtractionResult,
+    outline: TeachingOutline,
+    sections: tuple[SectionDraft, ...],
+    *,
+    all_sections: tuple[SectionDraft, ...],
+    context_tokens: int,
+    fragment_chars: int | None = None,
+) -> list[dict[str, Any]]:
+    outline_by_id = {section.section_id: section for section in outline.sections}
+    fragment_atom_ids: set[str] = set()
+    for section in sections:
+        outline_section = outline_by_id.get(section.section_id)
+        fragment_atom_ids.update(
+            section.included_atom_ids
+            or (outline_section.atom_ids if outline_section is not None else [])
+        )
+    indexes = {
+        atom.source_segment
+        for atom in extraction.atoms
+        if atom.id in fragment_atom_ids
+    }
+    if not indexes:
+        return []
+    max_chars = max(32, fragment_chars or int(context_tokens * 0.15))
+    compact_sections = tuple(
+        _project_depth_section(
+            section,
+            set(
+                section.included_atom_ids
+                or outline_by_id.get(section.section_id).atom_ids
+                if outline_by_id.get(section.section_id) is not None
+                else section.included_atom_ids
+            ),
+        )
+        for section in sections
+    )
+    fragments: list[dict[str, Any]] = []
+    for segment in note_input.segments:
+        if segment.index not in indexes:
+            continue
+        text = segment.text
+        count = max(1, math.ceil(len(text) / max_chars))
+        for index in range(count):
+            start = index * max_chars
+            fragment = _segment_payload(segment)
+            fragment["text"] = text[start : start + max_chars]
+            fragment["fragment_index"] = index
+            fragment["fragment_count"] = count
+            fragments.append(fragment)
+    payloads = [
+        _depth_review_payload(
+            note_input,
+            extraction,
+            outline,
+            compact_sections,
+            all_sections=all_sections,
+            compact=True,
+            context_tokens=context_tokens,
+            source_segments_override=[fragment],
+        )
+        for fragment in fragments
+    ]
+    budget_ok = all(
+        bool(
+            _provider_request_budget(
+                stage="depth_review",
+                system_prompt=SYSTEM_PROMPTS["depth_review"],
+                payload=payload,
+                json_schema=DepthReview.model_json_schema(),
+                context_tokens=context_tokens,
+            )["within_budget"]
+        )
+        for payload in payloads
+    )
+    if budget_ok:
+        return payloads
+    if max_chars <= 32:
+        return []
+    return _depth_fragment_payloads(
+        note_input,
+        extraction,
+        outline,
+        sections,
+        all_sections=all_sections,
+        context_tokens=context_tokens,
+        fragment_chars=max(32, max_chars // 2),
+    )
+
+
+def _merge_depth_reviews(
+    values: list[DepthReview],
+    *,
+    input_sufficient: bool,
+) -> DepthReview:
+    if not values:
+        return DepthReview(
+            abstracted_atom_ids=[],
+            example_without_result_atom_ids=[],
+            condition_without_scope_atom_ids=[],
+            reordered_step_atom_ids=[],
+            lost_literal_atom_ids=[],
+            lost_warning_or_promotion_atom_ids=[],
+            lost_uncertainty_markers=[],
+            unsupported_claims=[],
+            repair_section_ids=[],
+            input_sufficient=input_sufficient,
+        )
+    list_fields = (
+        "abstracted_atom_ids",
+        "example_without_result_atom_ids",
+        "condition_without_scope_atom_ids",
+        "reordered_step_atom_ids",
+        "lost_literal_atom_ids",
+        "lost_warning_or_promotion_atom_ids",
+        "lost_uncertainty_markers",
+        "unsupported_claims",
+        "repair_section_ids",
+        "unknown_atom_ids",
+        "unknown_section_ids",
+        "non_repairable_findings",
+    )
+    data = {
+        field_name: _dedupe_text(
+            item
+            for value in values
+            for item in getattr(value, field_name)
+        )
+        for field_name in list_fields
+    }
+    data["input_sufficient"] = input_sufficient and all(
+        value.input_sufficient for value in values
+    )
+    return DepthReview.model_validate(data, strict=True)
+
+
+def _validate_depth_review_refs(
+    review: DepthReview,
+    atom_ids: set[str],
+    *,
+    section_ids: set[str] | None = None,
+) -> DepthReview:
+    atom_fields = (
+        "abstracted_atom_ids",
+        "example_without_result_atom_ids",
+        "condition_without_scope_atom_ids",
+        "reordered_step_atom_ids",
+        "lost_literal_atom_ids",
+        "lost_warning_or_promotion_atom_ids",
+    )
+    unknown = _dedupe_text(
+        atom_id
+        for field_name in atom_fields
+        for atom_id in getattr(review, field_name)
+        if atom_id not in atom_ids
+    )
+    allowed_sections = set(_TEACHING_SECTION_IDS)
+    if section_ids is not None:
+        allowed_sections &= section_ids
+    unknown_sections = _dedupe_text(
+        section_id
+        for section_id in review.repair_section_ids
+        if section_id not in allowed_sections
+    )
+    valid_repair_sections = [
+        section_id
+        for section_id in review.repair_section_ids
+        if section_id in allowed_sections
+    ]
+    if not unknown and not unknown_sections:
+        return review
+    return review.model_copy(
+        update={
+            "unknown_atom_ids": _dedupe_text(
+                [*review.unknown_atom_ids, *unknown]
+            ),
+            "non_repairable_findings": _dedupe_text(
+                [
+                    *review.non_repairable_findings,
+                    *(f"unknown depth atom: {atom_id}" for atom_id in unknown),
+                    *(
+                        f"unknown depth section: {section_id}"
+                        for section_id in unknown_sections
+                    ),
+                ]
+            ),
+            "repair_section_ids": valid_repair_sections,
+            "unknown_section_ids": _dedupe_text(
+                [*review.unknown_section_ids, *unknown_sections]
+            ),
+        }
+    )
+
+
 def _compact_catalog(
     catalog: list[dict[str, Any]],
     *,
@@ -1780,15 +2503,11 @@ def _normalize_section(
 
     source_order = {atom_id: index for index, atom_id in enumerate(atom_by_id)}
     included = sorted(
-        dict.fromkeys(draft.included_atom_ids),
+        dict.fromkeys(
+            [*draft.included_atom_ids, *outline_section.atom_ids]
+        ),
         key=lambda atom_id: source_order[atom_id],
     )
-    if not included:
-        included = [
-            atom_id
-            for atom_id in outline_section.atom_ids
-            if atom_id in atom_by_id
-        ]
     return draft.model_copy(
         update={
             "section_id": outline_section.section_id,
@@ -2041,6 +2760,10 @@ def _repair_payload(
     relevant_segments: set[int],
     *,
     compact_content: bool,
+    outline: TeachingOutline | None = None,
+    section_drafts: tuple[SectionDraft, ...] = (),
+    depth_review: DepthReview | None = None,
+    repair_section_ids: list[str] | None = None,
 ) -> dict[str, Any]:
     relevant_ids = {
         atom_id
@@ -2069,6 +2792,14 @@ def _repair_payload(
             mode="json",
             by_alias=True,
         ),
+        "outline": outline.model_dump(mode="json") if outline else None,
+        "section_drafts": [
+            section.model_dump(mode="json") for section in section_drafts
+        ],
+        "depth_review": (
+            depth_review.model_dump(mode="json") if depth_review else None
+        ),
+        "repair_section_ids": list(repair_section_ids or []),
         "input_truncated": False,
     }
 
@@ -2337,6 +3068,7 @@ def _provider_request_budget(
         "synthesize": (1_024, 1.5),
         "section": (1_024, 1.5),
         "review": (768, 0.75),
+        "depth_review": (1_024, 1.0),
         "repair": (2_048, 1.5),
     }[stage]
     reserved_output_tokens = max(
@@ -2835,6 +3567,103 @@ def _repair_slice(
         _subset_extraction(extraction, relevant_ids, relevant_segments),
         relevant_segments,
     )
+
+
+def _depth_repair_slice(
+    extraction: ExtractionResult,
+    sections: tuple[SectionDraft, ...],
+    depth_review: DepthReview,
+    *,
+    outline: TeachingOutline | None = None,
+) -> tuple[ExtractionResult, set[int]]:
+    flagged = set(depth_review.repair_section_ids)
+    atom_ids = {
+        atom_id
+        for section in sections
+        if section.section_id in flagged
+        for atom_id in section.included_atom_ids
+    }
+    if outline is not None:
+        atom_ids.update(
+            atom_id
+            for section in outline.sections
+            if section.section_id in flagged
+            for atom_id in section.atom_ids
+        )
+    atom_ids.update(depth_review.abstracted_atom_ids)
+    atom_ids.update(depth_review.example_without_result_atom_ids)
+    atom_ids.update(depth_review.condition_without_scope_atom_ids)
+    atom_ids.update(depth_review.reordered_step_atom_ids)
+    atom_ids.update(depth_review.lost_literal_atom_ids)
+    atom_ids.update(
+        atom_id
+        for atom_id in depth_review.lost_warning_or_promotion_atom_ids
+        if atom_id
+    )
+    atom_by_id = {atom.id: atom for atom in extraction.atoms}
+    uncertainty_markers = set(depth_review.lost_uncertainty_markers)
+    atom_ids.update(
+        atom.id
+        for atom in extraction.atoms
+        if uncertainty_markers.intersection(atom.asr_uncertainty)
+    )
+    atom_ids = {atom_id for atom_id in atom_ids if atom_id in atom_by_id}
+    relevant_segments = {
+        atom_by_id[atom_id].source_segment
+        for atom_id in atom_ids
+    }
+    for atom_id in tuple(atom_ids):
+        relevant_segments.update(
+            relation.source_segment
+            for relation in atom_by_id.values()
+            if relation.id in atom_by_id[atom_id].relations
+        )
+    return _subset_extraction(extraction, atom_ids, relevant_segments), relevant_segments
+
+
+def _coverage_repair_section_ids(
+    outline: TeachingOutline,
+    sections: tuple[SectionDraft, ...],
+    repair_extraction: ExtractionResult,
+    relevant_segments: set[int],
+) -> list[str]:
+    """Return the teaching sections authorized by a coverage-only repair."""
+
+    repair_atom_ids = {atom.id for atom in repair_extraction.atoms}
+    repair_section_ids: list[str] = []
+    for section in sections:
+        if set(section.included_atom_ids) & repair_atom_ids:
+            repair_section_ids.append(section.section_id)
+            continue
+        outline_section = next(
+            (
+                candidate
+                for candidate in outline.sections
+                if candidate.section_id == section.section_id
+            ),
+            None,
+        )
+        if outline_section is None:
+            continue
+        if set(outline_section.atom_ids) & repair_atom_ids:
+            repair_section_ids.append(section.section_id)
+            continue
+        if any(
+            atom.source_segment in relevant_segments
+            for atom in repair_extraction.atoms
+            if atom.id in outline_section.atom_ids
+        ):
+            repair_section_ids.append(section.section_id)
+    if repair_section_ids:
+        return list(dict.fromkeys(repair_section_ids))
+    # A source omission may introduce a brand-new atom, so no existing draft
+    # can identify its eventual section. Keep the bounded repair target at the
+    # evidence-limits chapter rather than authorizing every chapter.
+    return [
+        section.section_id
+        for section in outline.sections
+        if section.section_id == "evidence_limits"
+    ]
 
 
 def _merge_repair_extraction_patch(

@@ -171,6 +171,27 @@ def test_unknown_references_and_unsupported_claims_are_reported() -> None:
     assert result.non_repairable_findings
 
 
+def test_unsupported_claim_is_nonrepairable_even_when_section_is_flagged() -> None:
+    atoms, outline, sections = _fixture()
+    review = DepthReview(
+        abstracted_atom_ids=[],
+        example_without_result_atom_ids=[],
+        condition_without_scope_atom_ids=[],
+        reordered_step_atom_ids=[],
+        lost_literal_atom_ids=[],
+        lost_warning_or_promotion_atom_ids=[],
+        lost_uncertainty_markers=[],
+        unsupported_claims=["unsupported"],
+        repair_section_ids=["methods_steps"],
+        input_sufficient=True,
+    )
+
+    result = DepthValidator().validate(atoms, outline, sections, review=review)
+
+    assert result.repair_section_ids == ["methods_steps"]
+    assert result.non_repairable_findings
+
+
 def test_lost_literal_and_reordered_steps_are_reported() -> None:
     atoms, outline, sections = _fixture()
     sections[0].content = "Step two. Step one. Claim. Example result. Condition scope."

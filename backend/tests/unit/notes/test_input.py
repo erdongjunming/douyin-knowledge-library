@@ -70,6 +70,29 @@ def test_load_preserves_complete_transcript_segments_metadata_and_assets(
     assert all(path.read_bytes() == content for path, content in before.items())
 
 
+def test_load_reuses_existing_note_budget_for_input_sufficiency(tmp_path: Path) -> None:
+    layout = StorageLayout(tmp_path / "library")
+    _seed_source(layout, "731-budget", "完整正文。")
+    layout.transcript_segments_path("731-budget").write_text(
+        json.dumps([{"start": 0, "end": 1, "text": "完整正文。"}], ensure_ascii=False),
+        encoding="utf-8",
+    )
+    layout.metadata_path("731-budget").write_text("{}", encoding="utf-8")
+    layout.note_dir("731-budget").mkdir(parents=True, exist_ok=True)
+    budget = {
+        "schema": "douyin-note-budget-v2",
+        "visual_dependency": {"risk": "high"},
+    }
+    (layout.note_dir("731-budget") / "note_budget.json").write_text(
+        json.dumps(budget, ensure_ascii=False),
+        encoding="utf-8",
+    )
+
+    note_input = NoteInputLoader(layout).load("731-budget")
+
+    assert note_input.note_budget == budget
+
+
 def test_invalid_segments_fall_back_to_one_complete_synthetic_segment(
     tmp_path: Path,
 ) -> None:

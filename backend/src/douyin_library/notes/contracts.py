@@ -157,6 +157,9 @@ class RepairResult(BaseModel):
 
     extraction_patch: ExtractionResult
     synthesis_patch: SynthesisResult
+    outline: TeachingOutline | None = None
+    section_drafts: list[SectionDraft] = Field(default_factory=list)
+    depth_review: DepthReview | None = None
 
 
 class DraftClaim(BaseModel):

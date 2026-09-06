@@ -40,6 +40,7 @@ class NoteInput:
     transcript_variant: str = "raw"
     transcript_source_kind: str = "asr"
     cleaning_fallback: str | None = None
+    note_budget: dict[str, Any] | None = None
 
 
 class NoteInputLoader:
@@ -87,6 +88,7 @@ class NoteInputLoader:
             source_url = f"https://www.douyin.com/video/{aweme_id}"
         source_files = self._source_files(aweme_id)
         asset_records = {key: _asset_record(Path(path)) for key, path in source_files.items()}
+        note_budget = self._load_note_budget(aweme_id)
         return NoteInput(
             aweme_id=aweme_id,
             transcript=transcript,
@@ -104,6 +106,7 @@ class NoteInputLoader:
             transcript_variant=transcript_variant,
             transcript_source_kind=transcript_source_kind,
             cleaning_fallback=cleaning_fallback,
+            note_budget=note_budget,
         )
 
     _cleaning_fallback: str | None = None
@@ -273,7 +276,20 @@ class NoteInputLoader:
             "transcript_cleaned_json": str(
                 self.layout.transcript_cleaned_json_path(aweme_id).resolve()
             ),
+            "note_budget": str(
+                (self.layout.note_dir(aweme_id) / "note_budget.json").resolve()
+            ),
         }
+
+    def _load_note_budget(self, aweme_id: str) -> dict[str, Any] | None:
+        path = self.layout.note_dir(aweme_id) / "note_budget.json"
+        if not path.is_file():
+            return None
+        try:
+            value = json.loads(path.read_text(encoding="utf-8-sig"))
+        except (OSError, UnicodeError, json.JSONDecodeError, TypeError):
+            return None
+        return value if isinstance(value, dict) else None
 
 
 def _parse_segments(value: Any) -> list[InputSegment] | None:
