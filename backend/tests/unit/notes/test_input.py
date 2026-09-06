@@ -112,3 +112,76 @@ def test_non_finite_probe_duration_is_ignored_without_breaking_load(tmp_path: Pa
     note_input = NoteInputLoader(layout).load("733")
 
     assert note_input.duration_ms is None
+
+
+def test_semantic_internal_space_mismatch_uses_complete_synthetic_transcript(
+    tmp_path: Path,
+) -> None:
+    layout = StorageLayout(tmp_path / "library")
+    transcript = "The speaker is not able to continue."
+    _seed_source(layout, "734", transcript)
+    layout.transcript_segments_path("734").write_text(
+        json.dumps(
+            [{"start": 0, "end": 1, "text": "The speaker is notable to continue."}]
+        ),
+        encoding="utf-8",
+    )
+
+    note_input = NoteInputLoader(layout).load("734")
+
+    assert note_input.segments == [
+        note_input.segments[0].__class__(
+            index=0,
+            start=None,
+            end=None,
+            text=transcript,
+        )
+    ]
+    assert any("synthetic segment" in warning for warning in note_input.warnings)
+
+
+def test_segment_comparison_allows_bom_outer_whitespace_and_line_endings(
+    tmp_path: Path,
+) -> None:
+    layout = StorageLayout(tmp_path / "library")
+    _seed_source(layout, "735", "First line\nSecond line")
+    layout.transcript_segments_path("735").write_text(
+        json.dumps(
+            [{"start": 0, "end": 1, "text": "\ufeff  First line\r\nSecond line  "}]
+        ),
+        encoding="utf-8",
+    )
+
+    note_input = NoteInputLoader(layout).load("735")
+
+    assert note_input.segments[0].start == 0.0
+    assert note_input.segments[0].text.endswith("  ")
+    assert not any("synthetic segment" in warning for warning in note_input.warnings)
+
+
+def test_segment_comparison_allows_whitespace_inserted_at_segment_boundaries(
+    tmp_path: Path,
+) -> None:
+    layout = StorageLayout(tmp_path / "library")
+    transcript = "第一段内容。\n第二段内容。\n第三段内容。"
+    _seed_source(layout, "736", transcript)
+    layout.transcript_segments_path("736").write_text(
+        json.dumps(
+            [
+                {"start": 0, "end": 1, "text": "第一段内容。"},
+                {"start": 1, "end": 2, "text": "第二段内容。"},
+                {"start": 2, "end": 3, "text": "第三段内容。"},
+            ],
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+
+    note_input = NoteInputLoader(layout).load("736")
+
+    assert [segment.text for segment in note_input.segments] == [
+        "第一段内容。",
+        "第二段内容。",
+        "第三段内容。",
+    ]
+    assert not any("synthetic segment" in warning for warning in note_input.warnings)
