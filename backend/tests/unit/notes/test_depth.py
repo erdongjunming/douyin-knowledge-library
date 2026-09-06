@@ -56,7 +56,9 @@ def _fixture():
             title="Method",
             content=(
                 "Claim. Step one. Step two. Example result. Condition scope. "
-                "Warning. promo 听不清 Excerpt warning Excerpt promo"
+                "Warning. promo 听不清 Excerpt claim Excerpt step-1 Excerpt step-2 "
+                "Excerpt example Excerpt condition Excerpt warning Excerpt promo "
+                "Excerpt uncertain"
             ),
             claims=[_claim("claim", "Claim")],
             steps=[_claim("step-1", "Step one"), _claim("step-2", "Step two")],
@@ -121,7 +123,9 @@ def test_unknown_references_and_unsupported_claims_are_reported() -> None:
     result = DepthValidator().validate(atoms, outline, sections, review=review)
 
     assert result.unsupported_claims == ["unsupported"]
-    assert result.repair_section_ids == ["methods_steps"]
+    assert result.repair_section_ids == []
+    assert result.unknown_atom_ids == ["unknown"]
+    assert result.non_repairable_findings
 
 
 def test_lost_literal_and_reordered_steps_are_reported() -> None:

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Annotated, Literal
+from typing import Annotated, Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, StringConstraints
 
@@ -239,6 +239,10 @@ class CoverageReport(BaseModel):
     semantic_generator: NonEmptyString
     quality_gate: QualityGate
     repairable: bool
+    depth_passed: bool = False
+    input_sufficient: bool = False
+    depth_review: dict[str, Any] | None = None
+    semantic_complete: bool = False
 
 
 class TeachingOutlineSection(BaseModel):
@@ -301,6 +305,9 @@ class DepthReview(BaseModel):
     unsupported_claims: list[NonEmptyString]
     repair_section_ids: list[TeachingSectionId]
     input_sufficient: bool
+    unknown_atom_ids: list[NonEmptyString] = Field(default_factory=list)
+    unknown_section_ids: list[NonEmptyString] = Field(default_factory=list)
+    non_repairable_findings: list[NonEmptyString] = Field(default_factory=list)
 
 
 __all__ = [

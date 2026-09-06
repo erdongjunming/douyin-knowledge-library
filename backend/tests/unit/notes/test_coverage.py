@@ -77,11 +77,7 @@ def _synthesis(
                 TimelineEntry(
                     segment_index=disposition.segment_index,
                     disposition=disposition.disposition,
-                    atom_ids=[
-                        atom_id
-                        for atom_id in disposition.atom_ids
-                        if atom_id in included
-                    ],
+                    atom_ids=[atom_id for atom_id in disposition.atom_ids if atom_id in included],
                     content=f"Segment {disposition.segment_index}",
                 )
                 for disposition in extraction.dispositions

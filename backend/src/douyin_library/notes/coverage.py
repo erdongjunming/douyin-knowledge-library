@@ -188,6 +188,9 @@ class CoverageValidator:
                 depth_review.lost_uncertainty_markers,
                 depth_review.unsupported_claims,
                 depth_review.repair_section_ids,
+                depth_review.unknown_atom_ids,
+                depth_review.unknown_section_ids,
+                depth_review.non_repairable_findings,
             )
         )
         semantic_complete = bool(depth_passed and passed and input_sufficient)
@@ -218,14 +221,10 @@ class CoverageValidator:
             repairable=not passed and not foundational_error and repair_issue,
             depth_passed=depth_passed,
             input_sufficient=input_sufficient,
-            depth_review=depth_review,
+            depth_review=(depth_review.model_dump(mode="json") if depth_review else None),
             semantic_complete=semantic_complete,
         )
-        # Keep callers compatible with a pre-Task1A contract during rolling upgrades.
-        supported = getattr(CoverageReport, "model_fields", {})
-        return CoverageReport(
-            **{key: value for key, value in report_values.items() if key in supported}
-        )
+        return CoverageReport(**report_values)
 
     @staticmethod
     def _disposition_references_are_valid(
