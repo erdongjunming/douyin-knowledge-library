@@ -266,8 +266,8 @@ class SectionClaim(BaseModel):
     model_config = _STRICT_MODEL_CONFIG
 
     text: NonEmptyString
-    atom_ids: list[NonEmptyString]
-    timestamps: list[NonNegativeFloat]
+    atom_ids: list[NonEmptyString] = Field(min_length=1)
+    timestamps: list[NonNegativeFloat] = Field(min_length=1)
 
 
 class SectionDraft(BaseModel):

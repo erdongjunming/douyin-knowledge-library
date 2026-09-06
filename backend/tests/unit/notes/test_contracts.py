@@ -602,6 +602,19 @@ def test_section_claim_requires_atom_ids_and_timestamps(payload: dict[str, objec
         SectionClaim.model_validate(payload)
 
 
+@pytest.mark.parametrize("field", ["atom_ids", "timestamps"])
+def test_section_claim_rejects_empty_atom_ids_and_timestamps(field: str) -> None:
+    payload = {
+        "text": "Claim",
+        "atom_ids": ["A-0001"],
+        "timestamps": [0.0],
+    }
+    payload[field] = []
+
+    with pytest.raises(ValidationError):
+        SectionClaim.model_validate(payload)
+
+
 def test_teaching_contracts_reject_extra_fields() -> None:
     for instance in (_teaching_outline(), _section_draft()):
         payload = instance.model_dump()
