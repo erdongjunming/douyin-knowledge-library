@@ -42,6 +42,30 @@ DraftClaimField = Literal[
     "tags",
 ]
 QualityGate = Literal["passed", "failed", "fallback"]
+TeachingSectionId = Literal[
+    "overview",
+    "core_points",
+    "methods_steps",
+    "examples_results",
+    "boundaries_risks",
+    "actions",
+    "timeline",
+    "evidence_limits",
+]
+EvidenceRequirement = Literal[
+    "claim",
+    "reason",
+    "step",
+    "example",
+    "result",
+    "condition",
+    "risk",
+    "number",
+    "named_entity",
+    "uncertainty",
+    "promotion",
+    "action",
+]
 NonNegativeInt = Annotated[int, Field(ge=0)]
 NonNegativeFloat = Annotated[float, Field(ge=0)]
 NonEmptyString = Annotated[
@@ -217,10 +241,73 @@ class CoverageReport(BaseModel):
     repairable: bool
 
 
+class TeachingOutlineSection(BaseModel):
+    model_config = _STRICT_MODEL_CONFIG
+
+    section_id: TeachingSectionId
+    title: NonEmptyString
+    order: int = Field(ge=1)
+    atom_ids: list[NonEmptyString]
+    required_evidence_types: list[EvidenceRequirement]
+    missing_evidence_policy: Literal["视频未提供这一类信息。"]
+    timestamps: list[NonNegativeFloat] = Field(default_factory=list)
+
+
+class TeachingOutline(BaseModel):
+    model_config = _STRICT_MODEL_CONFIG
+
+    sections: list[TeachingOutlineSection]
+    included_atom_ids: list[NonEmptyString]
+    unassigned_atom_ids: list[NonEmptyString] = Field(default_factory=list)
+    input_sufficient: bool = True
+
+
+class SectionClaim(BaseModel):
+    model_config = _STRICT_MODEL_CONFIG
+
+    text: NonEmptyString
+    atom_ids: list[NonEmptyString]
+    timestamps: list[NonNegativeFloat]
+
+
+class SectionDraft(BaseModel):
+    model_config = _STRICT_MODEL_CONFIG
+
+    section_id: TeachingSectionId
+    title: NonEmptyString
+    content: NonEmptyString
+    claims: list[SectionClaim] = Field(default_factory=list)
+    steps: list[SectionClaim] = Field(default_factory=list)
+    examples: list[SectionClaim] = Field(default_factory=list)
+    results: list[SectionClaim] = Field(default_factory=list)
+    conditions: list[SectionClaim] = Field(default_factory=list)
+    risks: list[SectionClaim] = Field(default_factory=list)
+    actions: list[SectionClaim] = Field(default_factory=list)
+    included_atom_ids: list[NonEmptyString]
+    unprovided_items: list[NonEmptyString] = Field(default_factory=list)
+    generated_interpretations: list[NonEmptyString] = Field(default_factory=list)
+
+
+class DepthReview(BaseModel):
+    model_config = _STRICT_MODEL_CONFIG
+
+    abstracted_atom_ids: list[NonEmptyString]
+    example_without_result_atom_ids: list[NonEmptyString]
+    condition_without_scope_atom_ids: list[NonEmptyString]
+    reordered_step_atom_ids: list[NonEmptyString]
+    lost_literal_atom_ids: list[NonEmptyString]
+    lost_warning_or_promotion_atom_ids: list[NonEmptyString]
+    lost_uncertainty_markers: list[NonEmptyString]
+    unsupported_claims: list[NonEmptyString]
+    repair_section_ids: list[TeachingSectionId]
+    input_sufficient: bool
+
+
 __all__ = [
     "AtomKind",
     "CoverageReport",
     "CoverageReview",
+    "DepthReview",
     "DispositionKind",
     "DraftClaim",
     "DraftClaimField",
@@ -231,8 +318,14 @@ __all__ = [
     "QualityGate",
     "RepairResult",
     "SegmentDisposition",
+    "SectionClaim",
+    "SectionDraft",
     "SourceOmissionCandidate",
     "SynthesisResult",
+    "TeachingOutline",
+    "TeachingOutlineSection",
+    "TeachingSectionId",
+    "EvidenceRequirement",
     "ThemeSection",
     "TimelineEntry",
 ]

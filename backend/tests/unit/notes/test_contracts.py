@@ -5,15 +5,21 @@ import json
 import pytest
 from pydantic import ValidationError
 
+from douyin_library.notes import contracts
 from douyin_library.notes.contracts import (
     CoverageReport,
     CoverageReview,
+    DepthReview,
     EvidenceAtom,
     ExtractionResult,
     ProviderUsage,
+    SectionClaim,
+    SectionDraft,
     SegmentDisposition,
     SourceOmissionCandidate,
     SynthesisResult,
+    TeachingOutline,
+    TeachingOutlineSection,
     ThemeSection,
     TimelineEntry,
 )
@@ -345,6 +351,31 @@ def test_provider_json_rejects_string_source_segment() -> None:
         EvidenceAtom.model_validate_json(json.dumps(payload))
 
 
+def test_repair_result_strictly_contains_extraction_and_synthesis_patches() -> None:
+    model_type = getattr(contracts, "RepairResult", None)
+    assert model_type is not None
+    payload = {
+        "extraction_patch": {
+            "atoms": [_atom().model_dump(mode="json")],
+            "dispositions": [
+                SegmentDisposition(
+                    segment_index=0,
+                    disposition="included",
+                    atom_ids=["A-0001"],
+                ).model_dump(mode="json")
+            ],
+        },
+        "synthesis_patch": _synthesis().model_dump(mode="json"),
+    }
+
+    repair = model_type.model_validate(payload, strict=True)
+
+    assert repair.extraction_patch.atoms[0].source_excerpt == "source excerpt"
+    assert repair.synthesis_patch.included_atom_ids == ["A-0001"]
+    with pytest.raises(ValidationError):
+        model_type.model_validate({**payload, "unexpected": True}, strict=True)
+
+
 @pytest.mark.parametrize("field", ["id", "topic", "statement", "source_excerpt"])
 def test_atom_required_text_rejects_whitespace(field: str) -> None:
     payload = _atom().model_dump(mode="json")
@@ -495,3 +526,105 @@ def test_nonempty_strings_are_stripped_during_json_validation() -> None:
     assert atom.id == "A-0001"
     assert atom.topic == "topic"
     assert atom.relations == ["A-parent"]
+
+
+def _teaching_outline() -> TeachingOutline:
+    return TeachingOutline(
+        sections=[
+            TeachingOutlineSection(
+                section_id="overview",
+                title="Overview",
+                order=1,
+                atom_ids=["A-0001"],
+                required_evidence_types=["claim"],
+                missing_evidence_policy="视频未提供这一类信息。",
+                timestamps=[0.0],
+            )
+        ],
+        included_atom_ids=["A-0001"],
+    )
+
+
+def _section_draft() -> SectionDraft:
+    claim = SectionClaim(
+        text="A supported claim.", atom_ids=["A-0001"], timestamps=[0.0]
+    )
+    return SectionDraft(
+        section_id="overview",
+        title="Overview",
+        content="A concise overview.",
+        claims=[claim],
+        included_atom_ids=["A-0001"],
+    )
+
+
+def test_teaching_contracts_round_trip_valid_json() -> None:
+    instances = [
+        _teaching_outline(),
+        SectionClaim(text="Claim", atom_ids=["A-0001"], timestamps=[0.0]),
+        _section_draft(),
+        DepthReview(
+            abstracted_atom_ids=[],
+            example_without_result_atom_ids=[],
+            condition_without_scope_atom_ids=[],
+            reordered_step_atom_ids=[],
+            lost_literal_atom_ids=[],
+            lost_warning_or_promotion_atom_ids=[],
+            lost_uncertainty_markers=[],
+            unsupported_claims=[],
+            repair_section_ids=[],
+            input_sufficient=True,
+        ),
+    ]
+
+    for instance in instances:
+        assert type(instance).model_validate_json(instance.model_dump_json()) == instance
+
+
+def test_teaching_outline_rejects_unknown_section_id() -> None:
+    payload = _teaching_outline().model_dump(mode="json")
+    payload["sections"][0]["section_id"] = "unknown"
+
+    with pytest.raises(ValidationError):
+        TeachingOutline.model_validate(payload)
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"text": "Claim", "timestamps": [0.0]},
+        {"text": "Claim", "atom_ids": ["A-0001"]},
+    ],
+    ids=["missing-atom-ids", "missing-timestamps"],
+)
+def test_section_claim_requires_atom_ids_and_timestamps(payload: dict[str, object]) -> None:
+    with pytest.raises(ValidationError):
+        SectionClaim.model_validate(payload)
+
+
+def test_teaching_contracts_reject_extra_fields() -> None:
+    for instance in (_teaching_outline(), _section_draft()):
+        payload = instance.model_dump()
+        payload["unexpected"] = True
+        with pytest.raises(ValidationError):
+            type(instance).model_validate(payload)
+
+
+def test_depth_review_has_strict_fields() -> None:
+    review = DepthReview(
+        abstracted_atom_ids=["A-0001"],
+        example_without_result_atom_ids=[],
+        condition_without_scope_atom_ids=[],
+        reordered_step_atom_ids=[],
+        lost_literal_atom_ids=[],
+        lost_warning_or_promotion_atom_ids=[],
+        lost_uncertainty_markers=["uncertain wording"],
+        unsupported_claims=["unsupported"],
+        repair_section_ids=["overview"],
+        input_sufficient=True,
+    )
+    payload = review.model_dump()
+    payload["unexpected"] = True
+
+    with pytest.raises(ValidationError):
+        DepthReview.model_validate(payload)
