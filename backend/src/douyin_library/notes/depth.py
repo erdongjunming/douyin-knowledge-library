@@ -45,9 +45,13 @@ class DepthValidator:
         unknown_sections: list[str] = []
         non_repairable: list[str] = []
 
-        for atom_id in outline_ids:
+        for atom_id in outline.included_atom_ids:
             if atom_id not in atom_by_id:
                 unknown_atoms.append(atom_id)
+        for outline_section in outline.sections:
+            for atom_id in outline_section.atom_ids:
+                if atom_id not in atom_by_id:
+                    unknown_atoms.append(atom_id)
         for section in sections:
             if section.section_id not in outline_by_id:
                 unknown_sections.append(section.section_id)
@@ -79,9 +83,8 @@ class DepthValidator:
                 continue
             unprovided = set(section.unprovided_items)
             searchable = body[section_id]
-            for atom_id in atom_ids:
-                atom = atom_by_id.get(atom_id)
-                if atom is None:
+            for atom in atoms:
+                if atom.id not in atom_ids:
                     continue
                 if (
                     atom.statement not in searchable

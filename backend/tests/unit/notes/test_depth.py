@@ -134,6 +134,18 @@ def test_outline_section_atom_outside_included_is_nonrepairable() -> None:
     assert review.non_repairable_findings
 
 
+def test_depth_review_serialization_is_stable_across_repeated_runs() -> None:
+    atoms, outline, sections = _fixture()
+    outline.included_atom_ids.append("unknown-b")
+    outline.included_atom_ids.append("unknown-a")
+    sections[0].included_atom_ids.extend(["unknown-b", "unknown-a"])
+    validator = DepthValidator()
+
+    serialized = [validator.validate(atoms, outline, sections).model_dump_json() for _ in range(5)]
+
+    assert len(set(serialized)) == 1
+
+
 def test_unknown_references_and_unsupported_claims_are_reported() -> None:
     atoms, outline, sections = _fixture()
     outline.included_atom_ids.append("unknown")
