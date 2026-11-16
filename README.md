@@ -5,6 +5,76 @@ metadata, transcribing speech, and turning the transcript into evidence-linked l
 notes. Runtime data defaults to `D:\DouyinKnowledgeLibrary`; the application does not
 silently move the library to the system drive.
 
+## Prerequisites
+
+### Backend (Python >= 3.12)
+
+```powershell
+cd backend
+uv venv          # or: python -m venv .venv
+uv pip install -e .   # pulls fastapi, sqlalchemy, alembic, keyring, ... plus the douyin-downloader submodule
+```
+
+`douyin-downloader` is vendored as the git submodule `upstream/jiji` (editable
+path dependency). After a fresh clone run `git submodule update --init`, then
+`uv sync` (or `uv pip install -e .`) from `backend`. Dev tooling:
+`uv sync --group dev` (pytest, ruff).
+
+**ffmpeg / ffprobe** are required for audio handling. Resolution order:
+`DKL_FFMPEG_PATH` / `DKL_FFPROBE_PATH`, then system `PATH`, then
+`D:\DouyinKnowledgeLibrary\tools\ffmpeg\*\bin\`.
+
+### Frontend (Node.js, Vite 7 + React 19)
+
+```powershell
+cd frontend
+npm install
+npm run dev     # vite on 127.0.0.1:5175
+```
+
+### Local models
+
+- **Ollama** with `qwen3:4b` installed (`ollama pull qwen3:4b`). Never
+  auto-installed or auto-pulled; the launcher only waits for it.
+- **Qwen3-ASR-0.6B** for transcription. The ASR worker spawns
+  `scripts/qwen_asr_server.py` with a dedicated Python environment pointed at
+  by `DKL_QWEN_PYTHON_PATH`. That environment needs the `qwen-asr` package and
+  the model weights cached locally — see Known issues below for the
+  `HF_ENDPOINT` requirement.
+
+### Optional
+
+- **Douyin cookie** (only for creator-scoped collection): stored in the
+  Windows keyring via the UI, Settings → 账号凭据. Validated against Douyin
+  before saving. Use a throwaway account, not your business one.
+- **External note provider**: set `DKL_NOTE_PROVIDER_POLICY=external` plus
+  base URL / model / API key (see Configuration).
+
+## Configuration
+
+All settings are environment variables with the `DKL_` prefix (case-insensitive
+snake_case → UPPER_CASE). The commonly used ones:
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `DKL_STORAGE_ROOT` | `D:\DouyinKnowledgeLibrary` | Runtime data root (audio, transcripts, notes, DB) |
+| `DKL_NOTE_OLLAMA_MODEL` | `qwen3:4b` | Local note model; overriding does not trigger a download |
+| `DKL_NOTE_PROVIDER_POLICY` | `auto` | `auto` / `local` / `external` / `rule` |
+| `DKL_NOTE_EXTERNAL_BASE_URL` / `_MODEL` / `_API_KEY` | unset | External provider; keys are never written to logs or notes |
+| `DKL_TRANSCRIPTION_RUNTIME` | `resident` | `resident` (shared Qwen server) or `subprocess` (one process per job) |
+| `DKL_QWEN_PYTHON_PATH` | auto | Python env used to run the ASR server |
+| `DKL_QWEN_SERVER_SCRIPT_PATH` | `scripts\qwen_asr_server.py` | Reviewed copy of the ASR server script |
+| `DKL_QWEN_OFFLINE` | `true` | Offline model loading; jobs never download weights |
+| `DKL_TRANSCRIPTION_SUBTITLE_ENABLED` | `true` | Prefer retained subtitles over ASR |
+| `DKL_TRANSCRIPTION_CLEANING_ENABLED` | `false` | Optional qwen3:4b transcript cleaning pass |
+| `DKL_FFMPEG_PATH` / `DKL_FFPROBE_PATH` | unset | Explicit tool paths |
+| `DKL_EMBEDDED_WORKERS` | `false` | Run workers in-process (tests, small setups) |
+| `DKL_STOP_BACKEND_ON_EXIT` | `1` | `0` leaves the backend running when the launcher exits |
+
+The launcher (`scripts\dev.ps1`) imports provider configuration from Windows
+user environment variables via `scripts\local-runtime.ps1` without printing
+the API key.
+
 ## Start locally
 
 Double-click `start-local.cmd`, or run:
@@ -240,3 +310,41 @@ transcripts and are included only to demonstrate pipeline output quality;
 copyright of the original videos remains with their authors (links in each note
 header). `examples/notes/ai-context-engineering/legacy_v1.md` shows the same note
 as produced before the semantic pipeline upgrade, for before/after comparison.
+
+## Known issues and gotchas
+
+- **Network to github.com**: on mainland-China networks the github.com TLS
+  handshake is commonly reset (SNI blocking) while `api.github.com` works.
+  `git push`/`fetch` needs a working proxy — e.g.
+  `git config http.https://github.com.proxy http://127.0.0.1:7897` — or the
+  push fails with connection-closed errors. Browser access to github.com has
+  the same symptom.
+- **ASR model loading needs `HF_ENDPOINT=https://hf-mirror.com` on every
+  load**, not just the first. Without it the HuggingFace cache misses and the
+  load re-attempts huggingface.co and dies on the walled host. Persist it at
+  the user level (or pass `DKL_QWEN_OFFLINE=true` only after weights are fully
+  cached) and restart the ASR worker. A single successful load under an ad-hoc
+  environment does not prove the worker will see it.
+- **`qwen-asr` install side effects**: installing `qwen-asr` upgrades
+  `transformers` in that environment. If the same env is shared with other
+  pipelines (e.g. voice-generation stacks), pin `transformers` back first when
+  they break.
+- **GPU scheduling**: ASR transcription and local note inference share the
+  `gpu:0` lease and never run together. Batch note generation and transcription
+  should be staggered deliberately; running both at once just serializes on
+  the lease.
+- **No automatic retry for failed transcription jobs**: failed jobs sit until
+  resumed. Use `POST /api/jobs/bulk-resume {"job_ids": [...]}` for batches or
+  `POST /api/jobs/<id>/retry` for a single job. Note there is no
+  `GET /api/jobs/<id>` route — list jobs with `GET /api/jobs?limit=N`.
+- **Semantic chapter classifier is faithful but blunt**: 方法与步骤
+  (methods & steps) occasionally labels a video full of concrete methods as
+  "not provided". Cross-check that chapter against the full timeline before
+  trusting a coverage report.
+- **Windows long paths**: test leftovers under `backend/.pytest-tmp*` can
+  exceed MAX_PATH and make `git add` fail with "Filename too long". They are
+  gitignored; delete the directories if the index ever chokes.
+- **This repository intentionally contains no runtime data**: the local
+  library (`D:\DouyinKnowledgeLibrary`, tens of GB of audio/transcripts/notes)
+  is not version-controlled and not uploaded. Only code, docs and the five
+  curated note samples under `examples/notes/` are published.
