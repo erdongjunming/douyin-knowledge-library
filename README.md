@@ -44,9 +44,11 @@ npm run dev     # vite on 127.0.0.1:5175
 
 ### Optional
 
-- **Douyin cookie** (only for creator-scoped collection): stored in the
-  Windows keyring via the UI, Settings → 账号凭据. Validated against Douyin
-  before saving. Use a throwaway account, not your business one.
+- **Douyin cookie** (required for collection flows — favorites sync, downloads,
+  and creator-scoped collection all fail with `douyin_cookie_not_configured`
+  without it): stored in the Windows keyring via the UI, Settings → 账号凭据.
+  Validated against Douyin before saving. Use a throwaway account, not your
+  business one.
 - **External note provider**: set `DKL_NOTE_PROVIDER_POLICY=external` plus
   base URL / model / API key (see Configuration).
 
@@ -64,7 +66,7 @@ snake_case → UPPER_CASE). The commonly used ones:
 | `DKL_TRANSCRIPTION_RUNTIME` | `resident` | `resident` (shared Qwen server) or `subprocess` (one process per job) |
 | `DKL_QWEN_PYTHON_PATH` | auto | Python env used to run the ASR server |
 | `DKL_QWEN_SERVER_SCRIPT_PATH` | `scripts\qwen_asr_server.py` | Reviewed copy of the ASR server script |
-| `DKL_QWEN_OFFLINE` | `true` | Offline model loading; jobs never download weights |
+| `DKL_QWEN_OFFLINE` | `true` | Injects offline env vars in `resident` mode only; the `subprocess` path ignores it |
 | `DKL_TRANSCRIPTION_SUBTITLE_ENABLED` | `true` | Prefer retained subtitles over ASR |
 | `DKL_TRANSCRIPTION_CLEANING_ENABLED` | `false` | Optional qwen3:4b transcript cleaning pass |
 | `DKL_FFMPEG_PATH` / `DKL_FFPROBE_PATH` | unset | Explicit tool paths |
@@ -313,28 +315,32 @@ as produced before the semantic pipeline upgrade, for before/after comparison.
 
 ## Known issues and gotchas
 
-- **Network to github.com**: on mainland-China networks the github.com TLS
-  handshake is commonly reset (SNI blocking) while `api.github.com` works.
-  `git push`/`fetch` needs a working proxy — e.g.
-  `git config http.https://github.com.proxy http://127.0.0.1:7897` — or the
-  push fails with connection-closed errors. Browser access to github.com has
+- **Network to github.com**: observed on this project's home network — the
+  github.com TLS handshake is reset (consistent with SNI blocking) while
+  `api.github.com` works. `git push`/`fetch` needs a working proxy, e.g.
+  `git config http.https://github.com.proxy http://127.0.0.1:7897`, or the
+  push fails with connection-closed errors. Browser access to github.com shows
   the same symptom.
-- **ASR model loading needs `HF_ENDPOINT=https://hf-mirror.com` on every
-  load**, not just the first. Without it the HuggingFace cache misses and the
-  load re-attempts huggingface.co and dies on the walled host. Persist it at
-  the user level (or pass `DKL_QWEN_OFFLINE=true` only after weights are fully
-  cached) and restart the ASR worker. A single successful load under an ad-hoc
-  environment does not prove the worker will see it.
-- **`qwen-asr` install side effects**: installing `qwen-asr` upgrades
-  `transformers` in that environment. If the same env is shared with other
-  pipelines (e.g. voice-generation stacks), pin `transformers` back first when
-  they break.
+- **ASR model weights must be fully cached before the first job.** With
+  `DKL_QWEN_OFFLINE=true` (default) the resident runtime forces
+  `HF_HUB_OFFLINE=1`, so a cache miss cannot fall back to a download — and
+  setting `HF_ENDPOINT=https://hf-mirror.com` does not lift the offline
+  restriction. Use the mirror only for the explicit, network-enabled model
+  preparation step (load the model once with the mirror set), then keep
+  offline mode for jobs. A load that succeeds under an ad-hoc environment
+  does not prove the worker will see the same variables.
+- **`qwen-asr` install side effects**: installing `qwen-asr` has upgraded
+  `transformers` in that environment (observed once). If the same env is
+  shared with other pipelines (e.g. voice-generation stacks), pin
+  `transformers` back first when they break.
 - **GPU scheduling**: ASR transcription and local note inference share the
-  `gpu:0` lease and never run together. Batch note generation and transcription
-  should be staggered deliberately; running both at once just serializes on
-  the lease.
-- **No automatic retry for failed transcription jobs**: failed jobs sit until
-  resumed. Use `POST /api/jobs/bulk-resume {"job_ids": [...]}` for batches or
+  `gpu:0` lease and never run together (external note providers are not
+  subject to the lease). Batch note generation and transcription should be
+  staggered deliberately; running both at once just serializes on the lease.
+- **Limited automatic retry for transcription jobs**: a failed attempt is
+  retried once automatically after 60 s; a second failure lands the job in the
+  terminal `failed` state and it sits there until resumed. Use
+  `POST /api/jobs/bulk-resume {"job_ids": [...]}` for batches or
   `POST /api/jobs/<id>/retry` for a single job. Note there is no
   `GET /api/jobs/<id>` route — list jobs with `GET /api/jobs?limit=N`.
 - **Semantic chapter classifier is faithful but blunt**: 方法与步骤
