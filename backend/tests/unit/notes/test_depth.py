@@ -31,7 +31,8 @@ def _fixture():
         _atom("claim"),
         _atom("step-1", "step", sequence=1),
         _atom("step-2", "step", sequence=2),
-        _atom("example", "example", relations=["claim"]),
+        _atom("result"),
+        _atom("example", "example", relations=["result"]),
         _atom("condition", "condition", relations=["claim"]),
         _atom("warning", "warning", relations=["claim"]),
         _atom("promo", "promotion", is_promotional=True),
@@ -57,13 +58,13 @@ def _fixture():
             content=(
                 "Claim. Step one. Step two. Example result. Condition scope. "
                 "Warning. promo 听不清 Excerpt claim Excerpt step-1 Excerpt step-2 "
-                "Excerpt example Excerpt condition Excerpt warning Excerpt promo "
+                "Excerpt result Excerpt example Excerpt condition Excerpt warning Excerpt promo "
                 "Excerpt uncertain"
             ),
             claims=[_claim("claim", "Claim")],
             steps=[_claim("step-1", "Step one"), _claim("step-2", "Step two")],
             examples=[_claim("example", "Example")],
-            results=[_claim("example", "Result")],
+            results=[_claim("result", "Result")],
             conditions=[_claim("condition", "Condition")],
             risks=[_claim("warning", "Warning")],
             included_atom_ids=[atom.id for atom in atoms],
@@ -95,7 +96,7 @@ def test_missing_result_and_condition_scope_are_findings() -> None:
     atoms, outline, sections = _fixture()
     sections[0].results = []
     sections[0].conditions = [_claim("condition", "unrelated condition")]
-    atoms[4].relations = []
+    next(atom for atom in atoms if atom.id == "condition").relations = []
 
     review = DepthValidator().validate(atoms, outline, sections)
 
@@ -103,9 +104,20 @@ def test_missing_result_and_condition_scope_are_findings() -> None:
     assert review.condition_without_scope_atom_ids == ["condition"]
 
 
+def test_example_cannot_satisfy_its_own_result_requirement() -> None:
+    atoms, outline, sections = _fixture()
+    example = next(atom for atom in atoms if atom.id == "example")
+    example.relations = ["example"]
+    sections[0].results = [_claim("example", "Result")]
+
+    review = DepthValidator().validate(atoms, outline, sections)
+
+    assert review.example_without_result_atom_ids == ["example"]
+
+
 def test_risk_without_same_chapter_scope_is_a_finding() -> None:
     atoms, outline, sections = _fixture()
-    atoms[5].relations = []
+    next(atom for atom in atoms if atom.id == "warning").relations = []
     sections[0].risks = [_claim("warning", "Unscoped risk")]
 
     review = DepthValidator().validate(atoms, outline, sections)
@@ -115,7 +127,7 @@ def test_risk_without_same_chapter_scope_is_a_finding() -> None:
 
 def test_structured_example_requires_result_even_for_claim_atom() -> None:
     atoms, outline, sections = _fixture()
-    atoms[3].kind = "claim"
+    next(atom for atom in atoms if atom.id == "example").kind = "claim"
     sections[0].results = []
 
     review = DepthValidator().validate(atoms, outline, sections)

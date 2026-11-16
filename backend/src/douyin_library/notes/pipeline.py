@@ -5,10 +5,12 @@ import copy
 import inspect
 import json
 import math
+import re
 import time
 from collections import Counter
 from collections.abc import Mapping
 from dataclasses import dataclass, field
+from functools import cache, lru_cache
 from typing import Any, Protocol
 
 from pydantic import BaseModel
@@ -23,6 +25,7 @@ from douyin_library.notes.contracts import (
     ExtractionResult,
     ProviderUsage,
     RepairResult,
+    SectionClaim,
     SectionDraft,
     SynthesisResult,
     TeachingOutline,
@@ -34,12 +37,16 @@ from douyin_library.notes.coverage import CoverageValidator
 from douyin_library.notes.depth import DepthValidator
 from douyin_library.notes.input import InputSegment, NoteInput
 from douyin_library.notes.prompts import (
+    EXTRACT_RETRY_PROMPT_VERSION,
+    EXTRACT_RETRY_SYSTEM_PROMPT,
     PROMPT_VERSIONS,
+    REVIEW_RETRY_PROMPT_VERSION,
+    REVIEW_RETRY_SYSTEM_PROMPT,
     SYSTEM_PROMPTS,
     TEACHING_REPAIR_PROMPT_VERSION,
     TEACHING_REPAIR_SYSTEM_PROMPT,
 )
-from douyin_library.notes.providers.base import NoteProvider, NoteStage
+from douyin_library.notes.providers.base import NoteProvider, NoteProviderError, NoteStage
 
 
 @dataclass(frozen=True, slots=True)
@@ -74,6 +81,44 @@ class StageRecord:
     diagnostics: dict[str, Any]
     elapsed_ms: float
     batch_boundary: dict[str, int] | None
+
+
+@dataclass(frozen=True, slots=True)
+class RepairUnit:
+    """One inseparable teaching-repair request.
+
+    A unit owns whole teaching sections. Sections that share evidence, source
+    segments, or an atom relation stay together so one patch cannot overwrite
+    the context required by another patch.
+    """
+
+    section_ids: tuple[str, ...]
+    extraction: ExtractionResult
+    relevant_segments: frozenset[int]
+    section_drafts: tuple[SectionDraft, ...]
+    outline: TeachingOutline
+    depth_review: DepthReview | None
+
+
+class RepairUnitFailure(RuntimeError):
+    """A repair unit failed before the round could safely be committed."""
+
+    def __init__(self, failure: Mapping[str, Any]) -> None:
+        self.failure = copy.deepcopy(dict(failure))
+        super().__init__(str(self.failure.get("code", "repair_unit_failed")))
+
+
+@cache
+def _cached_model_json_schema(schema: type[BaseModel]) -> dict[str, Any]:
+    """Build each static provider schema once per process."""
+
+    return schema.model_json_schema()
+
+
+def _model_json_schema(schema: type[BaseModel]) -> dict[str, Any]:
+    """Return an isolated cached schema for provider and budget calls."""
+
+    return copy.deepcopy(_cached_model_json_schema(schema))
 
 
 def _empty_teaching_outline() -> TeachingOutline:
@@ -157,14 +202,17 @@ def build_segment_batches(
     current: list[InputSegment] = []
     current_chars = 0
     current_tokens = 0
+    source_segments = _positioned_source_segments(note_input) or note_input.segments
     expanded_segments = [
         InputSegment(
             index=segment.index,
             start=segment.start,
             end=segment.end,
             text=segment.text[offset : offset + char_limit],
+            segment_id=segment.segment_id,
+            source_offset=segment.source_offset + offset,
         )
-        for segment in note_input.segments
+        for segment in source_segments
         for offset in range(0, max(1, len(segment.text)), char_limit)
     ]
     for segment in expanded_segments:
@@ -181,6 +229,168 @@ def build_segment_batches(
     if current:
         batches.append(_batch(len(batches), current, current_chars, current_tokens))
     return batches
+
+
+def _positioned_source_segments(note_input: NoteInput) -> list[InputSegment] | None:
+    """Return raw segments with zero-based offsets proven against the transcript.
+
+    ASR segment files often omit only the whitespace separating neighboring
+    chunks.  A position is usable for provenance only when every segment can
+    be located in order and every omitted span is whitespace.  Callers that do
+    not require positional provenance may retain the original segments when
+    this proof is unavailable; fallback publication will fail closed later.
+    """
+
+    cursor = 0
+    positioned: list[InputSegment] = []
+    for segment in note_input.segments:
+        source_start = note_input.transcript.find(segment.text, cursor)
+        if source_start < 0 or note_input.transcript[cursor:source_start].strip():
+            return None
+        positioned.append(
+            InputSegment(
+                index=segment.index,
+                start=segment.start,
+                end=segment.end,
+                text=segment.text,
+                segment_id=segment.segment_id,
+                source_offset=source_start,
+            )
+        )
+        cursor = source_start + len(segment.text)
+    if note_input.transcript[cursor:].strip():
+        return None
+    return positioned
+
+
+def _fallback_source_review_batches(
+    note_input: NoteInput,
+    extraction: ExtractionResult,
+    context_tokens: int,
+    *,
+    input_fraction: float,
+) -> list[SegmentBatch] | None:
+    """Batch canonical fallback evidence without cutting or rewriting source."""
+
+    if not _is_source_preserving_fallback(extraction):
+        return None
+    source_material = _fallback_source_material(note_input)
+    if source_material is None:
+        return []
+    positioned_atoms = [atom for atom in extraction.atoms if atom.source_start is not None]
+    if len(positioned_atoms) != len(extraction.atoms):
+        return []
+    token_limit = max(1, math.floor(context_tokens * input_fraction))
+    segments: list[InputSegment] = []
+    assigned_atom_count = 0
+    for source_segment, source, fragment_offset in source_material:
+        source_start = source_segment.source_offset
+        source_end = source_start + len(source_segment.text)
+        source_atoms = sorted(
+            (
+                atom
+                for atom in positioned_atoms
+                if atom.source_segment == source_segment.index
+                and source_start <= (atom.source_start or 0)
+                and (atom.source_start or 0) + len(atom.source_excerpt) <= source_end
+            ),
+            key=lambda atom: (atom.source_start or 0, atom.id),
+        )
+        if not source_atoms:
+            return []
+        cursor = 0
+        segment_fragments: list[InputSegment] = []
+        for atom in source_atoms:
+            atom_start = (atom.source_start or 0) - fragment_offset
+            atom_end = atom_start + len(atom.source_excerpt)
+            if atom_start < cursor or source[atom_start:atom_end] != atom.source_excerpt:
+                return []
+            # Begin each fragment immediately after the prior atom.  This keeps
+            # inter-atom whitespace with the following atom and never removes
+            # it from the review source.
+            segment_fragments.append(
+                InputSegment(
+                    index=source_segment.index,
+                    start=source_segment.start,
+                    end=source_segment.end,
+                    text=source[cursor:atom_end],
+                    segment_id=source_segment.segment_id,
+                    source_offset=fragment_offset + cursor,
+                )
+            )
+            cursor = atom_end
+        assigned_atom_count += len(source_atoms)
+        if segment_fragments:
+            # Preserve trailing whitespace (or other source text) in the final
+            # atom-safe fragment instead of reconstructing input from excerpts.
+            final_fragment = segment_fragments[-1]
+            segment_fragments[-1] = InputSegment(
+                index=final_fragment.index,
+                start=final_fragment.start,
+                end=final_fragment.end,
+                text=final_fragment.text + source[cursor:],
+                segment_id=final_fragment.segment_id,
+                source_offset=final_fragment.source_offset,
+            )
+        segments.extend(segment_fragments)
+    if assigned_atom_count != len(positioned_atoms):
+        return []
+    batches: list[SegmentBatch] = []
+    current: list[InputSegment] = []
+    current_chars = 0
+    current_tokens = 0
+    for segment in segments:
+        segment_tokens = max(1, math.ceil(len(segment.text) / 1.5))
+        if current and current_tokens + segment_tokens > token_limit:
+            batches.append(_batch(len(batches), current, current_chars, current_tokens))
+            current = []
+            current_chars = 0
+            current_tokens = 0
+        current.append(segment)
+        current_chars += len(segment.text)
+        current_tokens += segment_tokens
+    if current:
+        batches.append(_batch(len(batches), current, current_chars, current_tokens))
+    return batches
+
+
+def _fallback_source_material(
+    note_input: NoteInput,
+) -> list[tuple[InputSegment, str, int]] | None:
+    """Map every canonical segment to its exact raw-transcript material.
+
+    ASR segment files may omit whitespace between adjacent chunks.  A fallback
+    source review must retain those raw characters while every coordinate stays
+    a zero-based absolute index into the original transcript.  If the ordered
+    mapping cannot be proven without skipping non-whitespace, leave publication
+    closed.
+    """
+
+    source_segments = _positioned_source_segments(note_input)
+    if not source_segments:
+        return None
+    cursor = 0
+    material: list[tuple[InputSegment, str, int]] = []
+    for source_segment in source_segments:
+        source_start = source_segment.source_offset
+        source_end = source_start + len(source_segment.text)
+        material.append(
+            (
+                source_segment,
+                note_input.transcript[cursor:source_end],
+                cursor,
+            )
+        )
+        cursor = source_end
+    if note_input.transcript[cursor:].strip() or not material:
+        return None
+    last_segment, last_text, last_offset = material[-1]
+    material[-1] = (
+        last_segment,
+        last_text + note_input.transcript[cursor:],
+        last_offset,
+    )
+    return material
 
 
 class SemanticNotePipeline:
@@ -203,7 +413,7 @@ class SemanticNotePipeline:
                 stage=stage,
                 system_prompt=SYSTEM_PROMPTS[stage],
                 payload=payload,
-                json_schema=schema.model_json_schema(),
+                json_schema=_model_json_schema(schema),
                 context_tokens=self.provider.context_tokens,
             )["within_budget"]
         )
@@ -216,6 +426,23 @@ class SemanticNotePipeline:
     ) -> SemanticGeneration:
         records: list[StageRecord] = []
         context_failures: list[dict[str, Any]] = []
+        if _positioned_source_segments(note_input) is None:
+            failure = {
+                "stage": "extract",
+                "code": "source_provenance_unverified",
+                "message": ("source segments do not losslessly cover the raw transcript"),
+            }
+            _remember_context_failure(context_failures, failure)
+            await _record_context_failure(failure, audit_sink, records)
+            return self._failed_generation(
+                note_input=note_input,
+                extraction=None,
+                synthesis=None,
+                review=None,
+                context_failures=context_failures,
+                records=records,
+                batches=[],
+            )
         pending_batches = build_segment_batches(
             note_input,
             self.provider.context_tokens,
@@ -223,11 +450,14 @@ class SemanticNotePipeline:
         )
         batches: list[SegmentBatch] = []
         extractions: list[tuple[SegmentBatch, ExtractionResult]] = []
+        source_fallback_mode = False
         while pending_batches:
             batch = _reindex_batch(pending_batches.pop(0), len(batches))
-            all_prior_atoms = (
-                _merge_extractions(extractions).atoms if extractions else []
-            )
+            if source_fallback_mode:
+                extractions.append((batch, _canonical_source_extraction(batch)))
+                batches.append(batch)
+                continue
+            all_prior_atoms = _merge_extractions(extractions).atoms if extractions else []
             prior_atoms, _ = _bounded_prior_context(
                 all_prior_atoms,
                 batch.estimated_tokens,
@@ -272,7 +502,7 @@ class SemanticNotePipeline:
                         stage="extract",
                         system_prompt=SYSTEM_PROMPTS["extract"],
                         payload=payload,
-                        json_schema=ExtractionResult.model_json_schema(),
+                        json_schema=_model_json_schema(ExtractionResult),
                         context_tokens=self.provider.context_tokens,
                     ),
                     batch_boundary=batch.boundary(),
@@ -286,9 +516,7 @@ class SemanticNotePipeline:
                 _remember_context_failure(context_failures, failure)
                 return self._failed_generation(
                     note_input=note_input,
-                    extraction=_merge_extractions(extractions)
-                    if extractions
-                    else None,
+                    extraction=_merge_extractions(extractions) if extractions else None,
                     synthesis=None,
                     review=None,
                     context_failures=context_failures,
@@ -296,23 +524,67 @@ class SemanticNotePipeline:
                     batches=batches,
                 )
             try:
-                result = await self._call(
-                    stage="extract",
-                    payload=payload,
-                    schema=ExtractionResult,
-                    cancel_event=cancel_event,
-                    audit_sink=audit_sink,
-                    records=records,
-                    batch_boundary=batch.boundary(),
+                result: ExtractionResult | None = None
+                validation_error: ValueError | None = None
+                extraction_attempts = (
+                    2 if getattr(self.provider, "supports_teaching_pipeline", False) else 1
                 )
+                for extraction_attempt in range(extraction_attempts):
+                    request_payload = dict(payload)
+                    if validation_error is not None:
+                        request_payload["validation_feedback"] = str(validation_error)
+                    result = await self._call(
+                        stage="extract",
+                        payload=request_payload,
+                        schema=ExtractionResult,
+                        cancel_event=cancel_event,
+                        audit_sink=audit_sink,
+                        records=records,
+                        batch_boundary=batch.boundary(),
+                        system_prompt_override=(
+                            EXTRACT_RETRY_SYSTEM_PROMPT if extraction_attempt else None
+                        ),
+                        prompt_version_override=(
+                            EXTRACT_RETRY_PROMPT_VERSION if extraction_attempt else None
+                        ),
+                    )
+                    if extraction_attempts == 1:
+                        break
+                    try:
+                        _validate_extraction_response(batch, result)
+                        validation_error = None
+                        break
+                    except ValueError as exc:
+                        validation_error = exc
+                        if extraction_attempt == extraction_attempts - 1:
+                            raise
+                if result is None:
+                    raise ValueError("extraction response was empty")
+            except ValueError:
+                if not validation_error or not getattr(
+                    self.provider, "supports_teaching_pipeline", False
+                ):
+                    raise
+                # Keep the local semantic pipeline usable when a small model
+                # returns schema-shaped but lossy extraction twice. The
+                # fallback is built only from exact source clauses; all later
+                # synthesis, source review and depth gates still run.
+                # Once any batch needs the exact-source fallback, rebuild the
+                # earlier batches with the same deterministic representation.
+                # Mixing provider atoms with fallback atoms would make the
+                # teaching projection and per-batch review inconsistent.
+                extractions = [
+                    (prior_batch, _canonical_source_extraction(prior_batch))
+                    for prior_batch, _ in extractions
+                ]
+                result = _canonical_source_extraction(batch)
+                source_fallback_mode = True
             except ProviderContextBudgetError as exc:
                 failure = _exception_failure(exc, "extract", payload)
                 _remember_context_failure(context_failures, failure)
                 return self._failed_generation(
                     note_input=note_input,
-                    extraction=_merge_extractions(extractions)
-                    if extractions
-                    else None,
+                    extraction=_merge_extractions(extractions) if extractions else None,
                     synthesis=None,
                     review=None,
                     context_failures=context_failures,
@@ -325,52 +597,70 @@ class SemanticNotePipeline:
         outline = _empty_teaching_outline()
         section_drafts: tuple[SectionDraft, ...] = ()
         section_attempts: dict[str, int] = {}
-        input_sufficient = True
-        teaching_enabled = bool(
-            getattr(self.provider, "supports_teaching_pipeline", False)
-        )
+        # Input sufficiency is a local gate for every provider path, including
+        # legacy semantic providers that do not expose teaching sections.
+        input_sufficient = _input_is_sufficient(note_input)
+        teaching_enabled = bool(getattr(self.provider, "supports_teaching_pipeline", False))
         if teaching_enabled:
-            try:
-                outline = await self._build_outline(
-                    note_input,
-                    extraction,
-                    cancel_event,
-                    audit_sink,
-                    records,
-                )
-                section_drafts, section_attempts = await self._synthesize_sections(
-                    note_input,
+            if _is_source_preserving_fallback(extraction):
+                outline = _source_fallback_outline(extraction)
+                section_drafts = _source_fallback_section_drafts(
                     extraction,
                     outline,
-                    cancel_event,
-                    audit_sink,
-                    records,
                 )
-                # ``unprovided_items`` normally records honest evidence gaps
-                # (for example, a video with no counterexample).  Only the
-                # section-id marker is an orchestration failure emitted by our
-                # bounded section retry path.
-                section_failed = any(
-                    draft.section_id in draft.unprovided_items
-                    for draft in section_drafts
-                )
-                input_sufficient = outline.input_sufficient and not section_failed
+                section_attempts = {section.section_id: 0 for section in outline.sections}
+                input_sufficient = _input_is_sufficient(note_input)
                 synthesis = _teaching_synthesis(
                     note_input,
                     extraction,
                     outline,
                     section_drafts,
                 )
-            except AssertionError:
-                # Keep the legacy path available for partially upgraded providers.
-                teaching_enabled = False
-        pending_slices = [] if teaching_enabled else [
-            item
-            for item, _ in _build_extraction_slices(
-                extraction,
-                self.provider.context_tokens,
-            )
-        ]
+            else:
+                try:
+                    outline = await self._build_outline(
+                        note_input,
+                        extraction,
+                        cancel_event,
+                        audit_sink,
+                        records,
+                    )
+                    section_drafts, section_attempts = await self._synthesize_sections(
+                        note_input,
+                        extraction,
+                        outline,
+                        cancel_event,
+                        audit_sink,
+                        records,
+                    )
+                    # ``unprovided_items`` normally records honest evidence gaps
+                    # (for example, a video with no counterexample).  Only the
+                    # section-id marker is an orchestration failure emitted by our
+                    # bounded section retry path.
+                    section_failed = any(
+                        draft.section_id in draft.unprovided_items for draft in section_drafts
+                    )
+                    input_sufficient = outline.input_sufficient and not section_failed
+                    synthesis = _teaching_synthesis(
+                        note_input,
+                        extraction,
+                        outline,
+                        section_drafts,
+                    )
+                except AssertionError:
+                    # Keep the legacy path available for partially upgraded providers.
+                    teaching_enabled = False
+        pending_slices = (
+            []
+            if teaching_enabled
+            else [
+                item
+                for item, _ in _build_extraction_slices(
+                    extraction,
+                    self.provider.context_tokens,
+                )
+            ]
+        )
         extraction_slices: list[ExtractionResult] = []
         synthesis_parts: list[SynthesisResult] = []
         while pending_slices:
@@ -396,7 +686,7 @@ class SemanticNotePipeline:
                         stage="synthesize",
                         system_prompt=SYSTEM_PROMPTS["synthesize"],
                         payload=trial_payload,
-                        json_schema=SynthesisResult.model_json_schema(),
+                        json_schema=_model_json_schema(SynthesisResult),
                         context_tokens=self.provider.context_tokens,
                     ),
                 )
@@ -409,9 +699,7 @@ class SemanticNotePipeline:
                 return self._failed_generation(
                     note_input=note_input,
                     extraction=extraction,
-                    synthesis=_merge_syntheses(synthesis_parts)
-                    if synthesis_parts
-                    else None,
+                    synthesis=_merge_syntheses(synthesis_parts) if synthesis_parts else None,
                     review=None,
                     context_failures=context_failures,
                     records=records,
@@ -436,19 +724,21 @@ class SemanticNotePipeline:
                     )
                 )
             except ProviderContextBudgetError as exc:
-                failure = _exception_failure(exc, "synthesize", _synthesis_payload(
-                    note_input,
-                    extraction_slice,
-                    slice_index,
-                    len(extraction_slices),
-                ))
+                failure = _exception_failure(
+                    exc,
+                    "synthesize",
+                    _synthesis_payload(
+                        note_input,
+                        extraction_slice,
+                        slice_index,
+                        len(extraction_slices),
+                    ),
+                )
                 _remember_context_failure(context_failures, failure)
                 return self._failed_generation(
                     note_input=note_input,
                     extraction=extraction,
-                    synthesis=_merge_syntheses(synthesis_parts)
-                    if synthesis_parts
-                    else None,
+                    synthesis=_merge_syntheses(synthesis_parts) if synthesis_parts else None,
                     review=None,
                     context_failures=context_failures,
                     records=records,
@@ -467,8 +757,7 @@ class SemanticNotePipeline:
                     cancel_event,
                     audit_sink,
                     records,
-                    input_sufficient=_input_is_sufficient(note_input)
-                    and input_sufficient,
+                    input_sufficient=_input_is_sufficient(note_input) and input_sufficient,
                 )
             except ProviderContextBudgetError as exc:
                 failure = _exception_failure(exc, "depth_review", {})
@@ -482,7 +771,14 @@ class SemanticNotePipeline:
                     records=records,
                     batches=batches,
                 )
-            input_sufficient = input_sufficient and depth_review.input_sufficient
+            # Provider depth output cannot override local evidence sufficiency.
+            # Keep the gate fail-closed when transcript/segment metadata is
+            # sparse or visual evidence is explicitly required.
+            input_sufficient = (
+                input_sufficient
+                and _input_is_sufficient(note_input)
+                and depth_review.input_sufficient
+            )
         review = await self._review(
             note_input,
             extraction,
@@ -522,7 +818,98 @@ class SemanticNotePipeline:
             and not depth_review.unknown_atom_ids
             and not depth_review.unknown_section_ids
         )
-        if coverage.quality_gate == "failed" and (coverage.repairable or depth_repairable):
+        if (
+            coverage.quality_gate == "failed"
+            and (coverage.repairable or depth_repairable)
+            and teaching_enabled
+        ):
+            # Successful unit patches remain private until the complete repair
+            # round succeeds. A historical upgrade must never expose a partial
+            # teaching note after a later unit fails.
+            original_extraction = extraction
+            original_synthesis = synthesis
+            original_review = review
+            original_coverage = coverage
+            try:
+                extraction, synthesis, section_drafts = await self._repair_teaching_units(
+                    note_input=note_input,
+                    extraction=extraction,
+                    synthesis=synthesis,
+                    review=review,
+                    coverage=coverage,
+                    outline=outline,
+                    section_drafts=section_drafts,
+                    depth_review=depth_review,
+                    depth_repairable=depth_repairable,
+                    cancel_event=cancel_event,
+                    audit_sink=audit_sink,
+                    records=records,
+                )
+            except RepairUnitFailure as exc:
+                _remember_context_failure(context_failures, exc.failure)
+                coverage = original_coverage.model_copy(
+                    update={"quality_gate": "failed", "repairable": False}
+                )
+                return self._failed_generation(
+                    note_input=note_input,
+                    extraction=original_extraction,
+                    synthesis=original_synthesis,
+                    review=original_review,
+                    context_failures=context_failures,
+                    records=records,
+                    batches=batches,
+                    coverage=coverage,
+                )
+            repair_count = 1
+            review = await self._review(
+                note_input,
+                extraction,
+                synthesis,
+                2,
+                cancel_event,
+                audit_sink,
+                records,
+                context_failures,
+            )
+            _check_cancellation(cancel_event)
+            try:
+                depth_review = await self._review_depth(
+                    note_input,
+                    extraction,
+                    outline,
+                    section_drafts,
+                    cancel_event,
+                    audit_sink,
+                    records,
+                    input_sufficient=_input_is_sufficient(note_input) and input_sufficient,
+                )
+            except ProviderContextBudgetError as exc:
+                failure = _exception_failure(exc, "depth_review", {})
+                _remember_context_failure(context_failures, failure)
+                return self._failed_generation(
+                    note_input=note_input,
+                    extraction=extraction,
+                    synthesis=synthesis,
+                    review=review,
+                    context_failures=context_failures,
+                    records=records,
+                    batches=batches,
+                    coverage=coverage,
+                )
+            input_sufficient = input_sufficient and depth_review.input_sufficient
+            coverage = self._validate(
+                note_input,
+                extraction,
+                synthesis,
+                review,
+                input_sufficient=input_sufficient,
+                depth_review=depth_review,
+            )
+            if context_failures:
+                coverage = coverage.model_copy(
+                    update={"quality_gate": "failed", "repairable": False}
+                )
+        elif coverage.quality_gate == "failed" and (coverage.repairable or depth_repairable):
             _check_cancellation(cancel_event)
             if depth_repairable and depth_review is not None:
                 repair_extraction, relevant_segments = _depth_repair_slice(
@@ -566,14 +953,10 @@ class SemanticNotePipeline:
                 outline=outline if teaching_enabled else None,
                 section_drafts=repair_sections if teaching_enabled else (),
                 depth_review=depth_review if teaching_enabled else None,
-                repair_section_ids=(
-                    teaching_repair_section_ids if teaching_enabled else []
-                ),
+                repair_section_ids=(teaching_repair_section_ids if teaching_enabled else []),
             )
             repair_system_prompt = (
-                TEACHING_REPAIR_SYSTEM_PROMPT
-                if teaching_enabled
-                else SYSTEM_PROMPTS["repair"]
+                TEACHING_REPAIR_SYSTEM_PROMPT if teaching_enabled else SYSTEM_PROMPTS["repair"]
             )
             if teaching_enabled:
                 repair_payload["prompt_version"] = TEACHING_REPAIR_PROMPT_VERSION
@@ -581,7 +964,7 @@ class SemanticNotePipeline:
                 stage="repair",
                 system_prompt=repair_system_prompt,
                 payload=repair_payload,
-                json_schema=RepairResult.model_json_schema(),
+                json_schema=_model_json_schema(RepairResult),
                 context_tokens=self.provider.context_tokens,
             )
             if not repair_budget["within_budget"]:
@@ -597,15 +980,13 @@ class SemanticNotePipeline:
                     outline=outline if teaching_enabled else None,
                     section_drafts=repair_sections if teaching_enabled else (),
                     depth_review=depth_review if teaching_enabled else None,
-                    repair_section_ids=(
-                        teaching_repair_section_ids if teaching_enabled else []
-                    ),
+                    repair_section_ids=(teaching_repair_section_ids if teaching_enabled else []),
                 )
                 compact_budget = _provider_request_budget(
                     stage="repair",
                     system_prompt=repair_system_prompt,
                     payload=compact_payload,
-                    json_schema=RepairResult.model_json_schema(),
+                    json_schema=_model_json_schema(RepairResult),
                     context_tokens=self.provider.context_tokens,
                 )
                 if compact_budget["within_budget"]:
@@ -644,14 +1025,10 @@ class SemanticNotePipeline:
                     audit_sink=audit_sink,
                     records=records,
                     system_prompt_override=(
-                        TEACHING_REPAIR_SYSTEM_PROMPT
-                        if teaching_enabled
-                        else None
+                        TEACHING_REPAIR_SYSTEM_PROMPT if teaching_enabled else None
                     ),
                     prompt_version_override=(
-                        TEACHING_REPAIR_PROMPT_VERSION
-                        if teaching_enabled
-                        else None
+                        TEACHING_REPAIR_PROMPT_VERSION if teaching_enabled else None
                     ),
                 )
             except ProviderContextBudgetError as exc:
@@ -687,15 +1064,12 @@ class SemanticNotePipeline:
             else:
                 extraction, synthesis = updated_extraction, updated_synthesis
                 if teaching_enabled and repair_result.section_drafts:
-                    outline_by_id = {
-                        section.section_id: section for section in outline.sections
-                    }
+                    outline_by_id = {section.section_id: section for section in outline.sections}
                     normalized_repairs: dict[str, SectionDraft] = {}
                     for repaired_draft in repair_result.section_drafts:
                         if (
                             depth_review is None
-                            or repaired_draft.section_id
-                            not in set(teaching_repair_section_ids)
+                            or repaired_draft.section_id not in set(teaching_repair_section_ids)
                             or repaired_draft.section_id not in outline_by_id
                         ):
                             raise ValueError("teaching repair section is not authorized")
@@ -705,12 +1079,10 @@ class SemanticNotePipeline:
                             {atom.id: atom for atom in extraction.atoms},
                         )
                     updated_by_id = {
-                        draft.section_id: draft
-                        for draft in normalized_repairs.values()
+                        draft.section_id: draft for draft in normalized_repairs.values()
                     }
                     section_drafts = tuple(
-                        updated_by_id.get(draft.section_id, draft)
-                        for draft in section_drafts
+                        updated_by_id.get(draft.section_id, draft) for draft in section_drafts
                     )
                     if depth_repairable or teaching_repair_section_ids:
                         synthesis = _teaching_synthesis(
@@ -723,17 +1095,6 @@ class SemanticNotePipeline:
                     # A depth repair without a returned section patch cannot
                     # claim that the affected teaching section was repaired.
                     input_sufficient = False
-                elif teaching_enabled:
-                    # Coverage-only repair may return only legacy extraction /
-                    # synthesis fields. Rebuild the teaching projection from
-                    # the merged extraction so section and timeline artifacts
-                    # cannot drift apart.
-                    synthesis = _teaching_synthesis(
-                        note_input,
-                        extraction,
-                        outline,
-                        section_drafts,
-                    )
                 repair_count = 1
                 review = await self._review(
                     note_input,
@@ -756,8 +1117,7 @@ class SemanticNotePipeline:
                             cancel_event,
                             audit_sink,
                             records,
-                            input_sufficient=_input_is_sufficient(note_input)
-                            and input_sufficient,
+                            input_sufficient=_input_is_sufficient(note_input) and input_sufficient,
                         )
                     except ProviderContextBudgetError as exc:
                         failure = _exception_failure(exc, "depth_review", {})
@@ -808,9 +1168,7 @@ class SemanticNotePipeline:
             section_attempts=section_attempts,
             depth_review=depth_review,
             input_sufficient=input_sufficient,
-            context_status=(
-                "within_budget" if not context_failures else "failed"
-            ),
+            context_status=("within_budget" if not context_failures else "failed"),
             context_failures=tuple(context_failures),
         )
 
@@ -828,11 +1186,34 @@ class SemanticNotePipeline:
         reviews: list[CoverageReview] = []
         claims = _draft_claims(synthesis)
         fragment_segment_indexes: set[int] = set()
-        pending_batches = build_segment_batches(
+        fallback_batches = _fallback_source_review_batches(
             note_input,
+            extraction,
             self.provider.context_tokens,
             input_fraction=0.2,
         )
+        if fallback_batches is None:
+            pending_batches = build_segment_batches(
+                note_input,
+                self.provider.context_tokens,
+                input_fraction=0.2,
+            )
+        elif not fallback_batches:
+            failure = {
+                "stage": "review",
+                "code": "fallback_source_provenance_unverified",
+                "message": (
+                    "canonical fallback evidence could not be mapped "
+                    "losslessly to the raw source transcript"
+                ),
+            }
+            if context_failures is None:
+                raise ProviderContextBudgetError("review", failure)
+            _remember_context_failure(context_failures, failure)
+            await _record_context_failure(failure, audit_sink, records)
+            return _merge_reviews(reviews)
+        else:
+            pending_batches = fallback_batches
         source_batches: list[SegmentBatch] = []
         while pending_batches:
             batch = _reindex_batch(
@@ -851,6 +1232,7 @@ class SemanticNotePipeline:
                 source_payload,
                 CoverageReview,
             )
+            batch_claims = _claims_for_source_batch(claims, extraction, batch)
             claims_fit = all(
                 self._request_fits(
                     "review",
@@ -863,10 +1245,14 @@ class SemanticNotePipeline:
                     ),
                     DraftClaimReview,
                 )
-                for claim in claims
+                for claim in batch_claims
             )
             if not source_fits or not claims_fit:
-                split_batches = _split_segment_batch(batch)
+                split_batches = (
+                    []
+                    if _is_source_preserving_fallback(extraction) and len(batch.segments) == 1
+                    else _split_segment_batch(batch)
+                )
                 if split_batches:
                     pending_batches = [*split_batches, *pending_batches]
                     continue
@@ -880,7 +1266,7 @@ class SemanticNotePipeline:
                         review_pass,
                         [
                             claim
-                            for claim in claims
+                            for claim in batch_claims
                             if not self._request_fits(
                                 "review",
                                 _claim_review_payload(
@@ -904,7 +1290,7 @@ class SemanticNotePipeline:
                         stage="review",
                         system_prompt=SYSTEM_PROMPTS["review"],
                         payload=budget_payload,
-                        json_schema=budget_schema.model_json_schema(),
+                        json_schema=_model_json_schema(budget_schema),
                         context_tokens=self.provider.context_tokens,
                     ),
                     batch_boundary=batch.boundary(),
@@ -918,28 +1304,49 @@ class SemanticNotePipeline:
                     records,
                     batch_boundary=batch.boundary(),
                 )
+                if not source_fits:
+                    return _merge_reviews(reviews)
             source_batches.append(batch)
             fragment_segment_indexes = _fragment_segment_indexes(source_batches)
 
         for batch in source_batches:
             try:
-                reviews.append(
-                    await self._call(
+                source_payload = _source_review_payload(
+                    note_input, extraction, synthesis, batch, review_pass
+                )
+                source_review: CoverageReview | None = None
+                feedback: str | None = None
+                for attempt in range(2):
+                    request_payload = dict(source_payload)
+                    if feedback:
+                        request_payload["validation_feedback"] = feedback
+                    candidate = await self._call(
                         stage="review",
-                        payload=_source_review_payload(
-                            note_input,
-                            extraction,
-                            synthesis,
-                            batch,
-                            review_pass,
-                        ),
+                        payload=request_payload,
                         schema=CoverageReview,
                         cancel_event=cancel_event,
                         audit_sink=audit_sink,
                         records=records,
                         batch_boundary=batch.boundary(),
+                        system_prompt_override=(REVIEW_RETRY_SYSTEM_PROMPT if attempt else None),
+                        prompt_version_override=(REVIEW_RETRY_PROMPT_VERSION if attempt else None),
                     )
+                    try:
+                        _validate_source_review(candidate, batch)
+                        source_review = candidate
+                        break
+                    except ValueError as exc:
+                        feedback = str(exc)
+                        if attempt == 1:
+                            raise
+                if source_review is None:
+                    raise ValueError("source review response was empty")
+                source_review = _normalize_source_fallback_review(
+                    source_review,
+                    extraction,
+                    aweme_id=note_input.aweme_id,
                 )
+                reviews.append(source_review)
             except ProviderContextBudgetError as exc:
                 failure = _exception_failure(
                     exc,
@@ -963,15 +1370,23 @@ class SemanticNotePipeline:
             reviews,
             fragment_segment_indexes=fragment_segment_indexes,
         )
+        merged = _remove_noop_disposition_corrections(merged, extraction)
+        merged = _normalize_source_fallback_unsupported_claims(
+            extraction,
+            claims,
+            merged,
+        )
         if not claims:
             return merged
 
         supported_claim_ids: set[str] = set()
         contradicted_claim_ids: set[str] = set()
+        reviewed_claim_ids: set[str] = set()
         for batch in source_batches:
+            batch_claims = _claims_for_source_batch(claims, extraction, batch)
             claim_batches: list[list[DraftClaim]] = []
             current_claims: list[DraftClaim] = []
-            for claim in claims:
+            for claim in batch_claims:
                 trial_claims = [*current_claims, claim]
                 trial_payload = _claim_review_payload(
                     note_input,
@@ -1003,7 +1418,7 @@ class SemanticNotePipeline:
                                 review_pass,
                                 [claim],
                             ),
-                            json_schema=DraftClaimReview.model_json_schema(),
+                            json_schema=_model_json_schema(DraftClaimReview),
                             context_tokens=self.provider.context_tokens,
                         ),
                         batch_boundary=batch.boundary(),
@@ -1042,21 +1457,84 @@ class SemanticNotePipeline:
             for claim_batch in claim_batches:
                 expected_ids = {claim.id for claim in claim_batch}
                 try:
-                    claim_review = await self._call(
-                        stage="review",
-                        payload=_claim_review_payload(
-                            note_input,
-                            extraction,
-                            batch,
-                            review_pass,
-                            claim_batch,
-                        ),
-                        schema=DraftClaimReview,
-                        cancel_event=cancel_event,
-                        audit_sink=audit_sink,
-                        records=records,
-                        batch_boundary=batch.boundary(),
+                    claim_payload = _claim_review_payload(
+                        note_input, extraction, batch, review_pass, claim_batch
                     )
+                    claim_review: DraftClaimReview | None = None
+                    partial_review: DraftClaimReview | None = None
+                    feedback: str | None = None
+                    for attempt in range(2):
+                        request_payload = dict(claim_payload)
+                        if feedback:
+                            request_payload["validation_feedback"] = feedback
+                        candidate = await self._call(
+                            stage="review",
+                            payload=request_payload,
+                            schema=DraftClaimReview,
+                            cancel_event=cancel_event,
+                            audit_sink=audit_sink,
+                            records=records,
+                            batch_boundary=batch.boundary(),
+                            system_prompt_override=(
+                                REVIEW_RETRY_SYSTEM_PROMPT if attempt else None
+                            ),
+                            prompt_version_override=(
+                                REVIEW_RETRY_PROMPT_VERSION if attempt else None
+                            ),
+                        )
+                        try:
+                            _validate_claim_review(candidate, expected_ids)
+                            if set(candidate.reviewed_claim_ids) != expected_ids:
+                                feedback = (
+                                    "reviewed_claim_ids 不完整：必须逐项返回本批全部 claim.id；"
+                                    "来源未提及的 claim 也必须列入 reviewed_claim_ids，不能省略。"
+                                )
+                                if attempt == 0:
+                                    # Keep only explicit, valid verdicts. The
+                                    # retry independently reviews the missing
+                                    # claims against their original evidence,
+                                    # instead of asking the model to repeat a
+                                    # long list it has already omitted from.
+                                    reviewed = set(candidate.reviewed_claim_ids)
+                                    partial_review = DraftClaimReview(
+                                        reviewed_claim_ids=sorted(reviewed),
+                                        supported_claim_ids=sorted(
+                                            set(candidate.supported_claim_ids) & reviewed
+                                        ),
+                                        contradicted_claim_ids=sorted(
+                                            set(candidate.contradicted_claim_ids) & reviewed
+                                        ),
+                                    )
+                                    expected_ids -= reviewed
+                                    claim_payload = _claim_review_payload(
+                                        note_input, extraction, batch, review_pass,
+                                        [claim for claim in claim_batch
+                                         if claim.id in expected_ids],
+                                    )
+                                    continue
+                            claim_review = candidate
+                            break
+                        except ValueError as exc:
+                            feedback = str(exc)
+                            if attempt == 1:
+                                raise
+                    if claim_review is None:
+                        raise ValueError("draft claim review response was empty")
+                    if partial_review is not None:
+                        claim_review = DraftClaimReview(
+                            reviewed_claim_ids=[
+                                *partial_review.reviewed_claim_ids,
+                                *claim_review.reviewed_claim_ids,
+                            ],
+                            supported_claim_ids=[
+                                *partial_review.supported_claim_ids,
+                                *claim_review.supported_claim_ids,
+                            ],
+                            contradicted_claim_ids=[
+                                *partial_review.contradicted_claim_ids,
+                                *claim_review.contradicted_claim_ids,
+                            ],
+                        )
                 except ProviderContextBudgetError as exc:
                     failure = _exception_failure(
                         exc,
@@ -1085,24 +1563,37 @@ class SemanticNotePipeline:
                 reviewed_ids = set(claim_review.reviewed_claim_ids)
                 supported_ids = set(claim_review.supported_claim_ids)
                 contradicted_ids = set(claim_review.contradicted_claim_ids)
-                if reviewed_ids != expected_ids:
-                    raise ValueError("draft claim review did not account for its batch")
-                if not supported_ids <= expected_ids or not contradicted_ids <= expected_ids:
-                    raise ValueError("draft claim review referenced an unknown claim")
-                if supported_ids & contradicted_ids:
-                    raise ValueError("draft claim review returned conflicting verdicts")
-                supported_claim_ids.update(supported_ids)
+                reviewed_claim_ids.update(reviewed_ids)
+                supported_claim_ids.update(reviewed_ids & supported_ids)
                 contradicted_claim_ids.update(contradicted_ids)
 
         claim_by_id = {claim.id: claim for claim in claims}
-        unsupported_ids = contradicted_claim_ids | (
-            set(claim_by_id) - supported_claim_ids
+        unsupported_ids = _claim_review_unsupported_ids(
+            claims,
+            reviewed_ids=reviewed_claim_ids,
+            supported_ids=supported_claim_ids,
+            contradicted_ids=contradicted_claim_ids,
         )
+        if _is_source_preserving_fallback(extraction):
+            unsupported_ids = {
+                claim_id
+                for claim_id in unsupported_ids
+                if claim_id in contradicted_claim_ids or claim_id not in reviewed_claim_ids
+            }
+        unsupported_draft_claims = list(merged.unsupported_draft_claims)
+        if _is_source_preserving_fallback(extraction):
+            supported_texts = {
+                claim_by_id[claim_id].text
+                for claim_id in supported_claim_ids - contradicted_claim_ids
+            }
+            unsupported_draft_claims = [
+                value for value in unsupported_draft_claims if value not in supported_texts
+            ]
         return merged.model_copy(
             update={
                 "unsupported_draft_claims": _dedupe_text(
                     [
-                        *merged.unsupported_draft_claims,
+                        *unsupported_draft_claims,
                         *(claim_by_id[claim_id].text for claim_id in sorted(unsupported_ids)),
                     ]
                 )
@@ -1121,6 +1612,13 @@ class SemanticNotePipeline:
         *,
         input_sufficient: bool,
     ) -> DepthReview:
+        if _is_source_preserving_fallback(extraction):
+            deterministic = DepthValidator().validate(
+                atoms=extraction.atoms,
+                outline=outline,
+                sections=list(sections),
+            )
+            return deterministic.model_copy(update={"input_sufficient": input_sufficient})
         groups: list[tuple[SectionDraft, ...]] = [sections]
         provider_reviews: list[DepthReview] = []
         while groups:
@@ -1197,6 +1695,10 @@ class SemanticNotePipeline:
             {atom.id for atom in extraction.atoms},
             section_ids={section.section_id for section in outline.sections},
         )
+        provider_review = _normalize_provider_depth_review(
+            extraction,
+            provider_review,
+        )
         deterministic = DepthValidator().validate(
             atoms=extraction.atoms,
             outline=outline,
@@ -1225,34 +1727,18 @@ class SemanticNotePipeline:
                 "metadata": _metadata_payload(note_input),
                 "atom_catalog": chunk,
                 "source_segments": [
-                    _segment_payload(s)
-                    for s in note_input.segments
-                    if s.index in indexes
+                    _segment_payload(s) for s in note_input.segments if s.index in indexes
                 ],
                 "input_sufficient": bool(note_input.transcript.strip()),
             }
             if not self._request_fits("outline", payload, TeachingOutline):
-                compact_payload = dict(payload)
-                compact_payload["atom_catalog"] = _compact_catalog(
-                    chunk,
-                    max_chars=max(256, int(self.provider.context_tokens * 0.35)),
-                )
-                compact_payload["source_segments"] = _compact_source_segments(
-                    note_input,
-                    indexes,
-                    chunk,
-                    max_chars=max(256, int(self.provider.context_tokens * 0.35)),
-                )
-                if self._request_fits(
-                    "outline", compact_payload, TeachingOutline
-                ):
-                    payload = compact_payload
-                else:
-                    if len(chunk) <= 1:
-                        raise ProviderContextBudgetError("outline")
-                    midpoint = max(1, len(chunk) // 2)
-                    chunks = [chunk[:midpoint], chunk[midpoint:], *chunks]
-                    continue
+                # Never shorten an atom or its source segment to fit. Split
+                # the evidence set and let each request carry complete text.
+                if len(chunk) <= 1:
+                    raise ProviderContextBudgetError("outline")
+                midpoint = max(1, len(chunk) // 2)
+                chunks = [chunk[:midpoint], chunk[midpoint:], *chunks]
+                continue
             outline = await self._call(
                 stage="outline",
                 payload=payload,
@@ -1280,9 +1766,7 @@ class SemanticNotePipeline:
         attempts: dict[str, int] = {}
         for section in sorted(outline.sections, key=lambda item: item.order):
             section_atoms = [
-                atom_by_id[atom_id]
-                for atom_id in section.atom_ids
-                if atom_id in atom_by_id
+                atom_by_id[atom_id] for atom_id in section.atom_ids if atom_id in atom_by_id
             ]
             attempts[section.section_id] = 0
             chunks = [section_atoms]
@@ -1292,24 +1776,14 @@ class SemanticNotePipeline:
                 chunk = chunks.pop(0)
                 payload = _section_payload(note_input, section, chunk)
                 if not self._request_fits("section", payload, SectionDraft):
-                    compact_payload = _section_payload(
-                        note_input,
-                        section,
-                        chunk,
-                        compact=True,
-                        max_chars=max(256, int(self.provider.context_tokens * 0.35)),
-                    )
-                    if self._request_fits(
-                        "section", compact_payload, SectionDraft
-                    ):
-                        payload = compact_payload
-                    else:
-                        if len(chunk) <= 1:
-                            failed = True
-                            break
-                        midpoint = max(1, len(chunk) // 2)
-                        chunks = [chunk[:midpoint], chunk[midpoint:], *chunks]
-                        continue
+                    # A compact payload would silently discard facts. Keep
+                    # complete atom/source text and split the atom set.
+                    if len(chunk) <= 1:
+                        failed = True
+                        break
+                    midpoint = max(1, len(chunk) // 2)
+                    chunks = [chunk[:midpoint], chunk[midpoint:], *chunks]
+                    continue
                 result: SectionDraft | None = None
                 for attempt in range(1, 3):
                     attempts[section.section_id] += 1
@@ -1353,9 +1827,7 @@ class SemanticNotePipeline:
                             ]
                         }
                     )
-                    drafts.append(
-                        _normalize_section(partial, section, atom_by_id)
-                    )
+                    drafts.append(_normalize_section(partial, section, atom_by_id))
                 else:
                     result = SectionDraft(
                         section_id=section.section_id,
@@ -1375,6 +1847,441 @@ class SemanticNotePipeline:
                 )
         return tuple(drafts), attempts
 
+    async def _repair_teaching_units(
+        self,
+        *,
+        note_input: NoteInput,
+        extraction: ExtractionResult,
+        synthesis: SynthesisResult,
+        review: CoverageReview,
+        coverage: CoverageReport,
+        outline: TeachingOutline,
+        section_drafts: tuple[SectionDraft, ...],
+        depth_review: DepthReview | None,
+        depth_repairable: bool,
+        cancel_event: asyncio.Event,
+        audit_sink: AuditSink | None,
+        records: list[StageRecord],
+    ) -> tuple[ExtractionResult, SynthesisResult, tuple[SectionDraft, ...]]:
+        """Run one bounded repair request per independent teaching section.
+
+        Repair patches are accumulated only in memory.  The caller publishes a
+        result after this method returns and performs one global review, so a
+        later unit failure can never expose an earlier partial patch.
+        """
+
+        if depth_repairable and depth_review is not None:
+            repair_extraction, all_segments = _depth_repair_slice(
+                extraction,
+                section_drafts,
+                depth_review,
+                outline=outline,
+            )
+            section_ids = list(depth_review.repair_section_ids)
+        else:
+            repair_extraction, all_segments = _repair_slice(
+                extraction,
+                synthesis,
+                review,
+                coverage,
+            )
+            section_ids = _coverage_repair_section_ids(
+                outline,
+                section_drafts,
+                repair_extraction,
+                all_segments,
+            )
+
+        outline_by_id = {section.section_id: section for section in outline.sections}
+        draft_by_id = {draft.section_id: draft for draft in section_drafts}
+        atom_by_id = {atom.id: atom for atom in extraction.atoms}
+        atoms_by_segment: dict[int, set[str]] = {}
+        evidence_neighbors = {atom_id: set() for atom_id in atom_by_id}
+        for atom in extraction.atoms:
+            atoms_by_segment.setdefault(atom.source_segment, set()).add(atom.id)
+            for relation_id in atom.relations:
+                if relation_id not in atom_by_id:
+                    continue
+                evidence_neighbors[atom.id].add(relation_id)
+                evidence_neighbors[relation_id].add(atom.id)
+        for segment_atom_ids in atoms_by_segment.values():
+            for atom_id in segment_atom_ids:
+                evidence_neighbors[atom_id].update(segment_atom_ids)
+
+        def evidence_closure(
+            atom_ids: set[str],
+            segment_indexes: set[int],
+        ) -> tuple[set[str], set[int]]:
+            """Return all atoms and source segments connected to this evidence."""
+
+            pending = [
+                *atom_ids,
+                *(
+                    atom_id
+                    for segment_index in segment_indexes
+                    for atom_id in atoms_by_segment.get(segment_index, ())
+                ),
+            ]
+            expanded_atom_ids: set[str] = set()
+            expanded_segments = set(segment_indexes)
+            while pending:
+                atom_id = pending.pop()
+                if atom_id in expanded_atom_ids or atom_id not in atom_by_id:
+                    continue
+                expanded_atom_ids.add(atom_id)
+                atom = atom_by_id[atom_id]
+                expanded_segments.add(atom.source_segment)
+                pending.extend(evidence_neighbors[atom_id] - expanded_atom_ids)
+            return expanded_atom_ids, expanded_segments
+
+        allowed_sections = [
+            section_id
+            for section_id in section_ids
+            if section_id in outline_by_id
+        ]
+        if not allowed_sections:
+            raise RepairUnitFailure(
+                {
+                    "stage": "repair",
+                    "code": "repair_unit_no_authorized_sections",
+                }
+            )
+
+        # Build one ownership record per section, then join records that share
+        # source evidence or atom relations.  A unit always owns complete
+        # section ids; no section is split across provider calls.
+        ownership: dict[str, tuple[set[str], set[int]]] = {}
+        for section_id in allowed_sections:
+            atom_ids = set(outline_by_id[section_id].atom_ids)
+            draft = draft_by_id.get(section_id)
+            if draft is not None:
+                atom_ids.update(draft.included_atom_ids)
+            if depth_review is not None:
+                for field_name in (
+                    "abstracted_atom_ids",
+                    "example_without_result_atom_ids",
+                    "condition_without_scope_atom_ids",
+                    "reordered_step_atom_ids",
+                    "lost_literal_atom_ids",
+                    "lost_warning_or_promotion_atom_ids",
+                ):
+                    atom_ids.update(
+                        atom_id
+                        for atom_id in getattr(depth_review, field_name)
+                        if atom_id in atom_by_id and atom_id in atom_ids
+                    )
+            atom_ids = {atom_id for atom_id in atom_ids if atom_id in atom_by_id}
+            segments = {
+                atom_by_id[atom_id].source_segment
+                for atom_id in atom_ids
+            }
+            if not segments:
+                # A section with no assigned atom can still be authorized by a
+                # source omission or a disposition correction.
+                segments = {
+                    segment_index
+                    for segment_index in all_segments
+                    if any(
+                        atom.source_segment == segment_index
+                        and atom.id in set(outline_by_id[section_id].atom_ids)
+                        for atom in extraction.atoms
+                    )
+                }
+            ownership[section_id] = evidence_closure(atom_ids, segments)
+
+        parent = {section_id: section_id for section_id in allowed_sections}
+
+        def find(section_id: str) -> str:
+            while parent[section_id] != section_id:
+                parent[section_id] = parent[parent[section_id]]
+                section_id = parent[section_id]
+            return section_id
+
+        def join(left: str, right: str) -> None:
+            left_root, right_root = find(left), find(right)
+            if left_root != right_root:
+                parent[right_root] = left_root
+
+        for index, left in enumerate(allowed_sections):
+            left_atoms, left_segments = ownership[left]
+            for right in allowed_sections[index + 1 :]:
+                right_atoms, right_segments = ownership[right]
+                if left_segments & right_segments:
+                    join(left, right)
+                    continue
+                if any(
+                    relation_id in right_atoms
+                    for atom_id in left_atoms
+                    for relation_id in atom_by_id[atom_id].relations
+                ) or any(
+                    relation_id in left_atoms
+                    for atom_id in right_atoms
+                    for relation_id in atom_by_id[atom_id].relations
+                ):
+                    join(left, right)
+
+        grouped: dict[str, list[str]] = {}
+        for section_id in allowed_sections:
+            grouped.setdefault(find(section_id), []).append(section_id)
+
+        units: list[RepairUnit] = []
+        for grouped_ids in grouped.values():
+            unit_atom_ids: set[str] = set()
+            unit_segments: set[int] = set()
+            for section_id in grouped_ids:
+                section_atoms, section_segments = ownership[section_id]
+                unit_atom_ids.update(section_atoms)
+                unit_segments.update(section_segments)
+            unit_atom_ids, unit_segments = evidence_closure(unit_atom_ids, unit_segments)
+            unit_segments.update(
+                atom.source_segment
+                for atom in repair_extraction.atoms
+                if atom.id in unit_atom_ids
+            )
+            if not unit_segments:
+                unit_segments.update(all_segments)
+            local_extraction = _subset_extraction(
+                extraction,
+                unit_atom_ids,
+                unit_segments,
+            )
+            local_sections = tuple(
+                draft_by_id[section_id]
+                for section_id in grouped_ids
+                if section_id in draft_by_id
+            )
+            local_outline_sections = [outline_by_id[section_id] for section_id in grouped_ids]
+            local_atom_ids = {atom.id for atom in local_extraction.atoms}
+            local_outline = TeachingOutline(
+                sections=local_outline_sections,
+                included_atom_ids=[
+                    atom_id
+                    for atom_id in outline.included_atom_ids
+                    if atom_id in local_atom_ids
+                ],
+                unassigned_atom_ids=[],
+                input_sufficient=outline.input_sufficient,
+            )
+            local_depth = None
+            if depth_review is not None:
+                depth_data = depth_review.model_dump(mode="json")
+                depth_atom_fields = (
+                    "abstracted_atom_ids",
+                    "example_without_result_atom_ids",
+                    "condition_without_scope_atom_ids",
+                    "reordered_step_atom_ids",
+                    "lost_literal_atom_ids",
+                    "lost_warning_or_promotion_atom_ids",
+                )
+                for field_name in depth_atom_fields:
+                    depth_data[field_name] = [
+                        atom_id
+                        for atom_id in depth_data[field_name]
+                        if atom_id in local_atom_ids
+                    ]
+                depth_data["repair_section_ids"] = list(grouped_ids)
+                depth_data["unknown_atom_ids"] = []
+                depth_data["unknown_section_ids"] = []
+                local_depth = DepthReview.model_validate(depth_data, strict=True)
+            units.append(
+                RepairUnit(
+                    section_ids=tuple(grouped_ids),
+                    extraction=local_extraction,
+                    relevant_segments=frozenset(unit_segments),
+                    section_drafts=local_sections,
+                    outline=local_outline,
+                    depth_review=local_depth,
+                )
+            )
+
+        working_extraction = extraction
+        working_synthesis = synthesis
+        working_drafts = {draft.section_id: draft for draft in section_drafts}
+        repaired_section_drafts = False
+        synthesis_only_patches: list[tuple[SynthesisResult, set[int]]] = []
+        for unit in units:
+            if cancel_event.is_set():
+                raise RepairUnitFailure(
+                    {
+                        "stage": "repair",
+                        "code": "repair_unit_cancelled",
+                        "repair_section_ids": list(unit.section_ids),
+                    }
+                )
+            local_synthesis = _slice_synthesis(
+                working_synthesis,
+                set(unit.relevant_segments),
+                {atom.id for atom in unit.extraction.atoms},
+                working_extraction,
+            )
+            local_review = _slice_review(review, set(unit.relevant_segments))
+            payload = _repair_payload(
+                note_input,
+                unit.extraction,
+                local_synthesis,
+                working_extraction,
+                local_review,
+                coverage,
+                set(unit.relevant_segments),
+                compact_content=True,
+                outline=unit.outline,
+                section_drafts=unit.section_drafts,
+                depth_review=unit.depth_review,
+                repair_section_ids=list(unit.section_ids),
+            )
+            payload["prompt_version"] = TEACHING_REPAIR_PROMPT_VERSION
+            # Give each local request stable, source-oriented atom ids.  The
+            # merged extraction uses deterministic ``B###-A###`` ids, while a
+            # local unit should remain readable and independent of atoms that
+            # are outside the request.  Keep a reverse map so returned patches
+            # can be merged back into the canonical extraction safely.
+            local_to_global: dict[str, str] = {}
+            global_to_local: dict[str, str] = {}
+            candidate_counts: Counter[str] = Counter(
+                f"{atom.id.split('-', 1)[0]}-unit-{atom.source_segment}"
+                for atom in unit.extraction.atoms
+            )
+            for atom in unit.extraction.atoms:
+                candidate = f"{atom.id.split('-', 1)[0]}-unit-{atom.source_segment}"
+                if candidate_counts[candidate] != 1:
+                    continue
+                local_to_global[candidate] = atom.id
+                global_to_local[atom.id] = candidate
+
+            def remap(value: Any, mapping: Mapping[str, str]) -> Any:
+                if isinstance(value, str):
+                    return mapping.get(value, value)
+                if isinstance(value, list):
+                    return [remap(item, mapping) for item in value]
+                if isinstance(value, dict):
+                    return {key: remap(item, mapping) for key, item in value.items()}
+                return value
+
+            if global_to_local:
+                payload = remap(payload, global_to_local)
+            budget = _provider_request_budget(
+                stage="repair",
+                system_prompt=TEACHING_REPAIR_SYSTEM_PROMPT,
+                payload=payload,
+                json_schema=_model_json_schema(RepairResult),
+                context_tokens=self.provider.context_tokens,
+            )
+            if not budget["within_budget"]:
+                failure = _budget_failure("repair", budget)
+                failure["repair_section_ids"] = list(unit.section_ids)
+                await _record_context_failure(failure, audit_sink, records)
+                raise RepairUnitFailure(failure)
+            payload["context_budget"] = budget
+            try:
+                repair_result = await self._call(
+                    stage="repair",
+                    payload=payload,
+                    schema=RepairResult,
+                    cancel_event=cancel_event,
+                    audit_sink=audit_sink,
+                    records=records,
+                    system_prompt_override=TEACHING_REPAIR_SYSTEM_PROMPT,
+                    prompt_version_override=TEACHING_REPAIR_PROMPT_VERSION,
+                )
+                if local_to_global:
+                    repair_result = RepairResult.model_validate(
+                        remap(repair_result.model_dump(mode="json"), local_to_global),
+                        strict=True,
+                    )
+                updated_extraction = _merge_repair_extraction_patch(
+                    working_extraction,
+                    repair_result.extraction_patch,
+                    set(unit.relevant_segments),
+                )
+                updated_synthesis = _merge_repair_patch(
+                    working_synthesis,
+                    repair_result.synthesis_patch,
+                    set(unit.relevant_segments),
+                    extraction=updated_extraction,
+                )
+                outline_by_id_global = {
+                    section.section_id: section for section in outline.sections
+                }
+                for repaired_draft in repair_result.section_drafts:
+                    if repaired_draft.section_id not in unit.section_ids:
+                        raise ValueError("teaching repair section is not authorized")
+                    normalized = _normalize_section(
+                        repaired_draft,
+                        outline_by_id_global[repaired_draft.section_id],
+                        {atom.id: atom for atom in updated_extraction.atoms},
+                    )
+                    working_drafts[normalized.section_id] = normalized
+                    repaired_section_drafts = True
+                if not repair_result.section_drafts:
+                    synthesis_only_patches.append(
+                        (repair_result.synthesis_patch, set(unit.relevant_segments))
+                    )
+            except JobCancelledError as exc:
+                raise RepairUnitFailure(
+                    {
+                        "stage": "repair",
+                        "code": "repair_unit_cancelled",
+                        "message": str(exc),
+                        "repair_section_ids": list(unit.section_ids),
+                    }
+                ) from exc
+            except NoteProviderError as exc:
+                raise RepairUnitFailure(
+                    {
+                        "stage": "repair",
+                        "code": "provider_error",
+                        "provider": exc.provider,
+                        "provider_stage": exc.stage,
+                        "provider_code": exc.code,
+                        "repair_section_ids": list(unit.section_ids),
+                    }
+                ) from exc
+            except ProviderContextBudgetError as exc:
+                failure = _exception_failure(exc, "repair", payload)
+                failure["repair_section_ids"] = list(unit.section_ids)
+                await _record_context_failure(failure, audit_sink, records)
+                raise RepairUnitFailure(failure) from exc
+            except (TypeError, ValueError, KeyError) as exc:
+                raise RepairUnitFailure(
+                    {
+                        "stage": "repair",
+                        "code": "repair_unit_merge_failed",
+                        "message": str(exc),
+                        "repair_section_ids": list(unit.section_ids),
+                    }
+                ) from exc
+            working_extraction, working_synthesis = updated_extraction, updated_synthesis
+
+        if repaired_section_drafts:
+            # In the teaching pipeline the rendered synthesis is derived from
+            # the section drafts.  Rebuild it once after every private unit
+            # merge so the global review sees each repaired chapter.
+            working_synthesis = _teaching_synthesis(
+                note_input,
+                working_extraction,
+                outline,
+                tuple(
+                    working_drafts.get(draft.section_id, draft)
+                    for draft in section_drafts
+                ),
+            )
+            for patch, patch_segments in synthesis_only_patches:
+                working_synthesis = _merge_repair_patch(
+                    working_synthesis,
+                    patch,
+                    patch_segments,
+                    extraction=working_extraction,
+                )
+
+        return (
+            working_extraction,
+            working_synthesis,
+            tuple(
+                working_drafts.get(draft.section_id, draft)
+                for draft in section_drafts
+            ),
+        )
+
     async def _call[T: BaseModel](
         self,
         *,
@@ -1391,7 +2298,7 @@ class SemanticNotePipeline:
         _check_cancellation(cancel_event)
         system_prompt = system_prompt_override or SYSTEM_PROMPTS[stage]
         prompt_version = prompt_version_override or PROMPT_VERSIONS[stage]
-        json_schema = schema.model_json_schema()
+        json_schema = _model_json_schema(schema)
         request_payload = copy.deepcopy(dict(payload))
         budget = _provider_request_budget(
             stage=stage,
@@ -1635,6 +2542,8 @@ def _split_segment_batch(batch: SegmentBatch) -> list[SegmentBatch]:
                     start=segment.start,
                     end=segment.end,
                     text=segment.text[:midpoint],
+                    segment_id=segment.segment_id,
+                    source_offset=segment.source_offset,
                 )
             ],
             [
@@ -1643,6 +2552,8 @@ def _split_segment_batch(batch: SegmentBatch) -> list[SegmentBatch]:
                     start=segment.start,
                     end=segment.end,
                     text=segment.text[midpoint:],
+                    segment_id=segment.segment_id,
+                    source_offset=segment.source_offset + midpoint,
                 )
             ],
         )
@@ -1700,6 +2611,24 @@ def _input_is_sufficient(note_input: NoteInput) -> bool:
 
     if not note_input.transcript.strip() or not note_input.segments:
         return False
+    # A few acknowledgement syllables can be structurally valid ASR input, but
+    # cannot support a complete learning note. Count Unicode alphanumerics so
+    # line breaks and repeated punctuation cannot make a sparse transcript pass.
+    if sum(character.isalnum() for character in note_input.transcript) < 12:
+        return False
+    # A transcription can exceed the character threshold by repeating one
+    # acknowledgement across many ASR chunks.  Require enough variation in
+    # the segment text to support a learning note; otherwise no provider is
+    # called and the existing note stays in place.
+    normalized_segments = [
+        "".join(character for character in segment.text.casefold() if character.isalnum())
+        for segment in note_input.segments
+    ]
+    non_empty_segments = [text for text in normalized_segments if text]
+    if not non_empty_segments or (
+        len(non_empty_segments) > 1 and len(set(non_empty_segments)) == 1
+    ):
+        return False
     if note_input.transcript_variant not in {"raw", "cleaned"}:
         return False
     warning_text = " ".join(note_input.warnings).casefold()
@@ -1714,22 +2643,9 @@ def _input_is_sufficient(note_input: NoteInput) -> bool:
     if any(marker.casefold() in warning_text for marker in sparse_markers):
         return False
 
-    candidates: list[Any] = [
-        note_input.metadata,
-        getattr(note_input, "note_budget", None),
-    ]
-    if isinstance(note_input.metadata, Mapping):
-        candidates.extend(
-            value
-            for key in ("note_budget", "budget", "visual_dependency")
-            if isinstance((value := note_input.metadata.get(key)), Mapping)
-        )
-    for value in candidates:
-        if not isinstance(value, Mapping):
-            continue
-        visual = value.get("visual_dependency", value)
-        if isinstance(visual, Mapping) and visual.get("risk") in {"medium", "high"}:
-            return False
+    # Visual dependency is reported independently by rendering. It can limit
+    # what the note claims about the video, but it does not make complete text
+    # evidence insufficient by itself.
     return True
 
 
@@ -1753,9 +2669,7 @@ def _project_extraction(
     ]
     return {
         "atoms": atoms,
-        "dispositions": [
-            item.model_dump(mode="json") for item in extraction.dispositions
-        ],
+        "dispositions": [item.model_dump(mode="json") for item in extraction.dispositions],
     }
 
 
@@ -1765,10 +2679,11 @@ def _project_atom(
     include_source_excerpt: bool = True,
 ) -> dict[str, Any]:
     data = (
-        atom.model_dump(mode="json")
-        if isinstance(atom, BaseModel)
-        else copy.deepcopy(dict(atom))
+        atom.model_dump(mode="json") if isinstance(atom, BaseModel) else copy.deepcopy(dict(atom))
     )
+    # ``source_start`` is local routing metadata, not semantic evidence the
+    # model should be asked to infer or repeat.
+    data.pop("source_start", None)
     statement = data.get("statement")
     excerpt = data.get("source_excerpt")
     if statement == excerpt:
@@ -1793,9 +2708,7 @@ def _project_synthesis(
         return data
 
     atom_text = {
-        atom.id: atom.source_excerpt
-        if atom.statement == atom.source_excerpt
-        else atom.statement
+        atom.id: atom.source_excerpt if atom.statement == atom.source_excerpt else atom.statement
         for atom in extraction.atoms
     }
 
@@ -1820,9 +2733,7 @@ def _project_synthesis(
         "boundaries_and_risks",
         "promotions",
     ):
-        data[field_name] = [
-            compact_item(item) for item in data[field_name]
-        ]
+        data[field_name] = [compact_item(item) for item in data[field_name]]
     data["timeline"] = [compact_item(item) for item in data["timeline"]]
     return data
 
@@ -1889,6 +2800,269 @@ def _validate_outline_response(outline: TeachingOutline) -> None:
         raise ValueError("outline must contain each fixed teaching section exactly once")
 
 
+def _validate_extraction_response(
+    batch: SegmentBatch,
+    extraction: ExtractionResult,
+) -> None:
+    """Reject structurally valid JSON that loses source evidence.
+
+    Ollama can satisfy the Pydantic schema while returning a shortened title,
+    an excerpt with a timestamp appended, or an included disposition without
+    any atoms. Those responses poison every later teaching stage, so retry the
+    extraction while the complete source segment is still available.
+    """
+
+    segments_by_index: dict[int, list[InputSegment]] = {}
+    for segment in batch.segments:
+        segments_by_index.setdefault(segment.index, []).append(segment)
+    expected_segments = set(segments_by_index)
+    disposition_by_segment: dict[int, list[Any]] = {}
+    for disposition in extraction.dispositions:
+        disposition_by_segment.setdefault(disposition.segment_index, []).append(disposition)
+    if set(disposition_by_segment) != expected_segments:
+        raise ValueError("extraction source coverage has missing segment dispositions")
+    if any(
+        len(items) != len(segments_by_index[index])
+        for index, items in disposition_by_segment.items()
+        if len(segments_by_index[index]) == 1
+    ):
+        raise ValueError("extraction source coverage has duplicate segment dispositions")
+
+    atom_by_id: dict[str, Any] = {}
+    for atom in extraction.atoms:
+        if atom.id in atom_by_id:
+            raise ValueError(f"extraction atom_ids duplicate: {atom.id}")
+        if atom.source_segment not in expected_segments:
+            raise ValueError("extraction atom source_segment is outside the batch")
+        atom_by_id[atom.id] = atom
+
+    for disposition in extraction.dispositions:
+        if disposition.disposition in {"included", "promotion"} and not disposition.atom_ids:
+            raise ValueError("extraction disposition requires atom_ids")
+        if disposition.disposition not in {"included", "promotion"} and disposition.atom_ids:
+            raise ValueError("extraction disposition has unauthorized atom_ids")
+        for atom_id in disposition.atom_ids:
+            atom = atom_by_id.get(atom_id)
+            if atom is None or atom.source_segment != disposition.segment_index:
+                raise ValueError("extraction disposition references an invalid atom_id")
+
+    # Every extracted atom must be accounted for by exactly one disposition of
+    # its source segment.  Without this, a schema-shaped response can attach
+    # meaningful atoms to segments marked ``unintelligible_asr`` with empty
+    # atom lists.  The later source-coverage loop deliberately skips those
+    # dispositions, allowing a contradictory extraction to poison the
+    # teaching stages instead of triggering the exact-source fallback.
+    for segment_index in expected_segments:
+        expected_atom_ids = {
+            atom.id for atom in extraction.atoms if atom.source_segment == segment_index
+        }
+        mapped_atom_ids = [
+            atom_id
+            for disposition in disposition_by_segment[segment_index]
+            for atom_id in disposition.atom_ids
+        ]
+        if len(mapped_atom_ids) != len(set(mapped_atom_ids)):
+            raise ValueError("extraction atom mapping duplicates a source atom")
+        if set(mapped_atom_ids) != expected_atom_ids:
+            raise ValueError("extraction atom mapping does not match its source segment")
+
+    for segment_index, source_segments in segments_by_index.items():
+        dispositions = disposition_by_segment[segment_index]
+        # Duplicate indexes are lossless fragments of one original segment.
+        # Their dispositions are merged later, so validate excerpt membership
+        # without requiring one fragment to cover another fragment's text.
+        if len(source_segments) > 1:
+            source_texts = [segment.text for segment in source_segments]
+            for atom in extraction.atoms:
+                if atom.source_segment == segment_index and not any(
+                    atom.source_excerpt in source for source in source_texts
+                ):
+                    raise ValueError("extraction source coverage contains a non-source excerpt")
+            continue
+        if dispositions[0].disposition not in {"included", "promotion"}:
+            continue
+        source = source_segments[0].text
+        if not source.strip():
+            continue
+        intervals: list[tuple[int, int]] = []
+        for atom in extraction.atoms:
+            if atom.source_segment != segment_index:
+                continue
+            excerpt = atom.source_excerpt
+            starts: list[int] = []
+            cursor = 0
+            while excerpt:
+                start = source.find(excerpt, cursor)
+                if start < 0:
+                    break
+                starts.append(start)
+                cursor = start + 1
+            if not starts:
+                raise ValueError("extraction source coverage contains a non-source excerpt")
+            intervals.extend((start, start + len(excerpt)) for start in starts)
+        covered = [False] * len(source)
+        for start, end in intervals:
+            for offset in range(start, end):
+                if not source[offset].isspace():
+                    covered[offset] = True
+        if any(not covered[offset] for offset, char in enumerate(source) if not char.isspace()):
+            raise ValueError("extraction source coverage is incomplete")
+
+
+def _canonical_source_extraction(batch: SegmentBatch) -> ExtractionResult:
+    """Preserve exact source evidence after two invalid local extractions."""
+
+    atoms: list[dict[str, Any]] = []
+    dispositions: list[dict[str, Any]] = []
+    for segment_number, segment in enumerate(batch.segments, 1):
+        source = segment.text
+        if not source.strip():
+            dispositions.append(
+                {
+                    "segment_index": segment.index,
+                    "disposition": "unintelligible_asr",
+                    "atom_ids": [],
+                    "reason": "source segment is empty",
+                }
+            )
+            continue
+        # Keep punctuation with each clause so the source coverage validator
+        # can prove that no character was discarded or rewritten. Long
+        # unpunctuated ASR spans must also be split before review: the review
+        # layer can further divide source segments for its own context budget,
+        # and an atom larger than a review fragment cannot be evidenced there.
+        clauses = _source_preserving_fallback_clause_spans(source)
+        segment_atom_ids: list[str] = []
+        for clause_number, (clause, clause_start) in enumerate(clauses, 1):
+            text = clause.strip()
+            if not text:
+                continue
+            leading_whitespace = len(clause) - len(clause.lstrip())
+            atom_id = f"fallback-{batch.batch_index:03d}-{segment_number:03d}-{clause_number:03d}"
+            kind = "claim"
+            sequence = None
+            promotional = bool(re.search(r"关注|点赞|收藏|领取|下期|私信|购买|优惠", text))
+            if promotional:
+                kind = "promotion"
+            elif re.search(r"第[一二三四五六七八九十0-9]+步|首先|其次|最后|步骤", text):
+                kind = "step"
+                sequence = (
+                    sum(
+                        atom.get("sequence") is not None
+                        for atom in atoms
+                        if atom.get("kind") == "step"
+                    )
+                    + 1
+                )
+            elif re.search(r"例如|比如|案例", text):
+                kind = "example"
+            elif re.search(r"只有|如果|前提|条件|除非", text):
+                kind = "condition"
+            elif re.search(r"注意|不要|风险|否则", text):
+                kind = "warning"
+            atom = {
+                "id": atom_id,
+                "kind": kind,
+                "topic": "视频原文",
+                "statement": text,
+                "source_segment": segment.index,
+                "start": segment.start,
+                "end": segment.end,
+                "source_excerpt": text,
+                "source_start": segment.source_offset + clause_start + leading_whitespace,
+                "relations": [],
+                "sequence": sequence,
+                "is_promotional": promotional,
+                "asr_uncertainty": [],
+            }
+            atoms.append(atom)
+            segment_atom_ids.append(atom_id)
+        # Example, condition, and warning atoms must have a relation for the strict
+        # coverage validator. Link them to the first factual atom in the same
+        # source segment without inventing a new claim.
+        anchor = next(
+            (
+                item["id"]
+                for item in atoms
+                if item["source_segment"] == segment.index and item["kind"] in {"claim", "step"}
+            ),
+            None,
+        )
+        if anchor is not None:
+            for item in atoms:
+                if item["source_segment"] == segment.index and item["kind"] in {
+                    "example",
+                    "condition",
+                    "warning",
+                }:
+                    item["relations"] = [anchor]
+        dispositions.append(
+            {
+                "segment_index": segment.index,
+                "disposition": "promotion"
+                if any(
+                    item["source_segment"] == segment.index and item["kind"] == "promotion"
+                    for item in atoms
+                )
+                else "included",
+                "atom_ids": segment_atom_ids,
+                "reason": "lossless source-preserving local fallback",
+            }
+        )
+    return ExtractionResult.model_validate(
+        {"atoms": atoms, "dispositions": dispositions}, strict=True
+    )
+
+
+def _source_preserving_fallback_clauses(source: str) -> list[str]:
+    """Split source verbatim into review-sized evidence atoms."""
+
+    return [text for text, _ in _source_preserving_fallback_clause_spans(source)]
+
+
+def _source_preserving_fallback_clause_spans(source: str) -> list[tuple[str, int]]:
+    """Return lossless fallback clauses with their source character starts."""
+
+    max_chars = 512
+    clauses: list[tuple[str, int]] = []
+    cursor = 0
+    for clause in re.split(r"(?<=[。！？!?；;])", source):
+        clause_start = cursor
+        cursor += len(clause)
+        if not clause.strip():
+            continue
+        clauses.extend(
+            (clause[offset : offset + max_chars], clause_start + offset)
+            for offset in range(0, len(clause), max_chars)
+            if clause[offset : offset + max_chars].strip()
+        )
+    return clauses or [(source, 0)]
+
+
+def _validate_source_review(review: CoverageReview, batch: SegmentBatch) -> None:
+    expected = {segment.index for segment in batch.segments}
+    actual = review.reviewed_segment_indexes
+    if set(actual) != expected or len(actual) != len(set(actual)):
+        raise ValueError("source review must cover each source segment exactly once")
+
+
+def _validate_claim_review(
+    review: DraftClaimReview,
+    expected_ids: set[str],
+) -> None:
+    reviewed = set(review.reviewed_claim_ids)
+    supported = set(review.supported_claim_ids)
+    contradicted = set(review.contradicted_claim_ids)
+    if (
+        not reviewed <= expected_ids
+        or not supported <= expected_ids
+        or not contradicted <= expected_ids
+    ):
+        raise ValueError("draft claim review referenced an unknown claim")
+    if supported & contradicted:
+        raise ValueError("draft claim review returned conflicting verdicts")
+
+
 def _normalize_outline(
     outline: TeachingOutline,
     extraction: ExtractionResult,
@@ -1902,11 +3076,7 @@ def _normalize_outline(
     ):
         raise ValueError("outline must contain the fixed teaching sections")
 
-    referenced_ids = {
-        atom_id
-        for section in outline.sections
-        for atom_id in section.atom_ids
-    }
+    referenced_ids = {atom_id for section in outline.sections for atom_id in section.atom_ids}
     referenced_ids.update(outline.included_atom_ids)
     referenced_ids.update(outline.unassigned_atom_ids)
     unknown_ids = sorted(referenced_ids - atom_ids)
@@ -1914,6 +3084,7 @@ def _normalize_outline(
         raise ValueError(f"outline references unknown atoms: {unknown_ids}")
 
     source_order = {atom.id: index for index, atom in enumerate(extraction.atoms)}
+    source_atoms = {atom.id: atom for atom in extraction.atoms}
 
     def ordered_unique(values: list[str]) -> list[str]:
         return sorted(
@@ -1923,24 +3094,54 @@ def _normalize_outline(
 
     assigned: set[str] = set()
     sections: list[TeachingOutlineSection] = []
+    source_fallback = _is_source_preserving_fallback(extraction)
+    fallback_ids_by_section = {
+        "overview": [atom.id for atom in extraction.atoms],
+        "core_points": [
+            atom.id
+            for atom in extraction.atoms
+            if atom.kind != "promotion" and not atom.is_promotional
+        ],
+        "methods_steps": [atom.id for atom in extraction.atoms if atom.kind == "step"],
+        "examples_results": [
+            atom.id for atom in extraction.atoms if atom.kind in {"example", "counterexample"}
+        ],
+        "boundaries_risks": [
+            atom.id for atom in extraction.atoms if atom.kind in {"condition", "warning"}
+        ],
+        "actions": [atom.id for atom in extraction.atoms if atom.kind == "recommendation"],
+        "timeline": [atom.id for atom in extraction.atoms],
+        "evidence_limits": [atom.id for atom in extraction.atoms if atom.asr_uncertainty],
+    }
     for order, section_id in enumerate(_TEACHING_SECTION_IDS, 1):
         section = by_id[section_id]
         # An atom may legitimately support more than one teaching section.
         # Only duplicate references inside the same section are collapsed.
-        ids = ordered_unique(section.atom_ids)
+        ids = ordered_unique(
+            fallback_ids_by_section[section_id] if source_fallback else section.atom_ids
+        )
         assigned.update(ids)
+        timestamps = section.timestamps
+        if source_fallback:
+            timestamps = sorted(
+                {
+                    value
+                    for atom_id in ids
+                    for value in (
+                        source_atoms[atom_id].start,
+                        source_atoms[atom_id].end,
+                    )
+                    if value is not None
+                }
+            )
         sections.append(
-            section.model_copy(update={"order": order, "atom_ids": ids})
+            section.model_copy(update={"order": order, "atom_ids": ids, "timestamps": timestamps})
         )
     unassigned = [atom.id for atom in extraction.atoms if atom.id not in assigned]
     if unassigned:
         limit_index = _TEACHING_SECTION_IDS.index("evidence_limits")
         sections[limit_index] = sections[limit_index].model_copy(
-            update={
-                "atom_ids": ordered_unique(
-                    [*sections[limit_index].atom_ids, *unassigned]
-                )
-            }
+            update={"atom_ids": ordered_unique([*sections[limit_index].atom_ids, *unassigned])}
         )
     return outline.model_copy(
         update={
@@ -1949,6 +3150,162 @@ def _normalize_outline(
             "unassigned_atom_ids": [],
         }
     )
+
+
+def _source_fallback_outline(extraction: ExtractionResult) -> TeachingOutline:
+    atom_by_id = {atom.id: atom for atom in extraction.atoms}
+    source_order = {atom.id: index for index, atom in enumerate(extraction.atoms)}
+
+    def with_relations(atom_ids: list[str]) -> list[str]:
+        expanded = list(atom_ids)
+        for atom_id in atom_ids:
+            atom = atom_by_id[atom_id]
+            expanded.extend(relation for relation in atom.relations if relation in atom_by_id)
+        return sorted(dict.fromkeys(expanded), key=source_order.__getitem__)
+
+    non_promotional = [
+        atom.id for atom in extraction.atoms if atom.kind != "promotion" and not atom.is_promotional
+    ]
+    overview_ids = with_relations(non_promotional[:3])
+    assignments = {
+        "overview": overview_ids,
+        "core_points": with_relations(non_promotional),
+        "methods_steps": with_relations(
+            [atom.id for atom in extraction.atoms if atom.kind == "step"]
+        ),
+        "examples_results": with_relations(
+            [atom.id for atom in extraction.atoms if atom.kind in {"example", "counterexample"}]
+        ),
+        "boundaries_risks": with_relations(
+            [atom.id for atom in extraction.atoms if atom.kind in {"condition", "warning"}]
+        ),
+        "actions": with_relations(
+            [atom.id for atom in extraction.atoms if atom.kind == "recommendation"]
+        ),
+        "timeline": [atom.id for atom in extraction.atoms],
+        "evidence_limits": with_relations(
+            [atom.id for atom in extraction.atoms if atom.asr_uncertainty]
+        ),
+    }
+    titles = {
+        "overview": "概述",
+        "core_points": "核心要点",
+        "methods_steps": "方法步骤",
+        "examples_results": "示例与结果",
+        "boundaries_risks": "边界与风险",
+        "actions": "行动建议",
+        "timeline": "时间线",
+        "evidence_limits": "证据限制",
+    }
+    evidence_types: dict[str, list[str]] = {
+        "overview": ["claim"],
+        "core_points": ["claim", "reason"],
+        "methods_steps": ["step"],
+        "examples_results": ["example", "result"],
+        "boundaries_risks": ["condition", "risk"],
+        "actions": ["action"],
+        "timeline": ["claim"],
+        "evidence_limits": ["uncertainty"],
+    }
+    sections = []
+    for order, section_id in enumerate(_TEACHING_SECTION_IDS, 1):
+        atom_ids = assignments[section_id]
+        sections.append(
+            TeachingOutlineSection(
+                section_id=section_id,
+                title=titles[section_id],
+                order=order,
+                atom_ids=atom_ids,
+                required_evidence_types=evidence_types[section_id],
+                missing_evidence_policy="视频未提供这一类信息。",
+                timestamps=sorted(
+                    {
+                        value
+                        for atom_id in atom_ids
+                        for value in (
+                            atom_by_id[atom_id].start,
+                            atom_by_id[atom_id].end,
+                        )
+                        if value is not None
+                    }
+                ),
+            )
+        )
+    return TeachingOutline(
+        sections=sections,
+        included_atom_ids=[atom.id for atom in extraction.atoms],
+        unassigned_atom_ids=[],
+        input_sufficient=bool(extraction.atoms),
+    )
+
+
+def _source_fallback_section_drafts(
+    extraction: ExtractionResult,
+    outline: TeachingOutline,
+) -> tuple[SectionDraft, ...]:
+    atom_by_id = {atom.id: atom for atom in extraction.atoms}
+
+    def claim(atom: Any) -> SectionClaim:
+        timestamps = [value for value in (atom.start, atom.end) if value is not None]
+        if not timestamps:
+            timestamps = [float(atom.source_segment)]
+        return SectionClaim(
+            text=atom.statement,
+            atom_ids=[atom.id],
+            timestamps=timestamps,
+        )
+
+    drafts = []
+    for section in sorted(outline.sections, key=lambda item: item.order):
+        atoms = [atom_by_id[atom_id] for atom_id in section.atom_ids]
+        result_ids = {
+            relation
+            for atom in atoms
+            if atom.kind in {"example", "counterexample"}
+            for relation in atom.relations
+            if relation in atom_by_id
+        }
+        relation_anchor_ids = {
+            relation
+            for atom in atoms
+            if atom.kind in {"condition", "warning"}
+            for relation in atom.relations
+            if relation in atom_by_id
+        }
+        claim_atoms = [
+            atom
+            for atom in atoms
+            if atom.kind in {"claim", "reason", "definition", "number", "quote"}
+            or atom.id in relation_anchor_ids
+        ]
+        drafts.append(
+            SectionDraft(
+                section_id=section.section_id,
+                title=section.title,
+                content=(
+                    "；".join(atom.statement for atom in atoms)
+                    if atoms
+                    else section.missing_evidence_policy
+                ),
+                claims=[claim(atom) for atom in claim_atoms],
+                steps=[claim(atom) for atom in atoms if atom.kind == "step"],
+                examples=[
+                    claim(atom) for atom in atoms if atom.kind in {"example", "counterexample"}
+                ],
+                results=[
+                    claim(atom_by_id[atom_id])
+                    for atom_id in section.atom_ids
+                    if atom_id in result_ids
+                ],
+                conditions=[claim(atom) for atom in atoms if atom.kind == "condition"],
+                risks=[claim(atom) for atom in atoms if atom.kind == "warning"],
+                actions=[claim(atom) for atom in atoms if atom.kind == "recommendation"],
+                included_atom_ids=list(section.atom_ids),
+                unprovided_items=[],
+                generated_interpretations=[],
+            )
+        )
+    return tuple(drafts)
 
 
 def _merge_outlines(values: list[TeachingOutline]) -> TeachingOutline:
@@ -1962,12 +3319,8 @@ def _merge_outlines(values: list[TeachingOutline]) -> TeachingOutline:
                 current = sections[section.section_id]
                 sections[section.section_id] = current.model_copy(
                     update={
-                        "atom_ids": _dedupe_text(
-                            [*current.atom_ids, *section.atom_ids]
-                        ),
-                        "timestamps": sorted(
-                            {*current.timestamps, *section.timestamps}
-                        ),
+                        "atom_ids": _dedupe_text([*current.atom_ids, *section.atom_ids]),
+                        "timestamps": sorted({*current.timestamps, *section.timestamps}),
                     }
                 )
         included.extend(outline.included_atom_ids)
@@ -1985,32 +3338,19 @@ def _section_payload(
     note_input: NoteInput,
     section: TeachingOutlineSection,
     atoms: list[Any],
-    *,
-    compact: bool = False,
-    max_chars: int | None = None,
 ) -> dict[str, Any]:
     indexes = {atom.source_segment for atom in atoms}
     source_segments = [
-        _segment_payload(segment)
-        for segment in note_input.segments
-        if segment.index in indexes
+        _segment_payload(segment) for segment in note_input.segments if segment.index in indexes
     ]
     atom_catalog = [_atom_catalog_entry(atom) for atom in atoms]
-    if compact:
-        atom_catalog = _compact_catalog(atom_catalog, max_chars=max_chars or 1024)
-        source_segments = _compact_source_segments(
-            note_input,
-            indexes,
-            atoms,
-            max_chars=max_chars or 1024,
-        )
     return {
         "prompt_version": PROMPT_VERSIONS["section"],
         "aweme_id": note_input.aweme_id,
         "section": section.model_dump(mode="json"),
         "atoms": atom_catalog,
         "source_segments": source_segments,
-        "input_truncated": compact,
+        "input_truncated": False,
     }
 
 
@@ -2027,11 +3367,7 @@ def _depth_review_payload(
 ) -> dict[str, Any]:
     context_sections = all_sections or sections
     outline_by_id = {section.section_id: section for section in outline.sections}
-    section_atom_ids = {
-        atom_id
-        for section in sections
-        for atom_id in section.included_atom_ids
-    }
+    section_atom_ids = {atom_id for section in sections for atom_id in section.included_atom_ids}
     for section in sections:
         if section.included_atom_ids:
             continue
@@ -2046,15 +3382,9 @@ def _depth_review_payload(
             continue
         relation_ids.update(atom.relations)
     target_indexes = {
-        atom_by_id[atom_id].source_segment
-        for atom_id in section_atom_ids
-        if atom_id in atom_by_id
+        atom_by_id[atom_id].source_segment for atom_id in section_atom_ids if atom_id in atom_by_id
     }
-    relation_indexes = {
-        atom.source_segment
-        for atom in extraction.atoms
-        if atom.id in relation_ids
-    }
+    relation_indexes = {atom.source_segment for atom in extraction.atoms if atom.id in relation_ids}
     source_segments = source_segments_override or [
         _segment_payload(segment)
         for segment in note_input.segments
@@ -2128,9 +3458,7 @@ def _compact_depth_outline(
                 "title": section.title,
                 "order": section.order,
                 "atom_ids": [
-                    atom_id
-                    for atom_id in section.atom_ids
-                    if atom_id in relevant_atom_ids
+                    atom_id for atom_id in section.atom_ids if atom_id in relevant_atom_ids
                 ],
                 "required_evidence_types": list(section.required_evidence_types),
                 "timestamps": list(section.timestamps),
@@ -2139,9 +3467,7 @@ def _compact_depth_outline(
     return {
         "sections": sections,
         "included_atom_ids": [
-            atom_id
-            for atom_id in outline.included_atom_ids
-            if atom_id in relevant_atom_ids
+            atom_id for atom_id in outline.included_atom_ids if atom_id in relevant_atom_ids
         ],
         "unassigned_atom_ids": [],
         "input_sufficient": outline.input_sufficient,
@@ -2197,24 +3523,16 @@ def _project_depth_section(section: SectionDraft, atom_ids: set[str]) -> Section
     updates: dict[str, Any] = {
         "included_atom_ids": list(
             dict.fromkeys(
-                item
-                for item in [*section.included_atom_ids, *sorted(atom_ids)]
-                if item in atom_ids
+                item for item in [*section.included_atom_ids, *sorted(atom_ids)] if item in atom_ids
             )
         ),
         "generated_interpretations": [],
     }
     for field_name in fields:
         updates[field_name] = [
-            claim
-            for claim in getattr(section, field_name)
-            if set(claim.atom_ids) & atom_ids
+            claim for claim in getattr(section, field_name) if set(claim.atom_ids) & atom_ids
         ]
-    texts = [
-        claim.text
-        for field_name in fields
-        for claim in updates[field_name]
-    ]
+    texts = [claim.text for field_name in fields for claim in updates[field_name]]
     updates["content"] = "\n".join(dict.fromkeys(texts)) or "视频未提供这一类信息。"
     return section.model_copy(update=updates)
 
@@ -2237,11 +3555,7 @@ def _depth_fragment_payloads(
             section.included_atom_ids
             or (outline_section.atom_ids if outline_section is not None else [])
         )
-    indexes = {
-        atom.source_segment
-        for atom in extraction.atoms
-        if atom.id in fragment_atom_ids
-    }
+    indexes = {atom.source_segment for atom in extraction.atoms if atom.id in fragment_atom_ids}
     if not indexes:
         return []
     max_chars = max(32, fragment_chars or int(context_tokens * 0.15))
@@ -2249,8 +3563,7 @@ def _depth_fragment_payloads(
         _project_depth_section(
             section,
             set(
-                section.included_atom_ids
-                or outline_by_id.get(section.section_id).atom_ids
+                section.included_atom_ids or outline_by_id.get(section.section_id).atom_ids
                 if outline_by_id.get(section.section_id) is not None
                 else section.included_atom_ids
             ),
@@ -2289,7 +3602,7 @@ def _depth_fragment_payloads(
                 stage="depth_review",
                 system_prompt=SYSTEM_PROMPTS["depth_review"],
                 payload=payload,
-                json_schema=DepthReview.model_json_schema(),
+                json_schema=_model_json_schema(DepthReview),
                 context_tokens=context_tokens,
             )["within_budget"]
         )
@@ -2343,17 +3656,112 @@ def _merge_depth_reviews(
         "non_repairable_findings",
     )
     data = {
-        field_name: _dedupe_text(
-            item
-            for value in values
-            for item in getattr(value, field_name)
-        )
+        field_name: _dedupe_text(item for value in values for item in getattr(value, field_name))
         for field_name in list_fields
     }
-    data["input_sufficient"] = input_sufficient and all(
-        value.input_sufficient for value in values
-    )
+    data["input_sufficient"] = input_sufficient and all(value.input_sufficient for value in values)
     return DepthReview.model_validate(data, strict=True)
+
+
+def _is_source_preserving_fallback(extraction: ExtractionResult) -> bool:
+    return bool(extraction.atoms and extraction.dispositions) and all(
+        disposition.reason
+        in {
+            "lossless source-preserving local fallback",
+            "source segment is empty",
+        }
+        for disposition in extraction.dispositions
+    )
+
+
+def _normalize_source_fallback_review(
+    review: CoverageReview,
+    extraction: ExtractionResult,
+    *,
+    aweme_id: str | None = None,
+) -> CoverageReview:
+    """Remove deterministic fallback/layout labels from provider findings.
+
+    Source-preserving fallback atom IDs and the fixed teaching layout are
+    created locally from the source. A model may report those labels or fixed
+    missing-evidence text as unsupported claims even though they are directly
+    traceable. Keep any remaining free-form finding for the normal quality
+    gate to reject.
+    """
+
+    if not _is_source_preserving_fallback(extraction):
+        return review
+    # The canonical fallback deterministically carries every proven source
+    # clause into the overview and its source-segment timeline.  Its positional
+    # provenance is verified before any review request is sent.  A provider
+    # therefore cannot discover a source omission on this path; local models
+    # have instead reported the verbatim timeline entries themselves as
+    # omissions (for example, every clause of a long REIT transcript).  Keep
+    # the structural review for malformed responses, but let the deterministic
+    # coverage validator be authoritative for source omission here.
+    # Atom IDs are implementation identifiers, while an atom's statement may
+    # be the exact source-derived text of a real draft claim.  Do not discard
+    # that source text here: the later claim-aware normalization keeps it only
+    # when it exactly matches a traceable DraftClaim.
+    atom_labels = {atom.id for atom in extraction.atoms}
+    layout_labels = set(_TEACHING_SECTION_IDS)
+    layout_labels.update(
+        {
+            "概述",
+            "核心要点",
+            "方法步骤",
+            "示例与结果",
+            "边界与风险",
+            "行动建议",
+            "时间线",
+            "证据限制",
+        }
+    )
+    layout_labels.add("视频未提供这一类信息。")
+    layout_labels.add("视频原文")
+    if aweme_id:
+        layout_labels.add(aweme_id)
+
+    def is_structural(value: str) -> bool:
+        text = value.strip()
+        if not text:
+            return True
+        if text in atom_labels or text in layout_labels:
+            return True
+        if any(text.startswith(f"{label}:") for label in layout_labels):
+            return True
+        return False
+
+    return review.model_copy(
+        update={
+            "source_omission_candidates": [],
+            "unsupported_draft_claims": [
+                value for value in review.unsupported_draft_claims if not is_structural(value)
+            ]
+        }
+    )
+
+
+def _normalize_provider_depth_review(
+    extraction: ExtractionResult,
+    review: DepthReview,
+) -> DepthReview:
+    """Let deterministic validation recalculate structural fallback findings."""
+
+    if not _is_source_preserving_fallback(extraction):
+        return review
+    return review.model_copy(
+        update={
+            "abstracted_atom_ids": [],
+            "example_without_result_atom_ids": [],
+            "condition_without_scope_atom_ids": [],
+            "reordered_step_atom_ids": [],
+            "lost_literal_atom_ids": [],
+            "lost_warning_or_promotion_atom_ids": [],
+            "lost_uncertainty_markers": [],
+            "repair_section_ids": [],
+        }
+    )
 
 
 def _validate_depth_review_refs(
@@ -2380,91 +3788,27 @@ def _validate_depth_review_refs(
     if section_ids is not None:
         allowed_sections &= section_ids
     unknown_sections = _dedupe_text(
-        section_id
-        for section_id in review.repair_section_ids
-        if section_id not in allowed_sections
+        section_id for section_id in review.repair_section_ids if section_id not in allowed_sections
     )
     valid_repair_sections = [
-        section_id
-        for section_id in review.repair_section_ids
-        if section_id in allowed_sections
+        section_id for section_id in review.repair_section_ids if section_id in allowed_sections
     ]
     if not unknown and not unknown_sections:
         return review
     return review.model_copy(
         update={
-            "unknown_atom_ids": _dedupe_text(
-                [*review.unknown_atom_ids, *unknown]
-            ),
+            "unknown_atom_ids": _dedupe_text([*review.unknown_atom_ids, *unknown]),
             "non_repairable_findings": _dedupe_text(
                 [
                     *review.non_repairable_findings,
                     *(f"unknown depth atom: {atom_id}" for atom_id in unknown),
-                    *(
-                        f"unknown depth section: {section_id}"
-                        for section_id in unknown_sections
-                    ),
+                    *(f"unknown depth section: {section_id}" for section_id in unknown_sections),
                 ]
             ),
             "repair_section_ids": valid_repair_sections,
-            "unknown_section_ids": _dedupe_text(
-                [*review.unknown_section_ids, *unknown_sections]
-            ),
+            "unknown_section_ids": _dedupe_text([*review.unknown_section_ids, *unknown_sections]),
         }
     )
-
-
-def _compact_catalog(
-    catalog: list[dict[str, Any]],
-    *,
-    max_chars: int,
-) -> list[dict[str, Any]]:
-    """Keep identifiers and traceability fields while bounding prompt size."""
-
-    remaining = max(1, max_chars)
-    per_item = max(1, remaining // max(1, len(catalog)))
-    compacted: list[dict[str, Any]] = []
-    for item in catalog:
-        value = {
-            "id": item["id"],
-            "kind": item["kind"],
-            "topic": item["topic"],
-            "statement": item["statement"][:per_item],
-            "source_segment": item["source_segment"],
-            "timestamps": item.get("timestamps", []),
-            "relations": item.get("relations", []),
-            "uncertainty": item.get("uncertainty", []),
-        }
-        compacted.append(value)
-    return compacted
-
-
-def _compact_source_segments(
-    note_input: NoteInput,
-    indexes: set[int],
-    atoms: list[Any] | list[dict[str, Any]],
-    *,
-    max_chars: int,
-) -> list[dict[str, Any]]:
-    atom_indexes = {
-        item.source_segment if hasattr(item, "source_segment") else item["source_segment"]
-        for item in atoms
-    }
-    selected = [
-        _segment_payload(segment)
-        for segment in note_input.segments
-        if segment.index in indexes and segment.index in atom_indexes
-    ]
-    if not selected:
-        selected = [
-            _segment_payload(segment)
-            for segment in note_input.segments
-            if segment.index in indexes
-        ]
-    budget_each = max(1, max_chars // max(1, len(selected)))
-    for item in selected:
-        item["text"] = item["text"][:budget_each]
-    return selected
 
 
 def _normalize_section(
@@ -2474,8 +3818,7 @@ def _normalize_section(
 ) -> SectionDraft:
     if draft.section_id != outline_section.section_id:
         raise ValueError(
-            f"section draft id mismatch: {draft.section_id} != "
-            f"{outline_section.section_id}"
+            f"section draft id mismatch: {draft.section_id} != {outline_section.section_id}"
         )
     allowed = set(outline_section.atom_ids)
     referenced = set(draft.included_atom_ids)
@@ -2489,30 +3832,114 @@ def _normalize_section(
         "actions",
     ):
         referenced.update(
-            atom_id
-            for claim in getattr(draft, field_name)
-            for atom_id in claim.atom_ids
+            atom_id for claim in getattr(draft, field_name) for atom_id in claim.atom_ids
         )
     unknown = sorted(
-        atom_id
-        for atom_id in referenced
-        if atom_id not in atom_by_id or atom_id not in allowed
+        atom_id for atom_id in referenced if atom_id not in atom_by_id or atom_id not in allowed
     )
     if unknown:
         raise ValueError(f"section references unauthorized atoms: {unknown}")
 
     source_order = {atom_id: index for index, atom_id in enumerate(atom_by_id)}
     included = sorted(
-        dict.fromkeys(
-            [*draft.included_atom_ids, *outline_section.atom_ids]
-        ),
+        dict.fromkeys([*draft.included_atom_ids, *outline_section.atom_ids]),
         key=lambda atom_id: source_order[atom_id],
     )
+    assigned_atoms = [atom_by_id[atom_id] for atom_id in included]
+
+    def atom_value(atom: Any, name: str) -> Any:
+        return atom.get(name) if isinstance(atom, Mapping) else getattr(atom, name)
+
+    searchable = "\n".join(
+        [
+            draft.content,
+            *(
+                item.text
+                for field_name in (
+                    "claims",
+                    "steps",
+                    "examples",
+                    "results",
+                    "conditions",
+                    "risks",
+                    "actions",
+                )
+                for item in getattr(draft, field_name)
+            ),
+        ]
+    )
+    missing_statements = [
+        str(atom_value(atom, "statement"))
+        for atom in assigned_atoms
+        if str(atom_value(atom, "statement")) not in searchable
+        and str(atom_value(atom, "source_excerpt")) not in searchable
+    ]
+    content = draft.content
+    generated_interpretations = list(draft.generated_interpretations)
+    source_statements = [str(atom_value(atom, "statement")) for atom in assigned_atoms]
+
+    def normalized_text(value: str) -> str:
+        return re.sub(r"\s+", "", value).strip()
+
+    source_echoes = {
+        *(normalized_text(value) for value in source_statements),
+        normalized_text("".join(source_statements)),
+    }
+    generated_interpretations = [
+        value
+        for value in generated_interpretations
+        if normalized_text(value.removeprefix("视频原文：").removeprefix("原文："))
+        not in source_echoes
+    ]
+    structured_items = [
+        item
+        for field_name in (
+            "claims",
+            "steps",
+            "examples",
+            "results",
+            "conditions",
+            "risks",
+            "actions",
+        )
+        for item in getattr(draft, field_name)
+    ]
+    if not included and not structured_items:
+        content = outline_section.missing_evidence_policy
+        generated_interpretations = []
+    if missing_statements:
+        normalized_content = re.sub(r"\s+", " ", content).strip().casefold()
+        template_values = {
+            outline_section.title.strip().casefold(),
+            outline_section.section_id.casefold(),
+            outline_section.section_id.replace("_", " ").casefold(),
+            outline_section.missing_evidence_policy.strip().casefold(),
+            "claim",
+            "step",
+            "example",
+            "result",
+            "condition",
+            "risk",
+            "action",
+            "核心要点",
+            "方法步骤",
+            "示例与结果",
+            "边界与风险",
+            "时间线",
+            "视频原文",
+        }
+        exact_source = "\n".join(dict.fromkeys(source_statements))
+        if normalized_content in template_values:
+            content = exact_source
+        else:
+            content = f"{content.rstrip()}\n\n原文证据：\n{exact_source}"
     return draft.model_copy(
         update={
             "section_id": outline_section.section_id,
             "title": outline_section.title,
             "included_atom_ids": included,
+            "content": content,
+            "generated_interpretations": generated_interpretations,
         }
     )
 
@@ -2544,22 +3971,14 @@ def _merge_section_drafts(
     ):
         if field_name in {"unprovided_items", "generated_interpretations"}:
             data[field_name] = list(
-                dict.fromkeys(
-                    item
-                    for value in values
-                    for item in getattr(value, field_name)
-                )
+                dict.fromkeys(item for value in values for item in getattr(value, field_name))
             )
             continue
         seen: set[tuple[Any, ...]] = set()
         merged_items: list[dict[str, Any]] = []
         for value in values:
             for item in getattr(value, field_name):
-                item_data = (
-                    item.model_dump(mode="json")
-                    if hasattr(item, "model_dump")
-                    else item
-                )
+                item_data = item.model_dump(mode="json") if hasattr(item, "model_dump") else item
                 key = (
                     item_data.get("text"),
                     tuple(item_data.get("atom_ids", [])),
@@ -2582,12 +4001,14 @@ def _teaching_synthesis(
     outline: TeachingOutline,
     drafts: tuple[SectionDraft, ...],
 ) -> SynthesisResult:
+    if _is_source_preserving_fallback(extraction):
+        return _source_fallback_synthesis(note_input, extraction, outline)
     by_id = {draft.section_id: draft for draft in drafts}
     atom_by_id = {atom.id: atom for atom in extraction.atoms}
 
     def theme(section_id: str) -> list[ThemeSection]:
         draft = by_id.get(section_id)
-        if draft is None:
+        if draft is None or not draft.included_atom_ids:
             return []
         return [
             ThemeSection(
@@ -2596,17 +4017,9 @@ def _teaching_synthesis(
                 atom_ids=list(draft.included_atom_ids),
                 timestamps=sorted(
                     {
-                        timestamp
-                        for item in (
-                            *draft.claims,
-                            *draft.steps,
-                            *draft.examples,
-                            *draft.results,
-                            *draft.conditions,
-                            *draft.risks,
-                            *draft.actions,
-                        )
-                        for timestamp in item.timestamps
+                        atom.start
+                        for atom_id in draft.included_atom_ids
+                        if (atom := atom_by_id.get(atom_id)) is not None and atom.start is not None
                     }
                 ),
             )
@@ -2637,14 +4050,13 @@ def _teaching_synthesis(
         for disposition in sorted(extraction.dispositions, key=lambda item: item.segment_index)
     ]
     overview = by_id.get("overview")
+    source_fallback = _is_source_preserving_fallback(extraction)
     promotion_sections = [
         ThemeSection(
             heading=atom.topic,
             content=atom.statement,
             atom_ids=[atom.id],
-            timestamps=[
-                value for value in (atom.start, atom.end) if value is not None
-            ],
+            timestamps=[value for value in (atom.start, atom.end) if value is not None],
         )
         for atom in extraction.atoms
         if atom.kind == "promotion" or atom.is_promotional
@@ -2653,19 +4065,154 @@ def _teaching_synthesis(
         title=note_input.description or note_input.aweme_id,
         overview=overview.content if overview else "视频未提供这一类信息。",
         structure=[section.title for section in outline.sections],
-        themes=theme("core_points"),
+        # The outline may legitimately assign evidence to the overview,
+        # actions, timeline, or evidence-limits chapter instead of
+        # ``core_points``.  Each populated teaching chapter must remain in the
+        # traceable thematic projection; otherwise valid evidence can never
+        # satisfy the existing coverage gate merely because of its chapter.
+        themes=[
+            *theme("overview"),
+            *theme("core_points"),
+            *theme("actions"),
+            *theme("timeline"),
+            *theme("evidence_limits"),
+        ],
         methods_and_steps=theme("methods_steps"),
         examples_and_counterexamples=theme("examples_results"),
         boundaries_and_risks=theme("boundaries_risks"),
         concepts=_dedupe_text(atom.topic for atom in extraction.atoms if atom.kind == "definition"),
         quotes=_dedupe_text(atom.statement for atom in extraction.atoms if atom.kind == "quote"),
-        implications=_dedupe_text(draft.content for draft in drafts),
+        implications=(
+            []
+            if source_fallback
+            else _dedupe_text(
+                value if value.startswith("生成理解：") else f"生成理解：{value}"
+                for draft in drafts
+                for value in draft.generated_interpretations
+                if value != "视频未提供这一类信息。"
+            )
+        ),
         actions=_dedupe_text(item.text for draft in drafts for item in draft.actions),
         timeline=timeline,
         promotions=promotion_sections,
         tags=[],
         included_atom_ids=[atom.id for atom in extraction.atoms],
     )
+
+
+def _source_fallback_synthesis(
+    note_input: NoteInput,
+    extraction: ExtractionResult,
+    outline: TeachingOutline,
+) -> SynthesisResult:
+    atom_by_id = {atom.id: atom for atom in extraction.atoms}
+    outline_by_id = {section.section_id: section for section in outline.sections}
+
+    def theme(atom: Any) -> ThemeSection:
+        return ThemeSection(
+            heading=atom.topic,
+            content=atom.statement,
+            atom_ids=[atom.id],
+            timestamps=[atom.start] if atom.start is not None else [],
+        )
+
+    def atoms_for(section_id: str) -> list[Any]:
+        section = outline_by_id[section_id]
+        return [atom_by_id[atom_id] for atom_id in section.atom_ids]
+
+    overview_atoms = atoms_for("overview")
+    timeline = [
+        TimelineEntry(
+            segment_index=disposition.segment_index,
+            start=next(
+                (s.start for s in note_input.segments if s.index == disposition.segment_index),
+                None,
+            ),
+            end=next(
+                (s.end for s in note_input.segments if s.index == disposition.segment_index),
+                None,
+            ),
+            disposition=disposition.disposition,
+            atom_ids=list(disposition.atom_ids),
+            content=(
+                "；".join(
+                    atom_by_id[atom_id].statement
+                    for atom_id in disposition.atom_ids
+                    if atom_id in atom_by_id
+                )
+                or "无内容"
+            ),
+        )
+        for disposition in sorted(
+            extraction.dispositions,
+            key=lambda item: item.segment_index,
+        )
+    ]
+    return SynthesisResult(
+        title=note_input.description or note_input.aweme_id,
+        overview=("；".join(atom.statement for atom in overview_atoms) or "视频未提供这一类信息。"),
+        structure=[section.title for section in outline.sections],
+        themes=[theme(atom) for atom in atoms_for("core_points")],
+        methods_and_steps=[
+            theme(atom) for atom in atoms_for("methods_steps") if atom.kind == "step"
+        ],
+        examples_and_counterexamples=[
+            theme(atom)
+            for atom in atoms_for("examples_results")
+            if atom.kind in {"example", "counterexample"}
+        ],
+        boundaries_and_risks=[
+            theme(atom)
+            for atom in atoms_for("boundaries_risks")
+            if atom.kind in {"condition", "warning"}
+        ],
+        concepts=_dedupe_text(atom.topic for atom in extraction.atoms if atom.kind == "definition"),
+        quotes=_dedupe_text(atom.statement for atom in extraction.atoms if atom.kind == "quote"),
+        implications=[],
+        actions=_dedupe_text(
+            atom.statement for atom in extraction.atoms if atom.kind == "recommendation"
+        ),
+        timeline=timeline,
+        promotions=[
+            theme(atom)
+            for atom in extraction.atoms
+            if atom.kind == "promotion" or atom.is_promotional
+        ],
+        tags=_dedupe_text(atom.topic for atom in extraction.atoms),
+        included_atom_ids=[atom.id for atom in extraction.atoms],
+    )
+
+
+def _atom_ids_for_source_batch(
+    extraction: ExtractionResult,
+    batch: SegmentBatch,
+) -> set[str]:
+    """Return the evidence atoms wholly represented by a review fragment.
+
+    Provider-produced atoms predate positional provenance, so their source
+    excerpts retain the former membership check.  Canonical fallback atoms do
+    carry a source position; that coordinate is required whenever repeated
+    text makes a substring match ambiguous.
+    """
+
+    selected: set[str] = set()
+    use_positions = _is_source_preserving_fallback(extraction)
+    for atom in extraction.atoms:
+        if not atom.source_excerpt.strip():
+            continue
+        for segment in batch.segments:
+            if segment.index != atom.source_segment:
+                continue
+            if not use_positions or atom.source_start is None:
+                if atom.source_excerpt in segment.text:
+                    selected.add(atom.id)
+                continue
+            fragment_start = segment.source_offset
+            fragment_end = fragment_start + len(segment.text)
+            atom_end = atom.source_start + len(atom.source_excerpt)
+            if fragment_start <= atom.source_start and atom_end <= fragment_end:
+                selected.add(atom.id)
+    return selected
 
 
 def _source_review_payload(
@@ -2676,25 +4223,20 @@ def _source_review_payload(
     review_pass: int,
 ) -> dict[str, Any]:
     segment_indexes = {segment.index for segment in batch.segments}
+    review_atom_ids = _atom_ids_for_source_batch(extraction, batch)
     atom_ids = {
         atom_id
         for entry in synthesis.timeline
         if entry.segment_index in segment_indexes
         for atom_id in entry.atom_ids
-    }
-    review_atom_ids = {
-        atom.id
-        for atom in extraction.atoms
-        if atom.source_segment in segment_indexes
+        if atom_id in review_atom_ids
     }
     return {
         "prompt_version": PROMPT_VERSIONS["review"],
         "aweme_id": note_input.aweme_id,
         "review_pass": review_pass,
         "review_mode": "source_coverage",
-        "source_segments": [
-            _segment_payload(segment) for segment in batch.segments
-        ],
+        "source_segments": [_segment_payload(segment) for segment in batch.segments],
         "extraction": _project_extraction(
             _subset_extraction(
                 extraction,
@@ -2708,6 +4250,7 @@ def _source_review_payload(
                 synthesis,
                 segment_indexes,
                 atom_ids,
+                extraction,
             ),
             extraction,
             compact_content=True,
@@ -2724,19 +4267,13 @@ def _claim_review_payload(
     claims: list[DraftClaim],
 ) -> dict[str, Any]:
     segment_indexes = {segment.index for segment in batch.segments}
-    review_atom_ids = {
-        atom.id
-        for atom in extraction.atoms
-        if atom.source_segment in segment_indexes
-    }
+    review_atom_ids = _atom_ids_for_source_batch(extraction, batch)
     return {
         "prompt_version": PROMPT_VERSIONS["review"],
         "aweme_id": note_input.aweme_id,
         "review_pass": review_pass,
         "review_mode": "draft_claims",
-        "source_segments": [
-            _segment_payload(segment) for segment in batch.segments
-        ],
+        "source_segments": [_segment_payload(segment) for segment in batch.segments],
         "extraction": _project_extraction(
             _subset_extraction(
                 extraction,
@@ -2773,7 +4310,12 @@ def _repair_payload(
     }
     draft = synthesis
     if compact_content:
-        draft = _slice_synthesis(synthesis, relevant_segments, relevant_ids)
+        draft = _slice_synthesis(
+            synthesis,
+            relevant_segments,
+            relevant_ids,
+            extraction,
+        )
     draft_payload = _project_synthesis(
         draft,
         extraction,
@@ -2782,23 +4324,25 @@ def _repair_payload(
     return {
         "prompt_version": PROMPT_VERSIONS["repair"],
         "aweme_id": note_input.aweme_id,
+        "source_segments": [
+            _segment_payload(segment)
+            for segment in note_input.segments
+            if segment.index in relevant_segments
+        ],
         "extraction": _project_extraction(repair_extraction),
         "draft": draft_payload,
         "review": _slice_review(
             review,
             relevant_segments,
         ).model_dump(mode="json"),
-        "coverage_report": coverage.model_dump(
-            mode="json",
-            by_alias=True,
+        "coverage_report": _slice_coverage_report(
+            coverage,
+            repair_extraction,
+            relevant_segments,
         ),
         "outline": outline.model_dump(mode="json") if outline else None,
-        "section_drafts": [
-            section.model_dump(mode="json") for section in section_drafts
-        ],
-        "depth_review": (
-            depth_review.model_dump(mode="json") if depth_review else None
-        ),
+        "section_drafts": [section.model_dump(mode="json") for section in section_drafts],
+        "depth_review": (depth_review.model_dump(mode="json") if depth_review else None),
         "repair_section_ids": list(repair_section_ids or []),
         "input_truncated": False,
     }
@@ -2812,9 +4356,7 @@ def _materialize_repair_response(
     result = copy.deepcopy(parsed)
     extraction_payload = payload.get("extraction")
     extraction_atoms = (
-        extraction_payload.get("atoms", [])
-        if isinstance(extraction_payload, Mapping)
-        else []
+        extraction_payload.get("atoms", []) if isinstance(extraction_payload, Mapping) else []
     )
     atom_text = {
         atom.get("id"): atom.get("statement") or atom.get("source_excerpt")
@@ -2827,9 +4369,7 @@ def _materialize_repair_response(
     def materialize_item(item: Any) -> None:
         if not isinstance(item, dict):
             return
-        if "content" not in item and isinstance(
-            item.get("content_from_atom_ids"), list
-        ):
+        if "content" not in item and isinstance(item.get("content_from_atom_ids"), list):
             values = [
                 atom_text[atom_id]
                 for atom_id in item["content_from_atom_ids"]
@@ -2858,15 +4398,15 @@ def _materialize_repair_response(
         for atom in extraction_patch.get("atoms", []):
             if not isinstance(atom, dict):
                 continue
-            if "statement" not in atom and atom.pop(
-                "source_excerpt_is_statement", False
-            ):
+            if "statement" not in atom and atom.pop("source_excerpt_is_statement", False):
                 source_excerpt = atom.get("source_excerpt")
                 if isinstance(source_excerpt, str):
                     atom["statement"] = source_excerpt
             atom.pop("statement_in_source_segments", None)
             atom.pop("source_excerpt_in_source_segments", None)
     return result
+
+
 def _context_budget(
     estimated_tokens: int,
     context_tokens: int,
@@ -2932,11 +4472,7 @@ def _exception_failure(
         "code": "provider_context_budget_exceeded",
         "payload_tokens": len(
             json.dumps(
-                {
-                    key: value
-                    for key, value in payload.items()
-                    if key != "context_budget"
-                },
+                {key: value for key, value in payload.items() if key != "context_budget"},
                 ensure_ascii=False,
                 separators=(",", ":"),
             ).encode("utf-8")
@@ -2982,14 +4518,10 @@ def _failed_synthesis(
     extraction: ExtractionResult,
     failure: Mapping[str, Any] | None,
 ) -> SynthesisResult:
-    disposition_by_index = {
-        item.segment_index: item for item in extraction.dispositions
-    }
+    disposition_by_index = {item.segment_index: item for item in extraction.dispositions}
     included_ids = [atom.id for atom in extraction.atoms]
     timeline: list[dict[str, Any]] = []
-    reason = (
-        str(failure.get("stage")) if failure is not None else "unknown"
-    )
+    reason = str(failure.get("stage")) if failure is not None else "unknown"
     for segment in note_input.segments:
         disposition = disposition_by_index.get(segment.index)
         if disposition is None:
@@ -3044,22 +4576,27 @@ def _provider_request_budget(
     payload_without_budget = {
         key: value for key, value in payload.items() if key != "context_budget"
     }
-    system_prompt_tokens = len(system_prompt.encode("utf-8"))
-    payload_tokens = len(
+    # The provider reports a token context window, not a byte window.  UTF-8
+    # bytes over-count Chinese evidence by roughly 3x, causing local-only
+    # repairs to be rejected before Ollama sees them.  The exact Qwen
+    # tokenizer is intentionally not a runtime dependency, so use a
+    # conservative character-class estimate with a safety margin instead.
+    system_prompt_tokens = _cached_static_prompt_tokens(system_prompt)
+    payload_tokens = _estimate_prompt_tokens(
         json.dumps(
             payload_without_budget,
             ensure_ascii=False,
             separators=(",", ":"),
             sort_keys=True,
-        ).encode("utf-8")
+        )
     )
-    json_schema_tokens = len(
+    json_schema_tokens = _cached_static_prompt_tokens(
         json.dumps(
             json_schema,
             ensure_ascii=False,
             separators=(",", ":"),
             sort_keys=True,
-        ).encode("utf-8")
+        )
     )
     budget_metadata_tokens = 512
     output_floor, output_ratio = {
@@ -3076,14 +4613,11 @@ def _provider_request_budget(
         math.ceil(payload_tokens * output_ratio),
     )
     estimated_input_tokens = (
-        system_prompt_tokens
-        + payload_tokens
-        + json_schema_tokens
-        + budget_metadata_tokens
+        system_prompt_tokens + payload_tokens + json_schema_tokens + budget_metadata_tokens
     )
     estimated_total_tokens = estimated_input_tokens + reserved_output_tokens
     return {
-        "method": "provider-request-v2",
+        "method": "provider-request-v3-charclass",
         "system_prompt_tokens": system_prompt_tokens,
         "payload_tokens": payload_tokens,
         "json_schema_tokens": json_schema_tokens,
@@ -3095,6 +4629,44 @@ def _provider_request_budget(
         "context_tokens": context_tokens,
         "within_budget": estimated_total_tokens <= context_tokens,
     }
+
+
+def _estimate_prompt_tokens(value: str) -> int:
+    """Conservatively estimate Qwen-style prompt tokens without cloud calls.
+
+    CJK characters usually map close to one token, while ASCII prose and JSON
+    keys pack several characters into a token.  Weighting punctuation more
+    heavily and applying a 15% margin keeps the estimate on the safe side
+    without treating UTF-8's three bytes per Han character as three tokens.
+    """
+
+    units = 0.0
+    for character in value:
+        codepoint = ord(character)
+        if character.isspace():
+            units += 0.15
+        elif (
+            0x3400 <= codepoint <= 0x4DBF
+            or 0x4E00 <= codepoint <= 0x9FFF
+            or 0xF900 <= codepoint <= 0xFAFF
+            or 0x3040 <= codepoint <= 0x30FF
+            or 0xAC00 <= codepoint <= 0xD7AF
+        ):
+            units += 1.0
+        elif character.isascii() and character.isalnum():
+            units += 0.35
+        elif character.isascii():
+            units += 0.5
+        else:
+            units += 0.9
+    return max(1, math.ceil(units * 1.15))
+
+
+@lru_cache(maxsize=64)
+def _cached_static_prompt_tokens(value: str) -> int:
+    """Estimate recurring system-prompt and schema tokens once per process."""
+
+    return _estimate_prompt_tokens(value)
 
 
 def _bounded_prior_context(
@@ -3151,9 +4723,7 @@ def _build_extraction_slices(
     for index, atom_ids in enumerate(atom_groups):
         selected_ids = set(atom_ids)
         segment_indexes = {
-            atom.source_segment
-            for atom in extraction.atoms
-            if atom.id in selected_ids
+            atom.source_segment for atom in extraction.atoms if atom.id in selected_ids
         }
         if index == 0:
             segment_indexes.update(noncontent_segments)
@@ -3184,9 +4754,7 @@ def _split_extraction_slice(
         segment_indexes = {atom.source_segment for atom in atoms}
         if index == 0:
             segment_indexes.update(noncontent_segments)
-        result.append(
-            _subset_extraction(extraction, atom_ids, segment_indexes)
-        )
+        result.append(_subset_extraction(extraction, atom_ids, segment_indexes))
     return result
 
 
@@ -3195,11 +4763,7 @@ def _subset_extraction(
     atom_ids: set[str],
     segment_indexes: set[int],
 ) -> ExtractionResult:
-    atoms = [
-        atom.model_dump(mode="json")
-        for atom in extraction.atoms
-        if atom.id in atom_ids
-    ]
+    atoms = [atom.model_dump(mode="json") for atom in extraction.atoms if atom.id in atom_ids]
     dispositions: list[dict[str, Any]] = []
     for item in extraction.dispositions:
         selected = [atom_id for atom_id in item.atom_ids if atom_id in atom_ids]
@@ -3218,10 +4782,7 @@ def _subset_extraction(
 def _extraction_source_tokens(extraction: ExtractionResult) -> int:
     return max(
         1,
-        sum(
-            max(1, math.ceil(len(atom.source_excerpt) / 1.5))
-            for atom in extraction.atoms
-        ),
+        sum(max(1, math.ceil(len(atom.source_excerpt) / 1.5)) for atom in extraction.atoms),
     )
 
 
@@ -3238,21 +4799,11 @@ def _merge_syntheses(values: list[SynthesisResult]) -> SynthesisResult:
     merged: dict[str, Any] = {
         "title": values[0].title,
         "overview": "；".join(_dedupe_text(item.overview for item in values)),
-        "structure": _dedupe_text(
-            item for value in values for item in value.structure
-        ),
-        "concepts": _dedupe_text(
-            item for value in values for item in value.concepts
-        ),
-        "quotes": _dedupe_text(
-            item for value in values for item in value.quotes
-        ),
-        "implications": _dedupe_text(
-            item for value in values for item in value.implications
-        ),
-        "actions": _dedupe_text(
-            item for value in values for item in value.actions
-        ),
+        "structure": _dedupe_text(item for value in values for item in value.structure),
+        "concepts": _dedupe_text(item for value in values for item in value.concepts),
+        "quotes": _dedupe_text(item for value in values for item in value.quotes),
+        "implications": _dedupe_text(item for value in values for item in value.implications),
+        "actions": _dedupe_text(item for value in values for item in value.actions),
         "tags": _dedupe_text(item for value in values for item in value.tags),
         "included_atom_ids": _dedupe_text(
             atom_id for value in values for atom_id in value.included_atom_ids
@@ -3267,9 +4818,7 @@ def _merge_syntheses(values: list[SynthesisResult]) -> SynthesisResult:
     timeline: dict[int, list[dict[str, Any]]] = {}
     for value in values:
         for entry in value.timeline:
-            timeline.setdefault(entry.segment_index, []).append(
-                entry.model_dump(mode="json")
-            )
+            timeline.setdefault(entry.segment_index, []).append(entry.model_dump(mode="json"))
     merged["timeline"] = [
         _merge_timeline_entries(entries) for _, entries in sorted(timeline.items())
     ]
@@ -3278,9 +4827,7 @@ def _merge_syntheses(values: list[SynthesisResult]) -> SynthesisResult:
 
 def _merge_timeline_entries(entries: list[dict[str, Any]]) -> dict[str, Any]:
     first = entries[0]
-    atom_ids = _dedupe_text(
-        atom_id for entry in entries for atom_id in entry["atom_ids"]
-    )
+    atom_ids = _dedupe_text(atom_id for entry in entries for atom_id in entry["atom_ids"])
     dispositions = [entry["disposition"] for entry in entries]
     if atom_ids:
         disposition = "included" if "included" in dispositions else "promotion"
@@ -3292,9 +4839,7 @@ def _merge_timeline_entries(entries: list[dict[str, Any]]) -> dict[str, Any]:
         "end": first["end"],
         "disposition": disposition,
         "atom_ids": atom_ids,
-        "content": "；".join(
-            _dedupe_text(entry["content"] for entry in entries)
-        ),
+        "content": "；".join(_dedupe_text(entry["content"] for entry in entries)),
     }
 
 
@@ -3302,19 +4847,37 @@ def _slice_synthesis(
     synthesis: SynthesisResult,
     segment_indexes: set[int],
     atom_ids: set[str],
+    extraction: ExtractionResult,
 ) -> SynthesisResult:
-    def sections(field_name: str) -> list[dict[str, Any]]:
-        return [
-            section.model_dump(mode="json")
-            for section in getattr(synthesis, field_name)
-            if set(section.atom_ids) & atom_ids
-        ]
+    atom_text = {
+        atom.id: (atom.source_excerpt if atom.statement == atom.source_excerpt else atom.statement)
+        for atom in extraction.atoms
+    }
 
-    timeline = [
-        entry.model_dump(mode="json")
-        for entry in synthesis.timeline
-        if entry.segment_index in segment_indexes
-    ]
+    def sections(field_name: str) -> list[dict[str, Any]]:
+        result: list[dict[str, Any]] = []
+        for section in getattr(synthesis, field_name):
+            selected_ids = [atom_id for atom_id in section.atom_ids if atom_id in atom_ids]
+            if not selected_ids:
+                continue
+            data = section.model_dump(mode="json")
+            data["atom_ids"] = selected_ids
+            result.append(data)
+        return result
+
+    timeline = []
+    for entry in synthesis.timeline:
+        if entry.segment_index not in segment_indexes:
+            continue
+        selected_ids = [atom_id for atom_id in entry.atom_ids if atom_id in atom_ids]
+        if not selected_ids:
+            continue
+        data = entry.model_dump(mode="json")
+        data["atom_ids"] = selected_ids
+        data["content"] = "；".join(
+            atom_text[atom_id] for atom_id in selected_ids if atom_id in atom_text
+        )
+        timeline.append(data)
     return SynthesisResult.model_validate(
         {
             "title": synthesis.title,
@@ -3322,9 +4885,7 @@ def _slice_synthesis(
             "structure": [entry["heading"] for entry in sections("themes")],
             "themes": sections("themes"),
             "methods_and_steps": sections("methods_and_steps"),
-            "examples_and_counterexamples": sections(
-                "examples_and_counterexamples"
-            ),
+            "examples_and_counterexamples": sections("examples_and_counterexamples"),
             "boundaries_and_risks": sections("boundaries_and_risks"),
             "concepts": [],
             "quotes": [],
@@ -3334,17 +4895,72 @@ def _slice_synthesis(
             "promotions": sections("promotions"),
             "tags": [],
             "included_atom_ids": [
-                atom_id
-                for atom_id in synthesis.included_atom_ids
-                if atom_id in atom_ids
+                atom_id for atom_id in synthesis.included_atom_ids if atom_id in atom_ids
             ],
         },
         strict=True,
     )
 
 
+def _claims_for_source_batch[T: DraftClaim | Mapping[str, Any]](
+    claims: list[T],
+    extraction: ExtractionResult,
+    batch: SegmentBatch,
+) -> list[T]:
+    relevant_atom_ids = _atom_ids_for_source_batch(extraction, batch)
+    has_positional_fallback = any(atom.source_start is not None for atom in extraction.atoms)
+    selected: list[T] = []
+    for claim in claims:
+        if isinstance(claim, Mapping):
+            atom_ids = set(claim.get("atom_ids", []))
+        else:
+            atom_ids = set(claim.atom_ids)
+        if atom_ids & relevant_atom_ids:
+            selected.append(claim)
+        elif (
+            not atom_ids
+            and (
+                any(segment.index == 0 and segment.source_offset == 0 for segment in batch.segments)
+                if has_positional_fallback
+                else batch.batch_index == 0
+            )
+        ):
+            selected.append(claim)
+    return selected
+
+
 def _draft_claims(synthesis: SynthesisResult) -> list[DraftClaim]:
     claims: list[DraftClaim] = []
+    evidence_sections = [
+        section
+        for field_name in (
+            "themes",
+            "methods_and_steps",
+            "examples_and_counterexamples",
+            "boundaries_and_risks",
+            "promotions",
+        )
+        for section in getattr(synthesis, field_name)
+    ]
+
+    def inferred_atom_ids(
+        text: str,
+        *,
+        aggregate_content: bool = False,
+        match_heading: bool = False,
+    ) -> list[str]:
+        normalized = text.strip()
+        if not normalized or normalized == "视频未提供这一类信息。":
+            return []
+        matched: set[str] = set()
+        for section in evidence_sections:
+            content = section.content.strip()
+            content_matches = content == normalized or (
+                aggregate_content and content != "视频未提供这一类信息。" and content in normalized
+            )
+            if content_matches or (match_heading and section.heading.strip() == normalized):
+                matched.update(section.atom_ids)
+        return [atom_id for atom_id in synthesis.included_atom_ids if atom_id in matched]
 
     def add(field: str, text: str, atom_ids: list[str]) -> None:
         claims.append(
@@ -3360,7 +4976,11 @@ def _draft_claims(synthesis: SynthesisResult) -> list[DraftClaim]:
         )
 
     add("title", synthesis.title, [])
-    add("overview", synthesis.overview, [])
+    add(
+        "overview",
+        synthesis.overview,
+        inferred_atom_ids(synthesis.overview, aggregate_content=True),
+    )
     for item in synthesis.structure:
         add("structure", item, [])
     for field_name in (
@@ -3384,10 +5004,68 @@ def _draft_claims(synthesis: SynthesisResult) -> list[DraftClaim]:
         "tags",
     ):
         for item in getattr(synthesis, field_name):
-            add(field_name, item, [])
+            atom_ids = (
+                inferred_atom_ids(item, match_heading=True)
+                if field_name == "concepts"
+                else inferred_atom_ids(item)
+                if field_name in {"quotes", "actions"}
+                else []
+            )
+            add(field_name, item, atom_ids)
     for entry in synthesis.timeline:
         add("timeline", entry.content, list(entry.atom_ids))
     return claims
+
+
+def _claim_review_unsupported_ids(
+    claims: list[DraftClaim | Mapping[str, Any]],
+    *,
+    reviewed_ids: set[str],
+    supported_ids: set[str],
+    contradicted_ids: set[str],
+) -> set[str]:
+    """Classify claim review results without treating layout labels as facts."""
+
+    unsupported: set[str] = set()
+    for claim in claims:
+        claim_id = str(claim.get("id") if isinstance(claim, Mapping) else claim.id)
+        field_name = str(claim.get("field") if isinstance(claim, Mapping) else claim.field)
+        text = str(claim.get("text") if isinstance(claim, Mapping) else claim.text)
+        atom_ids = list(claim.get("atom_ids", []) if isinstance(claim, Mapping) else claim.atom_ids)
+        if claim_id in contradicted_ids or claim_id not in reviewed_ids:
+            unsupported.add(claim_id)
+            continue
+        if claim_id in supported_ids:
+            continue
+        editorial = field_name in {"title", "structure", "tags"} and not atom_ids
+        labeled_interpretation = field_name == "implications" and text.strip().startswith(
+            "生成理解："
+        )
+        if not editorial and not labeled_interpretation:
+            unsupported.add(claim_id)
+    return unsupported
+
+
+def _normalize_source_fallback_unsupported_claims(
+    extraction: ExtractionResult,
+    claims: list[DraftClaim],
+    review: CoverageReview,
+) -> CoverageReview:
+    """Keep only reviewable fallback draft text from source-coverage feedback."""
+
+    if not _is_source_preserving_fallback(extraction):
+        return review
+    atom_ids = {atom.id for atom in extraction.atoms}
+    reviewable_text = {claim.text for claim in claims if claim.atom_ids}
+    return review.model_copy(
+        update={
+            "unsupported_draft_claims": [
+                value
+                for value in review.unsupported_draft_claims
+                if value not in atom_ids and value in reviewable_text
+            ]
+        }
+    )
 
 
 def _claim_batches(
@@ -3401,10 +5079,7 @@ def _claim_batches(
     for claim in claims:
         claim_tokens = max(
             1,
-            math.ceil(
-                (len(claim.text) + sum(len(atom_id) for atom_id in claim.atom_ids))
-                / 1.5
-            ),
+            math.ceil((len(claim.text) + sum(len(atom_id) for atom_id in claim.atom_ids)) / 1.5),
         )
         if current and current_tokens + claim_tokens > token_limit:
             result.append((current, current_tokens))
@@ -3428,15 +5103,13 @@ def _merge_reviews(
     internally_duplicated: set[int] = set()
     for value in values:
         counts = Counter(value.reviewed_segment_indexes)
-        internally_duplicated.update(
-            index for index, count in counts.items() if count > 1
-        )
+        internally_duplicated.update(index for index, count in counts.items() if count > 1)
         for index in value.reviewed_segment_indexes:
             reviewed_indexes_by_segment.setdefault(index, []).append(index)
         for item in value.source_omission_candidates:
-            omission_by_key[
-                (item.segment_index, item.source_excerpt, item.missing_statement)
-            ] = item.model_dump(mode="json")
+            omission_by_key[(item.segment_index, item.source_excerpt, item.missing_statement)] = (
+                item.model_dump(mode="json")
+            )
         for item in value.disposition_corrections:
             correction_by_segment[item.segment_index] = item.model_dump(mode="json")
     return CoverageReview.model_validate(
@@ -3456,9 +5129,7 @@ def _merge_reviews(
             ],
             "source_omission_candidates": list(omission_by_key.values()),
             "unsupported_draft_claims": _dedupe_text(
-                claim
-                for value in values
-                for claim in value.unsupported_draft_claims
+                claim for value in values for claim in value.unsupported_draft_claims
             ),
             "disposition_corrections": list(correction_by_segment.values()),
         },
@@ -3466,10 +5137,29 @@ def _merge_reviews(
     )
 
 
+def _remove_noop_disposition_corrections(
+    review: CoverageReview,
+    extraction: ExtractionResult,
+) -> CoverageReview:
+    current = {disposition.segment_index: disposition for disposition in extraction.dispositions}
+    meaningful = []
+    for correction in review.disposition_corrections:
+        existing = current.get(correction.segment_index)
+        if (
+            existing is not None
+            and correction.disposition == existing.disposition
+            and (
+                not correction.atom_ids
+                or Counter(correction.atom_ids) == Counter(existing.atom_ids)
+            )
+        ):
+            continue
+        meaningful.append(correction)
+    return review.model_copy(update={"disposition_corrections": meaningful})
+
+
 def _fragment_segment_indexes(batches: list[SegmentBatch]) -> set[int]:
-    counts = Counter(
-        segment.index for batch in batches for segment in batch.segments
-    )
+    counts = Counter(segment.index for batch in batches for segment in batch.segments)
     return {index for index, count in counts.items() if count > 1}
 
 
@@ -3480,18 +5170,14 @@ def _slice_review(
     return CoverageReview.model_validate(
         {
             "reviewed_segment_indexes": [
-                index
-                for index in review.reviewed_segment_indexes
-                if index in segment_indexes
+                index for index in review.reviewed_segment_indexes if index in segment_indexes
             ],
             "source_omission_candidates": [
                 item.model_dump(mode="json")
                 for item in review.source_omission_candidates
                 if item.segment_index in segment_indexes
             ],
-            "unsupported_draft_claims": list(
-                review.unsupported_draft_claims
-            ),
+            "unsupported_draft_claims": list(review.unsupported_draft_claims),
             "disposition_corrections": [
                 item.model_dump(mode="json")
                 for item in review.disposition_corrections
@@ -3500,6 +5186,53 @@ def _slice_review(
         },
         strict=True,
     )
+
+
+def _slice_coverage_report(
+    coverage: CoverageReport,
+    extraction: ExtractionResult,
+    segment_indexes: set[int],
+) -> dict[str, Any]:
+    """Project coverage instructions to evidence owned by one repair unit."""
+
+    atom_ids = {atom.id for atom in extraction.atoms}
+    data = coverage.model_dump(mode="json", by_alias=True)
+    missing_atom_ids = [
+        atom_id for atom_id in coverage.missing_atom_ids if atom_id in atom_ids
+    ]
+    data.update(
+        {
+            "segment_total": len(segment_indexes),
+            "segment_disposition_count": sum(
+                item.segment_index in segment_indexes
+                for item in extraction.dispositions
+            ),
+            "missing_segment_indexes": [
+                index
+                for index in coverage.missing_segment_indexes
+                if index in segment_indexes
+            ],
+            "evidence_atom_total": len(atom_ids),
+            "evidence_atom_included": max(0, len(atom_ids) - len(missing_atom_ids)),
+            "missing_atom_ids": missing_atom_ids,
+            "traceable_atom_count": max(0, len(atom_ids) - len(missing_atom_ids)),
+            "source_segments_independently_reviewed": min(
+                coverage.source_segments_independently_reviewed,
+                len(segment_indexes),
+            ),
+            "source_omission_candidates": [
+                item.model_dump(mode="json")
+                for item in coverage.source_omission_candidates
+                if item.segment_index in segment_indexes
+            ],
+            # Draft claims and the depth result are scoped by their dedicated
+            # local payload fields.  Keeping the global copies here makes a
+            # local repair request grow with unrelated sections.
+            "unsupported_draft_claims": [],
+            "depth_review": None,
+        }
+    )
+    return data
 
 
 def _repair_slice(
@@ -3523,9 +5256,7 @@ def _repair_slice(
     }
     relevant_ids = set(coverage.missing_atom_ids)
     relevant_ids.update(set(synthesis.included_atom_ids) - thematic_ids)
-    relevant_segments = {
-        item.segment_index for item in review.source_omission_candidates
-    }
+    relevant_segments = {item.segment_index for item in review.source_omission_candidates}
     relevant_segments.update(coverage.missing_segment_indexes)
     timeline_indexes = {entry.segment_index for entry in synthesis.timeline}
     relevant_segments.update(
@@ -3535,33 +5266,42 @@ def _repair_slice(
     )
     if not coverage.promotional_content_preserved:
         relevant_ids.update(
-            atom.id
-            for atom in extraction.atoms
-            if atom.kind == "promotion" or atom.is_promotional
+            atom.id for atom in extraction.atoms if atom.kind == "promotion" or atom.is_promotional
         )
     if review.unsupported_draft_claims:
-        relevant_ids.update(atom_by_id)
+        unsupported_claims = set(review.unsupported_draft_claims)
+        claims_by_text: dict[str, list[DraftClaim]] = {}
+        for claim in _draft_claims(synthesis):
+            claims_by_text.setdefault(claim.text, []).append(claim)
+        matching_claims = [
+            claim
+            for text in unsupported_claims
+            for claim in claims_by_text.get(text, [])
+        ]
+        if (
+            len({claim.text for claim in matching_claims}) != len(unsupported_claims)
+            or any(not claim.atom_ids for claim in matching_claims)
+        ):
+            relevant_ids.update(atom_by_id)
+        else:
+            relevant_ids.update(
+                atom_id for claim in matching_claims for atom_id in claim.atom_ids
+            )
     relevant_ids.update(
-        atom.id
-        for atom in extraction.atoms
-        if atom.source_segment in relevant_segments
+        atom.id for atom in extraction.atoms if atom.source_segment in relevant_segments
     )
     related_ids: set[str] = set()
     for atom_id in tuple(relevant_ids):
         atom = atom_by_id.get(atom_id)
         if atom is not None:
             related_ids.update(
-                relation_id
-                for relation_id in atom.relations
-                if relation_id in atom_by_id
+                relation_id for relation_id in atom.relations if relation_id in atom_by_id
             )
     relevant_ids.update(related_ids)
     if not relevant_ids and extraction.atoms:
         relevant_ids.update(atom_by_id)
     relevant_segments.update(
-        atom_by_id[atom_id].source_segment
-        for atom_id in relevant_ids
-        if atom_id in atom_by_id
+        atom_by_id[atom_id].source_segment for atom_id in relevant_ids if atom_id in atom_by_id
     )
     return (
         _subset_extraction(extraction, relevant_ids, relevant_segments),
@@ -3596,9 +5336,7 @@ def _depth_repair_slice(
     atom_ids.update(depth_review.reordered_step_atom_ids)
     atom_ids.update(depth_review.lost_literal_atom_ids)
     atom_ids.update(
-        atom_id
-        for atom_id in depth_review.lost_warning_or_promotion_atom_ids
-        if atom_id
+        atom_id for atom_id in depth_review.lost_warning_or_promotion_atom_ids if atom_id
     )
     atom_by_id = {atom.id: atom for atom in extraction.atoms}
     uncertainty_markers = set(depth_review.lost_uncertainty_markers)
@@ -3608,10 +5346,7 @@ def _depth_repair_slice(
         if uncertainty_markers.intersection(atom.asr_uncertainty)
     )
     atom_ids = {atom_id for atom_id in atom_ids if atom_id in atom_by_id}
-    relevant_segments = {
-        atom_by_id[atom_id].source_segment
-        for atom_id in atom_ids
-    }
+    relevant_segments = {atom_by_id[atom_id].source_segment for atom_id in atom_ids}
     for atom_id in tuple(atom_ids):
         relevant_segments.update(
             relation.source_segment
@@ -3673,21 +5408,13 @@ def _merge_repair_extraction_patch(
 ) -> ExtractionResult:
     if any(atom.source_segment not in relevant_segments for atom in patch.atoms):
         raise ValueError("repair atom is outside the authorized source segments")
-    if any(
-        item.segment_index not in relevant_segments
-        for item in patch.dispositions
-    ):
+    if any(item.segment_index not in relevant_segments for item in patch.dispositions):
         raise ValueError("repair disposition is outside the authorized source segments")
 
-    atoms = {
-        atom.id: atom.model_dump(mode="json") for atom in extraction.atoms
-    }
+    atoms = {atom.id: atom.model_dump(mode="json") for atom in extraction.atoms}
     for atom in patch.atoms:
         existing = atoms.get(atom.id)
-        if (
-            existing is not None
-            and existing["source_segment"] not in relevant_segments
-        ):
+        if existing is not None and existing["source_segment"] not in relevant_segments:
             raise ValueError("repair atom ID collides outside the authorized segments")
         atoms[atom.id] = atom.model_dump(mode="json")
 
@@ -3697,25 +5424,19 @@ def _merge_repair_extraction_patch(
             raise ValueError("repair atom references an unknown atom")
 
     dispositions = {
-        item.segment_index: item.model_dump(mode="json")
-        for item in extraction.dispositions
+        item.segment_index: item.model_dump(mode="json") for item in extraction.dispositions
     }
     for item in patch.dispositions:
         if any(atom_id not in allowed_ids for atom_id in item.atom_ids):
             raise ValueError("repair disposition references an unknown atom")
-        if any(
-            atoms[atom_id]["source_segment"] != item.segment_index
-            for atom_id in item.atom_ids
-        ):
+        if any(atoms[atom_id]["source_segment"] != item.segment_index for atom_id in item.atom_ids):
             raise ValueError("repair disposition references another segment")
         dispositions[item.segment_index] = item.model_dump(mode="json")
 
     return ExtractionResult.model_validate(
         {
             "atoms": list(atoms.values()),
-            "dispositions": [
-                dispositions[index] for index in sorted(dispositions)
-            ],
+            "dispositions": [dispositions[index] for index in sorted(dispositions)],
         },
         strict=True,
     )
@@ -3748,9 +5469,7 @@ def _merge_repair_patch(
             for section in getattr(patch, field_name)
             for atom_id in section.atom_ids
         }
-        patch_atom_ids.update(
-            atom_id for entry in patch.timeline for atom_id in entry.atom_ids
-        )
+        patch_atom_ids.update(atom_id for entry in patch.timeline for atom_id in entry.atom_ids)
         patch_atom_ids.update(patch.included_atom_ids)
         if not patch_atom_ids <= allowed_atom_ids:
             raise ValueError("repair synthesis references an unknown atom")
@@ -3791,10 +5510,7 @@ def _merge_repair_patch(
             section.model_dump(mode="json")
             for section in getattr(synthesis, field_name)
             if not (set(section.atom_ids) & relevant_ids)
-        ] + [
-            section.model_dump(mode="json")
-            for section in getattr(patch, field_name)
-        ]
+        ] + [section.model_dump(mode="json") for section in getattr(patch, field_name)]
     data["timeline"] = [
         entry.model_dump(mode="json")
         for entry in synthesis.timeline
@@ -3802,11 +5518,7 @@ def _merge_repair_patch(
     ] + [entry.model_dump(mode="json") for entry in patch.timeline]
     data["timeline"].sort(key=lambda entry: entry["segment_index"])
     data["included_atom_ids"] = _dedupe_text(
-        [
-            atom_id
-            for atom_id in synthesis.included_atom_ids
-            if atom_id not in relevant_ids
-        ]
+        [atom_id for atom_id in synthesis.included_atom_ids if atom_id not in relevant_ids]
         + list(patch.included_atom_ids)
     )
     for field_name in (
@@ -3833,9 +5545,7 @@ def _merge_extractions(
     merged_atoms: list[dict[str, Any]] = []
     merged_dispositions: list[dict[str, Any]] = []
     disposition_batch_indexes: list[int] = []
-    prepared: list[
-        tuple[SegmentBatch, ExtractionResult, dict[str, str], bool]
-    ] = []
+    prepared: list[tuple[SegmentBatch, ExtractionResult, dict[str, str], bool]] = []
     id_occurrences: dict[str, list[str]] = {}
     for batch, extraction in values:
         global_indexes = {segment.index for segment in batch.segments}
@@ -3843,9 +5553,11 @@ def _merge_extractions(
             *(atom.source_segment for atom in extraction.atoms),
             *(item.segment_index for item in extraction.dispositions),
         ]
-        uses_local_indexes = bool(returned_indexes) and all(
-            0 <= value < len(batch.segments) for value in returned_indexes
-        ) and any(value not in global_indexes for value in returned_indexes)
+        uses_local_indexes = (
+            bool(returned_indexes)
+            and all(0 <= value < len(batch.segments) for value in returned_indexes)
+            and any(value not in global_indexes for value in returned_indexes)
+        )
         local_ids = [atom.id for atom in extraction.atoms]
         if len(local_ids) != len(set(local_ids)):
             raise ValueError("extraction batch contains duplicate atom IDs")
@@ -3857,9 +5569,7 @@ def _merge_extractions(
             id_occurrences.setdefault(old_id, []).append(new_id)
         prepared.append((batch, extraction, id_map, uses_local_indexes))
     unique_global_ids = {
-        old_id: new_ids[0]
-        for old_id, new_ids in id_occurrences.items()
-        if len(new_ids) == 1
+        old_id: new_ids[0] for old_id, new_ids in id_occurrences.items() if len(new_ids) == 1
     }
     for batch, extraction, id_map, uses_local_indexes in prepared:
         for atom in extraction.atoms:
@@ -3869,8 +5579,7 @@ def _merge_extractions(
                 atom.source_segment, batch, uses_local_indexes
             )
             data["relations"] = [
-                id_map.get(value, unique_global_ids.get(value, value))
-                for value in atom.relations
+                id_map.get(value, unique_global_ids.get(value, value)) for value in atom.relations
             ]
             merged_atoms.append(data)
         for disposition in extraction.dispositions:
@@ -3955,9 +5664,7 @@ def _combine_dispositions(
         disposition = "unintelligible_asr"
     else:
         disposition = kinds[0]
-    reasons = list(
-        dict.fromkeys(item["reason"] for item in items if item["reason"])
-    )
+    reasons = list(dict.fromkeys(item["reason"] for item in items if item["reason"]))
     return {
         "segment_index": segment_index,
         "disposition": disposition,

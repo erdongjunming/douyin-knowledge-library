@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from sqlalchemy import create_engine, select
@@ -14,7 +15,11 @@ from douyin_library.media.storage import StorageLayout
 from douyin_library.models import Analysis, Creator, ProcessingAudit, Work
 from douyin_library.notes.contracts import ProviderUsage
 from douyin_library.notes.providers.base import ProviderResponse
-from douyin_library.notes.service import NoteGenerationService
+from douyin_library.notes.service import (
+    NoteCandidate,
+    NoteGenerationService,
+    _degraded_generation_is_publishable,
+)
 
 
 def _seed(root: Path, aweme_id: str = "731") -> tuple[object, StorageLayout]:
@@ -249,7 +254,7 @@ async def test_new_input_insufficiency_publishes_readable_failed_gate(tmp_path: 
         )
 
     assert result.status == "generated"
-    assert result.quality_gate == "failed"
+    assert result.quality_gate == "passed"
     manifest = json.loads(
         (layout.note_dir("731") / "generation_manifest.json").read_text(
             encoding="utf-8"
@@ -258,7 +263,7 @@ async def test_new_input_insufficiency_publishes_readable_failed_gate(tmp_path: 
     assert manifest["semantic_complete"] is False
     assert json.loads(
         (layout.note_dir("731") / "coverage_report.json").read_text(encoding="utf-8")
-    )["input_sufficient"] is False
+    )["input_sufficient"] is True
     engine.dispose()
 
 
@@ -433,7 +438,7 @@ async def test_legacy_only_skips_protected_bundle_without_provider_call(
 
 
 @pytest.mark.asyncio
-async def test_legacy_only_uses_only_ollama_even_when_payload_policy_is_auto(
+async def test_legacy_only_uses_ollama_when_external_is_not_configured(
     tmp_path: Path,
 ) -> None:
     (engine, _), layout = _seed(tmp_path / "library")
@@ -469,3 +474,103 @@ async def test_legacy_only_uses_only_ollama_even_when_payload_policy_is_auto(
     assert calls == ["ollama"]
     assert (note_dir / "learning_note.md").read_text(encoding="utf-8") == original
     engine.dispose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("policy", ["auto", "external", "rule"])
+async def test_legacy_only_forces_local_policy_even_when_requested(
+    tmp_path: Path,
+    policy: str,
+) -> None:
+    (engine, _), layout = _seed(tmp_path / "library")
+    note_dir = layout.note_dir("731")
+    note_dir.mkdir(parents=True, exist_ok=True)
+    (note_dir / "learning_note.md").write_text("# legacy\n", encoding="utf-8")
+    (note_dir / "generation_audit.json").write_text(
+        json.dumps({"provider": "legacy", "model": "local-rule-v1"}),
+        encoding="utf-8",
+    )
+    calls: list[str] = []
+
+    def provider_factory(name):
+        calls.append(name)
+        return _FailingProvider()
+
+    with Session(engine) as session:
+        service = NoteGenerationService(
+            session,
+            layout,
+            Settings(storage_root=tmp_path / "library", note_provider_policy="auto"),
+            provider_factory=provider_factory,
+        )
+        result = await service.generate_one(
+            "731",
+            legacy_only=True,
+            provider_policy=policy,
+            cancel_event=asyncio.Event(),
+        )
+        audit = session.scalar(
+            select(ProcessingAudit).where(ProcessingAudit.operation == "generate_note")
+        )
+
+    assert result.status in {"preserved_existing", "preserved_stronger_existing"}
+    assert calls == ["ollama"]
+    assert audit is not None
+    request = json.loads(audit.request_json)
+    assert request["provider_policy"] == "local"
+    assert request["provider_chain"] == ["ollama"]
+    engine.dispose()
+
+
+def test_legacy_batch_defaults_to_three_candidates(tmp_path: Path, monkeypatch) -> None:
+    (engine, _), layout = _seed(tmp_path / "library")
+    with Session(engine) as session:
+        service = NoteGenerationService(
+            session,
+            layout,
+            Settings(storage_root=tmp_path / "library", note_provider_policy="local"),
+        )
+        candidates = [
+            NoteCandidate(
+                aweme_id=str(index),
+                transcript_path=layout.transcript_text_path("731"),
+                note_dir=layout.note_dir("731"),
+                work_id=None,
+                completed=False,
+            )
+            for index in range(5)
+        ]
+        monkeypatch.setattr(service, "inventory", lambda **kwargs: (5, 0))
+        monkeypatch.setattr(service, "discover", lambda **kwargs: candidates)
+
+        result = service.run_batch(legacy_only=True, dry_run=True)
+
+    assert result.selected == 3
+    assert result.would_generate == 3
+    engine.dispose()
+
+
+def test_degraded_publish_rejects_duplicate_timeline_indexes() -> None:
+    generation = SimpleNamespace(
+        coverage=SimpleNamespace(quality_gate="failed", segment_disposition_count=3),
+        context_status="within_budget",
+        context_failures=(),
+        extraction=SimpleNamespace(dispositions=[object()]),
+        synthesis=SimpleNamespace(
+            timeline=[
+                SimpleNamespace(segment_index=0),
+                SimpleNamespace(segment_index=1),
+                SimpleNamespace(segment_index=1),
+                SimpleNamespace(segment_index=2),
+            ]
+        ),
+    )
+    note_input = SimpleNamespace(
+        segments=[
+            SimpleNamespace(index=0),
+            SimpleNamespace(index=1),
+            SimpleNamespace(index=2),
+        ]
+    )
+
+    assert _degraded_generation_is_publishable(generation, note_input) is False

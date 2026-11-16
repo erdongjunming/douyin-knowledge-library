@@ -79,6 +79,16 @@ _GENERIC_CONCEPTS = {
     "流程",
     "习惯",
 }
+_TEACHING_SECTION_IDS = (
+    "overview",
+    "core_points",
+    "methods_steps",
+    "examples_results",
+    "boundaries_risks",
+    "actions",
+    "timeline",
+    "evidence_limits",
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -121,6 +131,7 @@ def generate_rule_note(
     evidence = _evidence(note_input, transcript)
     tags = _dedupe([*topics, "抖音学习笔记", "ASR转写"])
     coverage_report = _fallback_coverage(note_input, timeline)
+    evidence_map = _fallback_evidence_map(note_input, timeline)
     parsed = {
         "aweme_id": note_input["aweme_id"],
         "title": title,
@@ -137,6 +148,12 @@ def generate_rule_note(
         "evidence": evidence,
         "quality_gate": "fallback",
         "coverage_report": coverage_report,
+        "evidence_map": evidence_map,
+        "teaching_outline": None,
+        "section_drafts": [],
+        "depth_review": None,
+        "semantic_complete": False,
+        "input_sufficient": False,
     }
     raw_output = json.dumps(parsed, ensure_ascii=False, indent=2)
     page_metadata = _page_metadata(note_input, source_files, title, generated_at)
@@ -161,6 +178,11 @@ def generate_rule_note(
         "prompt_version": PROMPT_VERSION,
         "evidence_level": evidence["level"],
         "quality_gate": "fallback",
+        "semantic_complete": False,
+        "input_sufficient": False,
+        "teaching_outline": None,
+        "section_drafts": [],
+        "depth_review": None,
     }
     asset_manifest = _asset_manifest(note_input, source_files, generated_at)
     return NoteBundle(
@@ -311,15 +333,9 @@ def _details(segments: Any, key_points: list[str]) -> list[dict[str, Any]]:
     for segment in segments:
         if not isinstance(segment, dict):
             continue
-        segment_sentences = _sentences(str(segment.get("text") or ""))
-        if not segment_sentences:
+        text = _clean_text(str(segment.get("text") or ""))
+        if not text:
             continue
-        ranked = sorted(
-            enumerate(segment_sentences),
-            key=lambda item: (_sentence_score(item[1]), -item[0]),
-            reverse=True,
-        )[:2]
-        text = "；".join(sentence for _, sentence in sorted(ranked))
         details.append(
             {
                 "start": segment.get("start"),
@@ -394,6 +410,45 @@ def _fallback_coverage(
         "semantic_generator": MODEL_NAME,
         "quality_gate": "fallback",
         "repairable": False,
+        "depth_passed": False,
+        "input_sufficient": False,
+        "depth_review": None,
+        "semantic_complete": False,
+        "teaching_outline": None,
+        "section_drafts": [],
+    }
+
+
+def _fallback_evidence_map(
+    note_input: dict[str, Any], timeline: list[dict[str, Any]]
+) -> dict[str, Any]:
+    return {
+        "schema": "douyin-note-evidence-map-v1",
+        "aweme_id": note_input["aweme_id"],
+        "transcript_variant": note_input.get("transcript_variant", "raw"),
+        "transcript_source_kind": note_input.get("transcript_source_kind", "asr"),
+        "items": [],
+        "segment_count": len(timeline),
+        "section_ids": list(_TEACHING_SECTION_IDS),
+        "sections": [
+            {
+                "section_id": section_id,
+                "title": section_id,
+                "order": index,
+                "atom_ids": [],
+                "timestamps": [],
+            }
+            for index, section_id in enumerate(_TEACHING_SECTION_IDS, 1)
+        ],
+        "section_drafts": [],
+        "dispositions": [
+            {
+                "segment_index": item["segment_index"],
+                "disposition": item["disposition"],
+                "atom_ids": list(item.get("atom_ids") or []),
+            }
+            for item in timeline
+        ],
     }
 
 
@@ -463,8 +518,17 @@ def _page_metadata(
         "duration_ms": note_input.get("duration_ms"),
         "source_url": note_input.get("source_url"),
         "evidence_level": "E3-ASR",
+        "provider": "rule",
+        "model": MODEL_NAME,
+        "generator_version": GENERATOR_VERSION,
+        "prompt_version": PROMPT_VERSION,
         "source_files": source_files,
         "quality_gate": "fallback",
+        "semantic_complete": False,
+        "input_sufficient": False,
+        "teaching_outline": None,
+        "section_drafts": [],
+        "depth_review": None,
         "generated_at": generated_at,
     }
 
@@ -482,6 +546,8 @@ def _note_budget(
     else:
         note_min, note_max, granularity = 1600, 3600, "detailed"
     evidence = _evidence(note_input, transcript)
+    evidence_types = _fallback_evidence_types(note_input, transcript)
+    detail_level = "full" if len(evidence_types) >= 2 else "standard"
     return {
         "schema": "douyin-note-budget-v1",
         "aweme_id": note_input["aweme_id"],
@@ -494,7 +560,29 @@ def _note_budget(
         "model": MODEL_NAME,
         "prompt_version": PROMPT_VERSION,
         "provider": "rule",
+        "execution": {
+            "mode": "rule",
+            "provider": "rule",
+            "model": MODEL_NAME,
+            "is_local": True,
+            "is_external": False,
+        },
+        "recommended_detail": {
+            "level": detail_level,
+            "evidence_types": evidence_types,
+            "reason": "规则兜底保留完整时间线；证据类型由转写结构启发式识别。",
+        },
+        "batch_count": 1 if transcript.strip() else 0,
+        "batch_boundaries": [],
+        "stage_batches": [],
+        "stage_call_count": 0,
+        "context_status": "not_applicable",
         "quality_gate": "fallback",
+        "semantic_complete": False,
+        "input_sufficient": False,
+        "teaching_outline": None,
+        "section_drafts": [],
+        "depth_review": None,
         "repair_count": 0,
         "recommended_note_chars_min": note_min,
         "recommended_note_chars_max": note_max,
@@ -507,6 +595,26 @@ def _note_budget(
         },
         "generated_at": generated_at,
     }
+
+
+def _fallback_evidence_types(note_input: dict[str, Any], transcript: str) -> list[str]:
+    """Expose the evidence shape used by the deterministic fallback."""
+    types: list[str] = ["claim"] if transcript.strip() else []
+    segments = note_input.get("segments") or []
+    text = "".join(
+        str(item.get("text") or "") for item in segments if isinstance(item, dict)
+    )
+    if re.search(r"第[一二三四五六七八九十0-9]+步|首先|其次|最后|步骤", text):
+        types.append("step")
+    if re.search(r"例如|比如|案例", text):
+        types.append("example")
+    if re.search(r"如果|只有|除非|前提|条件", text):
+        types.append("condition")
+    if re.search(r"注意|不要|风险|否则", text):
+        types.append("warning")
+    if _CTA.search(text):
+        types.append("promotion")
+    return list(dict.fromkeys(types))
 
 
 def _asset_manifest(
@@ -531,6 +639,8 @@ def _asset_manifest(
         ],
         "copies_original_assets": False,
         "quality_gate": "fallback",
+        "semantic_complete": False,
+        "input_sufficient": False,
         "generated_at": generated_at,
     }
 

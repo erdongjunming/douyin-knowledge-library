@@ -29,10 +29,10 @@ def select_provider_names(
 ) -> list[ProviderName]:
     selected_policy = settings.note_provider_policy if policy is None else policy
     if selected_policy == "auto":
-        names: list[ProviderName] = ["ollama"]
+        names: list[ProviderName] = []
         if external_is_configured(settings):
             names.append("external")
-        names.append("rule")
+        names.extend(["ollama", "rule"])
         return names
     if selected_policy == "local":
         return ["ollama", "rule"]

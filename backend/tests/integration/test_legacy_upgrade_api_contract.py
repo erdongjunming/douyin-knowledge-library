@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import httpx
@@ -16,16 +17,118 @@ from douyin_library.media.storage import StorageLayout
 from douyin_library.models import Job
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("lease_live,stale_audit", [(True, False), (False, False), (True, True)])
+async def test_progress_includes_standalone_upgrade_and_keeps_completed_in_cohort(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, lease_live: bool, stale_audit: bool,
+) -> None:
+    from douyin_library.models import ProcessingAudit, ResourceLease, Work
+
+    storage = tmp_path / "library"
+    _seed_upgrade_candidates(storage)
+    monkeypatch.setenv("DKL_STORAGE_ROOT", str(storage))
+    audit_dir = storage / "audit"
+    audit_dir.mkdir()
+    (audit_dir / "legacy-upgrade-inventory-broken.json").write_text('{"broken":')
+    (audit_dir / "legacy-upgrade-inventory-invalid.json").write_text('["unrelated"]')
+    now = datetime.now(UTC)
+    (audit_dir / "legacy-upgrade-inventory-full.json").write_text(json.dumps({
+        "schema": "douyin-legacy-upgrade-inventory-v1",
+        "aweme_ids": ["731", "732", "733", "734", "735", "736"],
+    }), encoding="utf-8")
+    (audit_dir / "legacy-upgrade-batches-full.checkpoints.jsonl").write_text(
+        json.dumps({"event": "batch_started", "pid": 123, "batch_index": 0,
+                    "aweme_ids": ["731", "732", "733"],
+                    "at": (now - timedelta(minutes=1)).isoformat()}) + '\n{"interrupted":',
+        encoding="utf-8",
+    )
+    engine, session, transport = _client_with_queue(tmp_path / "library.db")
+    try:
+        for aweme_id, status in (("731", "running"), ("732", "failed")):
+            work = Work(aweme_id=aweme_id)
+            session.add(work)
+            session.flush()
+            session.add(ProcessingAudit(
+                work_id=work.id, operation="generate_note", processor="note-generator",
+                status=status, request_json="{}",
+                started_at=(now - timedelta(minutes=2))
+                if stale_audit and status == "running" else now,
+                error="semantic_incomplete" if status == "failed" else None,
+            ))
+        session.add(ResourceLease(
+            resource_name="gpu:0", lease_token="test", owner_worker_id="legacy-upgrade-123",
+            acquired_at=now, heartbeat_at=now,
+            expires_at=now + timedelta(minutes=1 if lease_live else -1),
+        ))
+        session.commit()
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            response = await client.get("/api/notes/progress")
+            progress = response.json()["upgrade"]
+            assert progress["total"] == 6
+            assert progress["completed"] == 1
+            expected_running = int(lease_live and not stale_audit)
+            assert progress["running"] == expected_running
+            assert progress["failed"] == 1
+            assert progress["not_queued"] == 4 - expected_running
+            assert progress["percent"] == 16.7
+            # New queued retries supersede earlier standalone failures.
+            retry = JobQueue(session).create(
+                kind="generate_note", payload={"aweme_id": "732", "legacy_only": True},
+            )
+            retry.created_at = now + timedelta(seconds=1)
+            session.commit()
+            retried = (await client.get("/api/notes/progress")).json()["upgrade"]
+            assert retried["pending"] == 1
+            assert retried["failed"] == 0
+            # An old failed queue job must not override a newer standalone result.
+            retry.created_at = now - timedelta(minutes=5)
+            retry.status = "failed"
+            retry.error_detail = "obsolete failure"
+            session.commit()
+            retried = (await client.get("/api/notes/progress")).json()["upgrade"]
+            assert retried["failures"] == [{"aweme_id": "732", "reason": "semantic_incomplete"}]
+            # A newly published standalone note must increase completion,
+            # rather than disappear from the historical denominator.
+            from douyin_library.api.routes import notes as notes_routes
+            snapshot = notes_routes._quality_details_snapshot(
+                notes_routes._service(JobQueue(session)),
+            )
+            snapshot["731"]["quality_status"] = "semantic_complete"
+            monkeypatch.setattr(notes_routes, "_quality_details_snapshot", lambda _: snapshot)
+            updated = (await client.get("/api/notes/progress?refresh=true")).json()["upgrade"]
+            assert updated["total"] == 6
+            assert updated["completed"] == 2
+            assert updated["running"] == 0
+            assert updated["percent"] == 33.3
+    finally:
+        app.dependency_overrides.pop(get_job_queue, None)
+        session.close()
+        engine.dispose()
+
+
 def _seed_upgrade_candidates(root: Path) -> None:
     layout = StorageLayout(root)
     layout.initialize()
     for aweme_id in ("731", "732", "733", "734", "735", "736"):
         transcript_dir = layout.transcript_dir(aweme_id)
         transcript_dir.mkdir(parents=True, exist_ok=True)
+        transcript_text = (
+            f"视频 {aweme_id} 的原始转写内容用于升级验证。"
+            if aweme_id == "733"
+            else f"视频 {aweme_id} 的原始转写。"
+        )
         layout.transcript_text_path(aweme_id).write_text(
-            f"视频 {aweme_id} 的原始转写。",
+            transcript_text,
             encoding="utf-8",
         )
+        if aweme_id == "733":
+            layout.transcript_segments_path(aweme_id).write_text(
+                json.dumps(
+                    [{"start": 0, "end": 10, "text": transcript_text}],
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
         note_dir = layout.note_dir(aweme_id)
         note_dir.mkdir(parents=True, exist_ok=True)
         (note_dir / "learning_note.md").write_text(
@@ -109,6 +212,32 @@ async def test_legacy_upgrade_defaults_to_three_and_forces_local_policy(
         assert all(payload["legacy_only"] is True for payload in payloads)
         assert all(payload["provider_policy"] == "local" for payload in payloads)
         assert [payload["aweme_id"] for payload in payloads] == ["731", "732", "734"]
+    finally:
+        app.dependency_overrides.pop(get_job_queue, None)
+        session.close()
+        engine.dispose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("policy", ["auto", "external", "rule"])
+async def test_legacy_upgrade_rejects_non_local_policy(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    policy: str,
+) -> None:
+    storage = tmp_path / "library"
+    _seed_upgrade_candidates(storage)
+    monkeypatch.setenv("DKL_STORAGE_ROOT", str(storage))
+    engine, session, transport = _client_with_queue(tmp_path / "library.db")
+    try:
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            response = await client.post(
+                "/api/notes/generate",
+                json={"legacy_only": True, "provider_policy": policy},
+            )
+        assert response.status_code == 422
+        assert response.json()["detail"] == "legacy_upgrade_requires_local_provider"
+        assert session.scalars(select(Job)).all() == []
     finally:
         app.dependency_overrides.pop(get_job_queue, None)
         session.close()
@@ -230,17 +359,16 @@ async def test_upgrade_progress_uses_current_semantic_state_and_latest_upgrade_j
             kind="generate_note",
             payload={"aweme_id": "fallback", "legacy_only": True},
         )
-        running = queue.create(
-            kind="generate_note",
-            payload={"aweme_id": "unknown", "legacy_only": True},
-            status="running",
-        )
         failed = queue.create(
             kind="generate_note",
             payload={"aweme_id": "failed", "legacy_only": True},
         )
         queue.claim(failed.id)
-        queue.fail(failed.id, error_code="handler_failed", error_detail="ollama unavailable")
+        queue.fail(
+            failed.id,
+            error_code="input_insufficient",
+            error_detail="ollama unavailable",
+        )
         false_success = queue.create(
             kind="generate_note",
             payload={"aweme_id": "false-success", "legacy_only": True},
@@ -253,6 +381,11 @@ async def test_upgrade_progress_uses_current_semantic_state_and_latest_upgrade_j
         )
         queue.claim(semantic.id)
         queue.transition(semantic.id, "succeeded")
+        running = queue.create(
+            kind="generate_note",
+            payload={"aweme_id": "unknown", "legacy_only": True},
+            status="running",
+        )
         assert pending.status == "pending"
         assert running.status == "running"
 

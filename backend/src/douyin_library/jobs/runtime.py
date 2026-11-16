@@ -7,7 +7,7 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from typing import Any, Protocol
 
-from sqlalchemy import exists, select
+from sqlalchemy import exists, select, update
 from sqlalchemy.engine import Engine
 from sqlalchemy.orm import Session
 
@@ -64,8 +64,13 @@ class WorkerRuntime:
     queue: JobQueue
     handlers: JobHandlers
     worker: JobWorker
+    transcriber: Transcriber | None = None
 
     def close(self) -> None:
+        if self.transcriber is not None:
+            closer = getattr(self.transcriber, "close", None)
+            if callable(closer):
+                closer()
         self.session.close()
 
 
@@ -93,6 +98,7 @@ def build_worker_runtime(
     make_media_service = media_service_factory or _build_media_service
     make_transcriber = transcriber_factory or QwenAsrProvider.from_settings
     make_cleaner = cleaner_factory or (lambda current: OllamaTranscriptCleaner(current))
+    transcriber = make_transcriber(settings)
     subtitle_provider = LocalSubtitleProvider(settings, storage_layout, session=session)
 
     async def sync_creator(job: Job, cancel_event: asyncio.Event) -> None:
@@ -166,7 +172,7 @@ def build_worker_runtime(
             session,
             storage_layout,
             settings,
-            make_transcriber(settings),
+            transcriber,
             subtitle_provider=subtitle_provider,
             lease_store=lease_store,
             worker_id=job.worker_id,
@@ -291,7 +297,11 @@ def build_worker_runtime(
                 gateway,
                 StorageLayout(settings.storage_root),
             )
-            await service.process(work)
+            parameters = inspect.signature(service.process).parameters
+            if "cancel_event" in parameters:
+                await service.process(work, cancel_event=cancel_event)
+            else:
+                await service.process(work)
         finally:
             await _close_gateway(gateway)
         _raise_if_cancelled(cancel_event)
@@ -304,6 +314,8 @@ def build_worker_runtime(
         aweme_id = work.aweme_id if work else payload.get("aweme_id")
         if not isinstance(aweme_id, str) or not aweme_id:
             raise ValueError("generate_note_aweme_id_missing")
+        owner_worker_id = job.worker_id
+        owner_fence = getattr(job, "claim_fence", None)
         force = payload.get("force", False)
         if not isinstance(force, bool):
             raise ValueError("generate_note_force_invalid")
@@ -317,19 +329,23 @@ def build_worker_runtime(
             )
             if cleaner_pending is not None:
                 raise RuntimeError("transcript_cleaning_pending")
-        job.stage = "analyze"
-        job.progress = 0.1
-        session.commit()
+        _update_owned_job(
+            session,
+            job.id,
+            owner_worker_id,
+            owner_fence,
+            stage="analyze",
+            progress=0.1,
+        )
         legacy_only = bool(payload.get("legacy_only", False))
-        # Upgrade jobs are always local semantic attempts.  This normalization
-        # protects older queued payloads that recorded ``auto`` before the
-        # upgrade contract was tightened.
-        effective_provider_policy = "local" if legacy_only else payload.get("provider_policy")
+        effective_provider_policy = (
+            "local" if legacy_only else payload.get("provider_policy")
+        )
         generation_result = NoteGenerationService(
             session,
             StorageLayout(settings.storage_root),
             settings,
-            worker_id=job.worker_id,
+            worker_id=owner_worker_id,
             lease_store=lease_store,
         ).generate_one(
             aweme_id,
@@ -344,8 +360,13 @@ def build_worker_runtime(
         if not isinstance(generation_result, GenerationResult):
             raise TypeError("generate_note_result_invalid")
         validate_handler_outcome(job, generation_result)
-        job.progress = 0.95
-        session.commit()
+        _update_owned_job(
+            session,
+            job.id,
+            owner_worker_id,
+            owner_fence,
+            progress=0.95,
+        )
         return generation_result
 
     handlers.register("sync_creator", sync_creator)
@@ -361,18 +382,59 @@ def build_worker_runtime(
         heartbeat_interval=settings.job_heartbeat_seconds,
         worker_name=worker_name,
         lease_ttl_seconds=settings.gpu_lease_ttl_seconds,
+        stale_after_seconds=settings.job_stale_seconds,
+        recovery_interval_seconds=min(30.0, settings.job_stale_seconds / 4),
+        idle_callback=(
+            (lambda: _refresh_legacy_upgrade(queue, settings))
+            if worker_kinds is None or "generate_note" in worker_kinds
+            else None
+        ),
     )
     return WorkerRuntime(
         session=session,
         queue=queue,
         handlers=handlers,
         worker=worker,
+        transcriber=transcriber,
     )
 
 
 def _raise_if_cancelled(cancel_event: asyncio.Event) -> None:
     if cancel_event.is_set():
         raise JobCancelledError("cancelled_by_user")
+
+
+def _refresh_legacy_upgrade(queue: JobQueue, settings: Settings) -> Any:
+    from douyin_library.jobs.legacy_upgrade import refresh_legacy_upgrade
+
+    return refresh_legacy_upgrade(queue, settings, throttle=True)
+
+
+def _update_owned_job(
+    session: Session,
+    job_id: int,
+    worker_id: str | None,
+    claim_fence: int | None,
+    *,
+    stage: str | None = None,
+    progress: float | None = None,
+) -> None:
+    conditions = [Job.id == job_id, Job.status == "running"]
+    if worker_id is None:
+        conditions.append(Job.worker_id.is_(None))
+    else:
+        conditions.append(Job.worker_id == worker_id)
+    if claim_fence is not None:
+        conditions.append(Job.claim_fence == claim_fence)
+    values: dict[str, object] = {}
+    if stage is not None:
+        values["stage"] = stage
+    if progress is not None:
+        values["progress"] = progress
+    result = session.execute(update(Job).where(*conditions).values(**values))
+    session.commit()
+    if not result.rowcount:
+        raise JobCancelledError("job_claim_lost")
 
 
 def _job_payload(job: Job) -> Mapping[str, object]:

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import inspect
 import json
 import os
@@ -28,6 +29,7 @@ GENERATED_FILES = (
     "assets/asset_manifest.json",
 )
 _MANIFEST = "generation_manifest.json"
+_JOURNAL = ".publication.json"
 _ALL_GENERATED_FILES = (*GENERATED_FILES, _MANIFEST)
 _PUBLISH_LOCKS: dict[str, threading.RLock] = {}
 _PUBLISH_LOCKS_GUARD = threading.Lock()
@@ -73,6 +75,7 @@ class NoteBundlePublisher:
         note_dir = self.root / "dy-note" / str(aweme_id)
         with note_publication_lock(self.root, aweme_id):
             note_dir.mkdir(parents=True, exist_ok=True)
+            _recover_publication(note_dir)
             staging = note_dir / ".staging" / str(uuid.uuid4())
             rollback = staging / ".previous"
             archive_dir: Path | None = None
@@ -86,6 +89,12 @@ class NoteBundlePublisher:
                         ensure_ascii=False,
                     )
                 self._validate_outputs(outputs)
+                manifest = _json_object(outputs[_MANIFEST], _MANIFEST)
+                manifest["file_hashes"] = {
+                    name: hashlib.sha256(outputs[name].encode("utf-8")).hexdigest()
+                    for name in GENERATED_FILES
+                }
+                outputs[_MANIFEST] = json.dumps(manifest, ensure_ascii=False, indent=2)
                 current_exists = (note_dir / "learning_note.md").is_file()
                 if (
                     current_exists
@@ -111,11 +120,18 @@ class NoteBundlePublisher:
                     archive_dir = self._next_archive_path(note_dir)
                     self._archive_current(note_dir, archive_dir)
                     archive_complete = True
+                _write_publication_journal(note_dir, staging, outputs)
                 self._replace_outputs(staging, note_dir, outputs)
                 self._check_ownership(aweme_id, ownership_check)
                 self.replace(staging / _MANIFEST, note_dir / _MANIFEST)
                 _fsync_directory(note_dir)
-                shutil.rmtree(staging, ignore_errors=True)
+                if (
+                    _file_hash(note_dir / _MANIFEST)
+                    != hashlib.sha256(outputs[_MANIFEST].encode("utf-8")).hexdigest()
+                    or not bundle_hashes_match(note_dir, manifest)
+                ):
+                    raise PublishError("published bundle hash mismatch before cleanup")
+                _finish_publication(note_dir, staging)
                 return PublishResult(
                     str(aweme_id),
                     "published",
@@ -123,13 +139,16 @@ class NoteBundlePublisher:
                     str(archive_dir) if archive_dir else None,
                 )
             except Exception as exc:
+                restored = not rollback_complete
                 if archive_complete and archive_dir is not None:
                     try:
                         self._restore_archive(note_dir, archive_dir)
+                        restored = True
                     except Exception as restore_exc:
                         if rollback_complete:
                             try:
                                 _restore_snapshot(note_dir, rollback)
+                                restored = True
                             except Exception as snapshot_exc:
                                 restore_exc = (
                                     f"{restore_exc}; snapshot restore failed: "
@@ -139,9 +158,12 @@ class NoteBundlePublisher:
                 elif rollback_complete:
                     try:
                         _restore_snapshot(note_dir, rollback)
+                        restored = True
                     except Exception as restore_exc:
                         exc = PublishError(f"{exc}; restore failed: {restore_exc}")
-                shutil.rmtree(staging, ignore_errors=True)
+                # Keep durable recovery evidence if rollback itself failed.
+                if restored:
+                    _finish_publication(note_dir, staging)
                 self._record_failure(note_dir, aweme_id, exc)
                 if isinstance(exc, PublishError):
                     raise
@@ -281,13 +303,18 @@ def publish_with_guard(
         "force": force,
         "ownership_check": ownership_check,
     }
-    if publish_guard is None or _accepts_keyword(publisher.publish, "publish_guard"):
-        if publish_guard is not None:
-            kwargs["publish_guard"] = publish_guard
+    if publish_guard is None:
         return publisher.publish(aweme_id, candidate, **kwargs)
 
+    # Hold the per-note lock across the guard check and the custom publisher
+    # call.  Built-in publishers acquire the same lock re-entrantly; custom
+    # publishers may accept ``publish_guard`` but otherwise have no locking,
+    # so the adapter must still close the check-to-replacement race here.
+    accepts_guard = _accepts_keyword(publisher.publish, "publish_guard")
+    if accepts_guard:
+        kwargs["publish_guard"] = publish_guard
     with note_publication_lock(root, aweme_id):
-        if not publish_guard():
+        if not accepts_guard and not publish_guard():
             raise PublishError("publish guard failed before replacement")
         return publisher.publish(aweme_id, candidate, **kwargs)
 
@@ -307,7 +334,21 @@ def _accepts_keyword(callback: Callable[..., Any], keyword: str) -> bool:
 def note_publication_lock(root: Path, aweme_id: str):
     """Serialize one work's publication across threads and worker processes."""
 
-    lock_path = Path(root) / "dy-note" / str(aweme_id) / ".publish.lock"
+    with _note_directory_lock(Path(root) / "dy-note" / str(aweme_id)):
+        yield
+
+
+@contextmanager
+def note_read_lock(note_dir: Path):
+    """Read a consistent committed bundle and recover an interrupted writer."""
+    with _note_directory_lock(note_dir):
+        _recover_publication(note_dir)
+        yield
+
+
+@contextmanager
+def _note_directory_lock(note_dir: Path):
+    lock_path = note_dir / ".publish.lock"
     key = str(lock_path.resolve())
     with _PUBLISH_LOCKS_GUARD:
         thread_lock = _PUBLISH_LOCKS.setdefault(key, threading.RLock())
@@ -450,9 +491,97 @@ def _stage_outputs(staging: Path, outputs: Mapping[str, str]) -> None:
         except ValueError as exc:
             raise PublishError(f"invalid staged output path: {relative}") from exc
         target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_text(content, encoding="utf-8")
+        target.write_text(content, encoding="utf-8", newline="\n")
         _fsync_file(target)
     _fsync_directory(staging)
+
+
+def _file_hash(path: Path) -> str:
+    with path.open("rb") as handle:
+        return hashlib.file_digest(handle, "sha256").hexdigest()
+
+
+def bundle_hashes_match(note_dir: Path, manifest: Mapping[str, Any]) -> bool:
+    """Legacy manifests remain readable; new bundles verify every artifact."""
+    if "file_hashes" not in manifest:
+        return True
+    hashes = manifest["file_hashes"]
+    if not isinstance(hashes, dict) or set(hashes) != set(GENERATED_FILES):
+        return False
+    try:
+        return all(_file_hash(note_dir / name) == hashes[name] for name in GENERATED_FILES)
+    except OSError:
+        return False
+
+
+def _write_publication_journal(
+    note_dir: Path, staging: Path, outputs: Mapping[str, str],
+) -> None:
+    snapshot = staging / ".previous"
+    previous = {
+        name: _file_hash(snapshot / name)
+        for name in _ALL_GENERATED_FILES if (snapshot / name).is_file()
+    }
+    value = {
+        "schema": "douyin-note-publication-v1",
+        "staging": staging.name,
+        "manifest_hash": hashlib.sha256(outputs[_MANIFEST].encode("utf-8")).hexdigest(),
+        "previous_hashes": previous,
+    }
+    temporary = note_dir / (_JOURNAL + ".tmp")
+    temporary.write_text(json.dumps(value), encoding="utf-8", newline="\n")
+    _fsync_file(temporary)
+    _replace(temporary, note_dir / _JOURNAL)
+    _fsync_directory(note_dir)
+
+
+def _recover_publication(note_dir: Path) -> None:
+    journal = note_dir / _JOURNAL
+    if not journal.is_file():
+        return
+    try:
+        value = _json_object(journal.read_text(encoding="utf-8"), _JOURNAL)
+        token = value.get("staging")
+        if not isinstance(token, str) or str(uuid.UUID(token)) != token:
+            raise PublishError("invalid publication staging token")
+        staging = note_dir / ".staging" / token
+        staging.resolve().relative_to((note_dir / ".staging").resolve())
+        manifest_path = note_dir / _MANIFEST
+        committed = (
+            manifest_path.is_file()
+            and _file_hash(manifest_path) == value.get("manifest_hash")
+            and bundle_hashes_match(
+                note_dir, _json_object(manifest_path.read_text(encoding="utf-8"), _MANIFEST),
+            )
+        )
+        if not committed:
+            snapshot = staging / ".previous"
+            previous = value.get("previous_hashes")
+            if not snapshot.is_dir() or not isinstance(previous, dict):
+                raise PublishError("publication rollback snapshot is unavailable")
+            snapshot_files = {
+                name for name in _ALL_GENERATED_FILES if (snapshot / name).is_file()
+            }
+            if set(previous) != snapshot_files:
+                raise PublishError("invalid publication snapshot paths")
+            if any(_file_hash(snapshot / name) != digest for name, digest in previous.items()):
+                raise PublishError("publication rollback snapshot hash mismatch")
+            _restore_snapshot(note_dir, snapshot)
+        _finish_publication(note_dir, staging)
+    except (OSError, UnicodeError, ValueError, RecursionError) as exc:
+        raise PublishError(f"publication recovery failed: {exc}") from exc
+
+
+def _finish_publication(note_dir: Path, staging: Path) -> None:
+    # The bundle has already been committed or restored.  Cleanup errors must
+    # never trigger another rollback or make that complete snapshot unreadable.
+    # Keep any remaining journal/staging files for later recovery or inspection.
+    try:
+        (note_dir / _JOURNAL).unlink(missing_ok=True)
+        _fsync_directory(note_dir)
+    except OSError:
+        return
+    shutil.rmtree(staging, ignore_errors=True)
 
 
 def _snapshot_generated(note_dir: Path, snapshot: Path) -> None:
@@ -479,6 +608,7 @@ def _restore_snapshot(note_dir: Path, snapshot: Path) -> None:
         if source.is_file():
             target.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(source, target)
+            _fsync_file(target)
         elif target.is_file():
             target.unlink()
     _fsync_directory(note_dir)
@@ -517,5 +647,7 @@ __all__ = [
     "PublishError",
     "PublishResult",
     "note_publication_lock",
+    "note_read_lock",
+    "bundle_hashes_match",
     "publish_with_guard",
 ]

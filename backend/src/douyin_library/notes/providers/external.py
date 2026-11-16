@@ -27,6 +27,7 @@ AsyncClientFactory = Callable[..., httpx.AsyncClient]
 class ExternalNoteProvider:
     name = "external"
     is_local = False
+    supports_teaching_pipeline = True
 
     def __init__(
         self,

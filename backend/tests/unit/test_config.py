@@ -15,6 +15,15 @@ def test_default_storage_root_is_d_drive(monkeypatch) -> None:
     assert settings.transcription_subtitle_root == Path(r"D:\DouyinKnowledgeLibrary\subtitle")
 
 
+def test_qwen_runtime_defaults_to_resident_and_has_local_server_path() -> None:
+    settings = Settings()
+
+    assert settings.transcription_runtime == "resident"
+    assert settings.qwen_server_script_path.name == "qwen_asr_server.py"
+    assert settings.qwen_runtime_start_timeout_seconds == 120
+    assert settings.qwen_offline is True
+
+
 def test_note_provider_defaults(monkeypatch) -> None:
     for name in (
         "DKL_NOTE_PROVIDER_POLICY",

@@ -7,7 +7,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from douyin_library.jobs.control import JobCancelledError, JobControl
-from douyin_library.jobs.queue import JobQueue
+from douyin_library.jobs.queue import JobQueue, JobTransitionError
 from douyin_library.notes.service import GenerationResult
 
 
@@ -59,7 +59,7 @@ class JobHandlers:
         try:
             await self.run_claimed(job, cancel_event)
         finally:
-            self.control.unregister(job.id)
+            self.control.unregister(job.id, cancel_event)
         return True
 
     async def run_job(
@@ -81,13 +81,27 @@ class JobHandlers:
             self.control.unregister(job.id)
 
     async def run_claimed(self, job: Any, cancel_event: asyncio.Event) -> None:
+        # Capture the lease identity before invoking user/provider code.  The
+        # ORM instance can be refreshed after a stale lease is reclaimed; all
+        # terminal mutations below must still be fenced by this original
+        # worker/fence pair.
+        owner_worker_id = getattr(job, "worker_id", None)
+        owner_fence = getattr(job, "claim_fence", None)
         handler = self._handlers.get(job.kind)
         if handler is None:
-            self.queue.fail(
-                job.id,
-                error_code="handler_not_registered",
-                error_detail=f"No handler registered for {job.kind}",
-            )
+            try:
+                if self._owns_claim(job.id, owner_worker_id, owner_fence):
+                    self.queue.fail(
+                        job.id,
+                        error_code="handler_not_registered",
+                        error_detail=f"No handler registered for {job.kind}",
+                        worker_id=owner_worker_id,
+                        claim_fence=owner_fence,
+                    )
+            except JobTransitionError:
+                # A stale worker has no authority to alter the replacement
+                # claim.  The current owner will report its own outcome.
+                pass
             return
         try:
             if cancel_event.is_set():
@@ -96,23 +110,75 @@ class JobHandlers:
             validate_handler_outcome(job, outcome)
         except JobCancelledError:
             self.queue.session.expire_all()
-            current = self.queue.get(job.id)
-            if current.status == "running":
-                self.queue.cancel(job.id)
+            try:
+                current = self.queue.get(job.id)
+                if current.status == "running" and self._owns_claim(
+                    job.id, owner_worker_id, owner_fence
+                ):
+                    self.queue.cancel(
+                        job.id,
+                        worker_id=owner_worker_id,
+                        claim_fence=owner_fence,
+                    )
+            except JobTransitionError:
+                pass
             return
         except Exception as exc:  # noqa: BLE001
             self.queue.session.expire_all()
-            if self.queue.get(job.id).status == "cancelled":
-                return
-            self.queue.fail(
-                job.id,
-                error_code="handler_failed",
-                error_detail=str(exc),
-            )
+            try:
+                if self.queue.get(job.id).status == "cancelled":
+                    return
+                if self._owns_claim(job.id, owner_worker_id, owner_fence):
+                    self.queue.fail(
+                        job.id,
+                        error_code="handler_failed",
+                        error_detail=str(exc),
+                        worker_id=owner_worker_id,
+                        claim_fence=owner_fence,
+                    )
+            except JobTransitionError:
+                pass
         else:
             self.queue.session.expire_all()
-            if self.queue.get(job.id).status == "running":
-                self.queue.transition(job.id, "succeeded")
+            try:
+                if self.queue.get(job.id).status == "running" and self._owns_claim(
+                    job.id, owner_worker_id, owner_fence
+                ):
+                    self.queue.transition(
+                        job.id,
+                        "succeeded",
+                        worker_id=owner_worker_id,
+                        claim_fence=owner_fence,
+                    )
+            except JobTransitionError:
+                pass
+
+    def _owns_claim(
+        self,
+        job_id: int,
+        worker_id: str | None,
+        claim_fence: int | None,
+    ) -> bool:
+        """Check the immutable claim before attempting a terminal mutation.
+
+        ``transition``/``fail`` still repeat this identity in their atomic
+        WHERE clause; this first check makes stale handlers return quietly and
+        avoids treating a replacement owner's state as their own.
+        """
+
+        checker = getattr(self.queue, "is_owned", None)
+        if not callable(checker) or claim_fence is None:
+            return True
+        try:
+            return bool(
+                checker(
+                    job_id,
+                    worker_id=worker_id,
+                    claim_fence=claim_fence,
+                )
+            )
+        except (KeyError, TypeError, ValueError):
+            return False
 
 
 def validate_handler_outcome(job: Any, outcome: Any) -> None:
@@ -154,10 +220,14 @@ def validate_handler_outcome(job: Any, outcome: Any) -> None:
         raise JobOutcomeError(
             f"generation_outcome_failed:upgrade_provider:{outcome.provider or 'missing'}"
         )
-    if outcome.quality_gate != "passed":
+    if outcome.quality_gate not in {"passed", "passed_with_warnings"}:
         raise JobOutcomeError(
             "generation_outcome_failed:upgrade_quality_gate:"
             f"{outcome.quality_gate or 'missing'}"
+        )
+    if getattr(outcome, "semantic_complete", None) is not True:
+        raise JobOutcomeError(
+            "generation_outcome_failed:upgrade_semantic_incomplete"
         )
 
 

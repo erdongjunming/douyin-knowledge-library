@@ -14,9 +14,11 @@ from douyin_library.notes.service import GenerationResult, NoteGenerationService
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("policy", ["auto", "local", "external", "rule", None])
 async def test_legacy_upgrade_result_is_returned_to_queue_contract(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    policy: str | None,
 ) -> None:
     root = tmp_path / "library"
     root.mkdir()
@@ -52,13 +54,14 @@ async def test_legacy_upgrade_result_is_returned_to_queue_contract(
         job = runtime.queue.create(
             kind="generate_note",
             work_id=work_id,
-            payload={"aweme_id": "734", "legacy_only": True, "provider_policy": "auto"},
+            payload={"aweme_id": "734", "legacy_only": True, "provider_policy": policy},
         )
 
         assert await runtime.handlers.run_one() is True
 
-        failed = runtime.queue.get(job.id)
-        assert failed.status == "failed"
+        retrying = runtime.queue.get(job.id)
+        assert retrying.status == "pending"
+        assert retrying.next_retry_at is not None
         assert policies == ["local"]
         assert (note_dir / "learning_note.md").read_text(encoding="utf-8") == original
     finally:

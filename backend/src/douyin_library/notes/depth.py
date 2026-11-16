@@ -116,14 +116,13 @@ class DepthValidator:
                 reordered_steps.extend(atom.id for atom in steps)
                 repair(section_id)
             for example in section.examples:
-                related = set(example.atom_ids)
-                related.update(
+                related = {
                     relation
                     for atom_id in example.atom_ids
                     if (atom := next((item for item in atoms if item.id == atom_id), None))
                     for relation in atom.relations
-                )
-                if not related & result_ids:
+                }
+                if not related & (result_ids - set(example.atom_ids)):
                     examples_missing.extend(example.atom_ids)
                     repair(section_id)
             for scoped in (*section.conditions, *section.risks):
@@ -141,7 +140,7 @@ class DepthValidator:
                 if atom.id not in atom_ids:
                     continue
                 if atom.kind in {"example", "counterexample"}:
-                    has_result = bool(set(atom.relations) & result_ids) or atom.id in result_ids
+                    has_result = bool(set(atom.relations) & (result_ids - {atom.id}))
                     if not atom.relations or not has_result:
                         examples_missing.append(atom.id)
                         repair(section_id)

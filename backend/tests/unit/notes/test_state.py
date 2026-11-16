@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 from pathlib import Path
 
@@ -16,6 +17,38 @@ def _note_dir(tmp_path: Path) -> Path:
     tmp_path.mkdir(parents=True, exist_ok=True)
     (tmp_path / "learning_note.md").write_text("# note", encoding="utf-8")
     return tmp_path
+
+
+@pytest.mark.parametrize("lock_exists", [False, True])
+@pytest.mark.parametrize("pending_publication", [False, True])
+def test_read_only_classification_never_creates_locks_or_recovers_publication(
+    tmp_path: Path, lock_exists: bool, pending_publication: bool,
+) -> None:
+    note_dir = _note_dir(tmp_path)
+    manifest = note_dir / "generation_manifest.json"
+    _write_json(manifest, {
+        "provider": "ollama", "model": "qwen3:8b", "quality_gate": "passed",
+        "semantic_complete": True,
+    })
+    _write_json(note_dir / "coverage_report.json", {
+        "quality_gate": "passed", "depth_passed": True,
+        "input_sufficient": True, "semantic_complete": True,
+    })
+    if lock_exists:
+        (note_dir / ".publish.lock").write_bytes(b"\0")
+    if pending_publication:
+        _write_json(note_dir / ".publication.json", {
+            "staging": "00000000-0000-0000-0000-000000000000",
+            "manifest_hash": hashlib.sha256(manifest.read_bytes()).hexdigest(),
+        })
+    before = {path: path.read_bytes() for path in note_dir.rglob("*") if path.is_file()}
+
+    state = classify_note_bundle(note_dir, read_only=True)
+
+    assert state.quality_status == (
+        "unknown" if pending_publication else "semantic_complete"
+    )
+    assert {path: path.read_bytes() for path in note_dir.rglob("*") if path.is_file()} == before
 
 
 def test_missing_learning_note_is_missing_even_with_metadata(tmp_path: Path) -> None:

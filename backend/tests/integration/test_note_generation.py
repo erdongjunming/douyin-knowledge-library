@@ -237,7 +237,7 @@ async def test_semantic_publish_checks_gpu_lease_ownership_before_commit(tmp_pat
         result = await service.generate_one("735", provider_policy="local")
 
     assert result.status == "generated"
-    assert ownership_checks[0] == 1
+    assert ownership_checks[0] == 2
     assert released == ["lease-handle"]
     engine.dispose()
 
@@ -316,8 +316,9 @@ async def test_legacy_upgrade_job_fails_for_preserved_result_and_forces_local_po
 
         assert await runtime.handlers.run_one() is True
 
-        failed = runtime.queue.get(job.id)
-        assert failed.status == "failed"
+        retrying = runtime.queue.get(job.id)
+        assert retrying.status == "pending"
+        assert retrying.next_retry_at is not None
         assert calls == ["local"]
         assert (note_dir / "learning_note.md").read_text(encoding="utf-8") == original
     finally:

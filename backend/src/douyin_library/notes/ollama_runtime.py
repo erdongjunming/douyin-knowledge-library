@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import os
 import shutil
 import subprocess
@@ -77,6 +78,12 @@ async def probe_ollama(
             client = httpx.AsyncClient(
                 transport=transport,
                 timeout=current_settings.note_ollama_probe_timeout_seconds,
+                # A loopback Ollama endpoint must not be sent through a
+                # system proxy, which can make a healthy local service look
+                # unavailable.
+                trust_env=not bool(
+                    (parsed := parse_base_url(base_url)) and parsed.is_loopback
+                ),
             )
         else:
             client = client_factory()
@@ -117,6 +124,44 @@ async def probe_ollama(
         model=model,
         action_required=None if model_available else f"ollama pull {model}",
     )
+
+
+async def ensure_ollama_ready(
+    settings: Settings | None = None,
+    *,
+    manager: OllamaProcessManager | None = None,
+    timeout_seconds: float = 45.0,
+    poll_interval_seconds: float = 0.5,
+) -> OllamaStatus:
+    """Start a local Ollama service when needed and wait for its configured model.
+
+    This never downloads a model and never starts a remote endpoint.  A manager
+    supplied by the caller remains responsible for stopping only a process that
+    it started itself.
+    """
+
+    if timeout_seconds <= 0 or poll_interval_seconds < 0:
+        raise ValueError("ollama_readiness_timeout_invalid")
+    current_settings = settings or Settings()
+    process_manager = manager or OllamaProcessManager(current_settings)
+    status = await probe_ollama(current_settings)
+    if status.ready:
+        return status
+    if status.service_status == "ready":
+        # The endpoint answered, but the exact configured model is absent.
+        return status
+    if status.service_status != "stopped" or not process_manager.start_if_installed():
+        return status
+
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout_seconds
+    while True:
+        if loop.time() >= deadline:
+            return status
+        await asyncio.sleep(poll_interval_seconds)
+        status = await probe_ollama(current_settings)
+        if status.ready or status.service_status == "ready":
+            return status
 
 
 class OllamaProcessManager:
@@ -216,6 +261,7 @@ def _loopback_ollama_host(value: str) -> str | None:
 
 
 __all__ = [
+    "ensure_ollama_ready",
     "OllamaProcessManager",
     "OllamaStatus",
     "probe_ollama",

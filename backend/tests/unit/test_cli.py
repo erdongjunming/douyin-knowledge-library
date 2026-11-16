@@ -126,6 +126,32 @@ def test_generate_notes_rejects_force_legacy_only(monkeypatch) -> None:
         main(["generate-notes", "--force", "--legacy-only"])
 
 
+def test_generate_notes_rejects_legacy_limit_above_three(monkeypatch) -> None:
+    monkeypatch.setattr("douyin_library.cli.run_generate_notes", lambda **kwargs: {})
+
+    with pytest.raises(SystemExit):
+        main(["generate-notes", "--legacy-only", "--limit", "4"])
+
+
+@pytest.mark.parametrize("provider", ["auto", "external", "rule"])
+def test_generate_notes_rejects_non_local_legacy_provider(monkeypatch, provider) -> None:
+    monkeypatch.setattr("douyin_library.cli.run_generate_notes", lambda **kwargs: {})
+
+    with pytest.raises(SystemExit):
+        main(["generate-notes", "--legacy-only", "--provider", provider])
+
+
+def test_generate_notes_defaults_legacy_upgrade_to_local(monkeypatch) -> None:
+    calls: list[dict[str, object]] = []
+    monkeypatch.setattr(
+        "douyin_library.cli.run_generate_notes",
+        lambda **kwargs: calls.append(kwargs) or {"failed": 0},
+    )
+
+    assert main(["generate-notes", "--legacy-only", "--dry-run"]) == 0
+    assert calls[0]["provider_policy"] == "local"
+
+
 def test_clean_transcripts_dry_run_reports_selected_ids_without_writes(monkeypatch, capsys) -> None:
     calls: list[dict[str, object]] = []
 

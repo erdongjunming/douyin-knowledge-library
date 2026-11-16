@@ -101,7 +101,9 @@ async def test_legacy_batch_counts_preserved_result_as_failed(tmp_path: Path) ->
 
 
 @pytest.mark.asyncio
-async def test_legacy_upgrade_rejects_provider_that_is_not_ollama(tmp_path: Path) -> None:
+async def test_legacy_upgrade_rejects_provider_that_does_not_match_selection(
+    tmp_path: Path,
+) -> None:
     engine, layout = _seed_legacy_note(tmp_path / "library")
     note_path = layout.note_dir("731") / "learning_note.md"
     original = note_path.read_text(encoding="utf-8")

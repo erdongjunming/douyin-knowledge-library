@@ -12,6 +12,7 @@ import asyncio
 from pathlib import Path
 
 from douyin_library.config import Settings
+from douyin_library.transcription.providers.qwen_resident import QwenResidentRunner
 from douyin_library.transcription.service import (
     QwenAsrSubprocess,
     SubprocessResult,
@@ -21,11 +22,13 @@ from douyin_library.transcription.service import (
 class QwenAsrProvider:
     """Configured Qwen subprocess exposed through the transcription protocol."""
 
-    def __init__(self, runner: QwenAsrSubprocess) -> None:
+    def __init__(self, runner: object) -> None:
         self.runner = runner
 
     @classmethod
     def from_settings(cls, settings: Settings) -> QwenAsrProvider:
+        if settings.transcription_runtime == "resident":
+            return cls(QwenResidentRunner.from_settings(settings))
         return cls(QwenAsrSubprocess.from_settings(settings))
 
     async def run(
@@ -42,6 +45,11 @@ class QwenAsrProvider:
             result_path=result_path,
             cancel_event=cancel_event,
         )
+
+    def close(self) -> None:
+        closer = getattr(self.runner, "close", None)
+        if callable(closer):
+            closer()
 
 
 __all__ = ["QwenAsrProvider"]

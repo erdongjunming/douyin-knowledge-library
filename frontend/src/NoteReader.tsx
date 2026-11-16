@@ -39,6 +39,7 @@ export function NoteReader({ title, markdown, onClose, provider, model, qualityS
     },
     a: ({ children, href, ...props }: React.ComponentProps<"a">) => <a href={href} target="_blank" rel="noopener noreferrer" {...props}>{children}</a>,
   }), [])
+  const content = useMemo(() => <ReactMarkdown components={components}>{markdown}</ReactMarkdown>, [components, markdown])
   const scrollTo = (heading: string) => document.getElementById(headingId(heading))?.scrollIntoView({ behavior: "smooth", block: "start" })
 
   return <div className="note-reader">
@@ -54,6 +55,6 @@ export function NoteReader({ title, markdown, onClose, provider, model, qualityS
       {warning && <span className="note-warning" role="alert">{warning}</span>}
     </div>}
     {availableSections.length > 0 && <nav className="note-section-nav" aria-label="笔记章节导航">{availableSections.map(({ heading, label, icon: Icon }) => <button className="button subtle" type="button" key={heading} onClick={() => scrollTo(heading)}><Icon size={14} aria-hidden="true" />{label}</button>)}</nav>}
-    <div className="note-reader-body"><article className="note-content"><ReactMarkdown components={components}>{markdown}</ReactMarkdown></article></div>
+    <div className="note-reader-body"><article className="note-content">{content}</article></div>
   </div>
 }

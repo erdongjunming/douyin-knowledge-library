@@ -13,8 +13,9 @@ Double-click `start-local.cmd`, or run:
 .\start-local.cmd
 ```
 
-The launcher starts four independently managed processes: FastAPI on `8002`, a general
-job worker, an ASR worker, and Vite on `5175`. It keeps child logs under `.runtime\logs`
+The launcher first starts (or reuses) local Ollama and waits for the configured
+`qwen3:4b` model, then starts four independently managed processes: FastAPI on `8002`, a
+general job worker, an ASR worker, and Vite on `5175`. It keeps child logs under `.runtime\logs`
 and terminates the complete process trees when the launcher exits. Open
 `http://127.0.0.1:5175/` after the readiness message. To create or repair the desktop
 shortcut, run `install-desktop-shortcut.cmd`.
@@ -34,9 +35,27 @@ queue, so they can be restarted independently.
 ## Local transcription
 
 Chinese audio uses the shared `Qwen/Qwen3-ASR-0.6B` environment. The ASR worker converts
-retained M4A audio to a temporary 16 kHz mono WAV, runs the Qwen subprocess, and removes
-the temporary file. Retained transcripts stay under
+retained M4A audio to a temporary 16 kHz mono WAV, sends it to the default resident Qwen
+runtime, and removes the temporary file. The resident runtime loads the model once per
+ASR worker and accepts sequential local JSON-line requests; it is supervised by the worker
+and is never exposed as a network service. Retained transcripts stay under
 `D:\DouyinKnowledgeLibrary\transcript\<aweme_id>\`.
+
+The runtime can be switched back to the one-process-per-job compatibility path with:
+
+```powershell
+$env:DKL_TRANSCRIPTION_RUNTIME = "subprocess"
+```
+
+Resident startup requires the configured Qwen Python environment and
+`scripts\qwen_asr_server.py`. Use `DKL_QWEN_SERVER_SCRIPT_PATH` to point to a reviewed
+copy, `DKL_QWEN_RUNTIME_START_TIMEOUT_SECONDS` to change the model-load deadline, and
+`DKL_QWEN_OFFLINE=false` only when an explicitly network-enabled model preparation step
+is intended. Runtime inference defaults to offline model loading and never downloads
+weights as part of a transcription job.
+The runtime reports readiness only after the model process loads successfully. A timeout,
+process exit, malformed response, or cancellation keeps the stable raw transcript intact;
+the next job can start a fresh resident process.
 
 Transcription is subtitle-first when `DKL_TRANSCRIPTION_SUBTITLE_ENABLED=true`: a usable
 local SRT/VTT/ASS/SSA/TXT subtitle is retained as the raw source and Qwen ASR is not
@@ -73,8 +92,8 @@ the lease expires or renews across worker processes.
 
 ## Note providers and cost
 
-The semantic note chain is local-first: `auto` tries Ollama, then an explicitly configured
-external provider, then the deterministic rule fallback. `local` omits the external
+For new notes, `auto` tries an explicitly configured external provider, then Ollama,
+then the deterministic rule fallback. `local` omits the external
 provider, `external` opts into it, and `rule` is deterministic-only. Ollama is never
 auto-installed or auto-pulled. Start and prepare it explicitly:
 
@@ -89,6 +108,18 @@ are all configured (and the selected policy permits it). External cost is report
 unknown unless the provider reports a cost or explicit per-million-token rates are set.
 Keys are never written to prompts, jobs, notes, or audit payloads.
 
+The full historical upgrade is a separate resumable operation so ordinary application
+startup cannot compete with it silently. Start it after the local model is ready with:
+
+```powershell
+.\scripts\resume_legacy_upgrade.ps1
+```
+
+The runner starts Ollama itself when it is stopped, waits for `qwen3:4b`, and exits with a
+provider-unavailable record if the model is not installed. It reuses the fixed inventory,
+rechecks source and old-note hashes before skipping a batch, and keeps the old note when a
+semantic or provider attempt fails.
+
 ## Incremental learning notes
 
 The note pipeline reuses only retained `metadata`, `transcript.txt`, `segments.json`, and
@@ -102,6 +133,34 @@ source segment and is marked as `fallback`; it cannot overwrite a stronger exist
 The dry run only reports eligible IDs and creates no jobs or files. Note generation never
 downloads a video or overwrites source audio, cover, metadata, subtitle, or raw transcript
 files; failed attempts are isolated under the note `attempts` directory.
+
+Teaching notes always expose the fixed chapters `主题观点`, `核心观点`, `方法与步骤`,
+`案例与结果`, `前提、边界与风险`, `行动建议`, `逐段证据`, and `证据与局限`, plus
+the reader views `主题复盘` and `完整逐段时间线`. Every substantive statement is
+linked to an evidence atom and timestamp. The renderer preserves concrete details
+such as ordered steps, examples and results, numbers, names, conditions, ASR
+uncertainty, and promotional content; when the source does not contain a category,
+it says so explicitly instead of inventing one.
+
+For an existing legacy/fallback note, `semantic_complete=true` is required before
+replacement. Historical upgrades are Ollama-only and limited to three queued works
+per request. A failed, cancelled, depth-incomplete, or input-insufficient upgrade
+keeps the old note and all raw asset hashes intact. Use a zero-write dry run first,
+then retry selected IDs after correcting the provider or transcript:
+
+```powershell
+cd backend
+.\.venv\Scripts\python.exe -m douyin_library.cli generate-notes `
+  --legacy-only --provider local --dry-run --limit 3
+.\.venv\Scripts\python.exe -m douyin_library.cli generate-notes `
+  --legacy-only --provider local --aweme-id <aweme_id>
+```
+
+The API reports pending/active/failed upgrade counts, including depth and input
+shortfalls. `--force` cannot be combined with `--legacy-only`. Do not bypass human
+verification, click CAPTCHA automatically, export cookies/tokens, or put signed
+video URLs in logs. Browser AI or Doubao may only supplement visual context; the
+subtitle/ASR transcript and evidence map remain the factual source.
 
 Always inspect the candidate count first:
 
@@ -121,6 +180,13 @@ Useful controls:
 .\.venv\Scripts\python.exe -m douyin_library.cli generate-notes --legacy-only --provider local
 # Rebuild a bundle intentionally; --force and --legacy-only cannot be combined.
 .\.venv\Scripts\python.exe -m douyin_library.cli generate-notes --force --limit 3
+# Rebuild an explicitly selected fallback through the configured cloud provider.
+# Load Windows user provider settings when the current shell predates them.
+. ..\scripts\local-runtime.ps1
+Import-ProviderUserEnvironment
+.\.venv\Scripts\python.exe -m douyin_library.cli generate-notes `
+  --force --provider external --aweme-id <aweme_id> --dry-run
+# Remove --dry-run to execute; repeat --aweme-id for each verified target.
 ```
 
 Incremental runs skip a video when `dy-note\<aweme_id>\learning_note.md` exists.
@@ -158,3 +224,19 @@ If the page does not open, check `.runtime\logs`, confirm `8002` and `5175` are 
 run `start-local.cmd` from the project directory. If notes show a fallback warning, check
 `GET http://127.0.0.1:8002/api/notes/provider-status`, start Ollama, and install the model
 explicitly; no source assets need to be downloaded again.
+
+The launcher imports missing provider configuration from the Windows user environment
+without printing the API key, and holds a project mutex to prevent simultaneous launches.
+If project workers already exist, startup stops with `project_workers_already_running`;
+reuse those services or stop their owning launcher first. Explicit failed-job retries use
+`POST /api/jobs/<id>/retry`; an existing active task for the same work returns HTTP 409.
+
+## Example notes
+
+[`examples/notes/`](examples/notes/) contains five representative learning notes
+picked from a local library of 2,283, spanning AI, investing, philosophy, growth,
+and wealth topics. They are generated locally (Ollama qwen3:4b) from ASR
+transcripts and are included only to demonstrate pipeline output quality;
+copyright of the original videos remains with their authors (links in each note
+header). `examples/notes/ai-context-engineering/legacy_v1.md` shows the same note
+as produced before the semantic pipeline upgrade, for before/after comparison.

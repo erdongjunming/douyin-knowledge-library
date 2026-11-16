@@ -473,12 +473,12 @@ async def test_jiang_teaching_note_keeps_facts_in_topic_sections() -> None:
     assert generation.coverage.semantic_complete is True
     assert generation.section_attempts == {section_id: 1 for section_id in _SECTION_IDS}
 
-    methods = _section_body(bundle.learning_note, "## 方法与步骤", "## 案例与反例")
-    examples = _section_body(bundle.learning_note, "## 案例与反例", "## 前提、边界与风险")
+    methods = _section_body(bundle.learning_note, "### 方法与步骤", "### 案例与结果")
+    examples = _section_body(bundle.learning_note, "### 案例与结果", "### 前提、边界与风险")
     boundaries = _section_body(
         bundle.learning_note,
-        "## 前提、边界与风险",
-        "## 关键概念",
+        "### 前提、边界与风险",
+        "### 行动建议",
     )
     promotions = _section_body(bundle.learning_note, "## 推广与行动号召", "## 归档标签")
 
@@ -487,8 +487,9 @@ async def test_jiang_teaching_note_keeps_facts_in_topic_sections() -> None:
     assert "结果首周获得10个有效反馈" in examples
     assert "100元" in examples
     assert "只有每周复盘才适用" in boundaries
-    assert "ASR" in boundaries
-    assert "姓名需人工核对" in boundaries
+    doubts = bundle.learning_note.split("## 转写疑点清单", 1)[1]
+    assert "ASR" in doubts
+    assert "姓名需人工核对" in doubts
     assert "关注我并领取实验模板" in promotions
 
     for field_name in (

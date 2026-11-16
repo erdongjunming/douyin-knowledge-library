@@ -237,6 +237,77 @@ it("switches to the jobs view and loads progress records", async () => {
   ))
 })
 
+it("selects jobs, pauses them in bulk, and refreshes stale work", async () => {
+  const fetchMock = vi.spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
+    const path = String(input)
+    if (path === "/api/jobs/refresh" && init?.method === "POST") {
+      return new Response(JSON.stringify({ recovered: 1, items: [{ id: 7, kind: "generate_note", work_id: 731, status: "pending", stage: "analyze", progress: 0, attempts: 0, error_code: null }] }), { status: 200 })
+    }
+    if (path === "/api/jobs/bulk-pause" && init?.method === "POST") {
+      return new Response(JSON.stringify({ paused: 1, items: [{ id: 7, kind: "generate_note", work_id: 731, status: "paused", stage: "analyze", progress: 0, attempts: 0, error_code: "paused_by_user" }] }), { status: 200 })
+    }
+    if (path === "/api/jobs") {
+      return new Response(JSON.stringify({ items: [{ id: 7, kind: "generate_note", work_id: 731, status: "pending", stage: "analyze", progress: 0, attempts: 0, error_code: null }] }), { status: 200 })
+    }
+    return new Response(JSON.stringify({ status: "ok" }), { status: 200 })
+  })
+
+  render(<App />)
+  fireEvent.click(screen.getByRole("button", { name: "任务中心" }))
+  await screen.findByText("generate_note")
+  fireEvent.click(screen.getByRole("button", { name: "多选" }))
+  fireEvent.click(screen.getByRole("checkbox", { name: "选择任务 7" }))
+  fireEvent.click(screen.getByRole("button", { name: "暂停 (1)" }))
+  await waitFor(() => expect(fetchMock).toHaveBeenCalledWith("/api/jobs/bulk-pause", expect.objectContaining({ method: "POST", body: JSON.stringify({ job_ids: [7] }) })))
+  fireEvent.click(screen.getByRole("button", { name: "刷新任务" }))
+  await waitFor(() => expect(fetchMock).toHaveBeenCalledWith("/api/jobs/refresh", expect.objectContaining({ method: "POST" })))
+  expect(await screen.findByText("已刷新任务，并重新排队 1 个卡住任务。")).toBeVisible()
+})
+
+it("shows separate lanes and reports bounded refresh results", async () => {
+  const jobs = [
+    { id: 7, kind: "generate_note", queue_lane: "new_note", lane_label: "新笔记录入", work_id: 731, status: "pending", stage: "analyze", progress: 0, attempts: 0, error_code: null },
+    { id: 8, kind: "generate_note", queue_lane: "legacy_upgrade", lane_label: "旧笔记升级", work_id: 732, status: "paused", stage: "analyze", progress: 0, attempts: 0, error_code: "paused_by_user" },
+  ]
+  vi.spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
+    const path = String(input)
+    if (path === "/api/jobs/refresh" && init?.method === "POST") {
+      return new Response(JSON.stringify({ items: jobs, recovered: 1, recovered_by_lane: { new_note: 0, legacy_upgrade: 1 }, legacy_refill: { queued: 2, reason: "new_queue_empty" } }), { status: 200 })
+    }
+    if (path === "/api/jobs") return new Response(JSON.stringify({ items: jobs }), { status: 200 })
+    return new Response(JSON.stringify({ status: "ok" }), { status: 200 })
+  })
+
+  render(<App />)
+  fireEvent.click(screen.getByRole("button", { name: "任务中心" }))
+  expect(await screen.findByText("新笔记录入")).toBeVisible()
+  expect(screen.getByText("旧笔记升级")).toBeVisible()
+  fireEvent.click(screen.getByRole("button", { name: "刷新任务" }))
+  expect(await screen.findByText("已刷新：恢复 1 个卡住任务，旧升级补入 2 条。")).toBeVisible()
+})
+
+it("keeps skipped bulk selections visible with their result", async () => {
+  const jobs = [
+    { id: 7, kind: "generate_note", work_id: 731, status: "pending", stage: "analyze", progress: 0, attempts: 0, error_code: null },
+    { id: 8, kind: "generate_note", work_id: 732, status: "paused", stage: "analyze", progress: 0, attempts: 0, error_code: "paused_by_user" },
+  ]
+  vi.spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
+    const path = String(input)
+    if (path === "/api/jobs/bulk-pause" && init?.method === "POST") return new Response(JSON.stringify({ paused: 1, skipped: 1, items: [{ ...jobs[0], status: "paused" }], results: [{ id: 7, status: "paused", reason: null }, { id: 8, status: "skipped", reason: "invalid_transition:paused->paused" }] }), { status: 200 })
+    if (path === "/api/jobs") return new Response(JSON.stringify({ items: jobs }), { status: 200 })
+    return new Response(JSON.stringify({ status: "ok" }), { status: 200 })
+  })
+
+  render(<App />)
+  fireEvent.click(screen.getByRole("button", { name: "任务中心" }))
+  await screen.findAllByText("generate_note")
+  fireEvent.click(screen.getByRole("button", { name: "多选" }))
+  fireEvent.click(screen.getByRole("checkbox", { name: "全选任务" }))
+  fireEvent.click(screen.getByRole("button", { name: "暂停 (2)" }))
+  expect(await screen.findByText("已暂停 1 个任务，跳过 1 个。#8：已暂停")).toBeVisible()
+  expect(screen.getByRole("checkbox", { name: "选择任务 8" })).toBeChecked()
+})
+
 it("validates and saves a douyin cookie without retaining the secret", async () => {
   const fetchMock = vi.spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
     const path = String(input)
@@ -543,12 +614,12 @@ it("keeps a stale library response from replacing a newer filter result", async 
   expect(screen.getByText("新结果")).toBeVisible()
 })
 
-it("upgrades legacy notes when a semantic provider is ready", async () => {
+it.each([false, true])("upgrades legacy notes locally when Ollama is ready with external configured %s", async (configured) => {
   const fetchMock = vi.spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
     const path = String(input)
     if (path === "/api/jobs/progress") return new Response(JSON.stringify({ works: { collected: 1, audio_ready: 1 }, audio_extraction: { total: 1, completed: 1, running: 0, pending: 0, failed: 0, not_queued: 0, percent: 100 }, transcription: { total: 1, completed: 1, running: 0, pending: 0, failed: 0, not_queued: 0, percent: 100 } }), { status: 200 })
     if (path === "/api/notes/progress") return new Response(JSON.stringify({ total: 1, completed: 1, running: 0, pending: 0, failed: 0, skipped: 1, not_queued: 0, percent: 100, recent_aweme_id: null, failures: [], quality_counts: { semantic_complete: 0, fallback: 0, legacy: 1, unknown: 0 }, upgrade: { eligible: 1 }, }), { status: 200 })
-    if (path === "/api/notes/provider-status") return new Response(JSON.stringify({ ollama: { ready: true, model: "qwen3:8b" }, external: { configured: false } }), { status: 200 })
+    if (path === "/api/notes/provider-status") return new Response(JSON.stringify({ ollama: { ready: true, model: "qwen3:4b" }, external: { configured, ready: null } }), { status: 200 })
     if (path === "/api/notes/generate" && init?.method === "POST") return new Response(JSON.stringify({ queued: 1, already_queued: 0, skipped: 0 }), { status: 202 })
     return new Response(JSON.stringify({ status: "ok" }), { status: 200 })
   })
@@ -639,7 +710,30 @@ it("shows queued and already-active upgrade counts and updates local progress", 
   )
 })
 
-it("includes fallback and unknown notes but disables upgrades without local Ollama", async () => {
+it("explains failed legacy upgrades and directs explicit retry to the task center", async () => {
+  vi.spyOn(globalThis, "fetch").mockImplementation(async (input) => {
+    const path = String(input)
+    const data = path.startsWith("/api/notes/progress") ? {
+      total: 1, completed: 1, running: 0, pending: 0, failed: 0, skipped: 1,
+      not_queued: 0, percent: 100, recent_aweme_id: null, failures: [],
+      upgrade: { total: 1, completed: 0, remaining: 1, failed: 1, eligible: 1 },
+    } : path === "/api/jobs/progress" ? {
+      works: { collected: 1, audio_ready: 1 },
+      transcription: { total: 1, completed: 1, running: 0, pending: 0, failed: 0, not_queued: 0, percent: 100 },
+    } : path === "/api/notes/provider-status" ? { ollama: { ready: true } }
+      : path === "/api/notes/generate" ? {
+        queued: 0, already_queued: 0, skipped: 0, blocked_failed: 1,
+        legacy_scheduler: { reason: "no_candidates", blocked_failed: 1 },
+      } : { status: "ok" }
+    return new Response(JSON.stringify(data))
+  })
+  render(<App />)
+  fireEvent.click(await screen.findByRole("button", { name: "升级旧笔记" }))
+  expect(await screen.findByText(/1 条旧升级曾失败，请在任务中心查看原因并重试/)).toBeVisible()
+  expect(screen.queryByText("当前没有可升级的旧笔记。")).not.toBeInTheDocument()
+})
+
+it.each([true, false])("disables upgrades without Ollama even when external is ready %s", async (configured) => {
   const fetchMock = vi.spyOn(globalThis, "fetch").mockImplementation(async (input) => {
     const path = String(input)
     if (path === "/api/jobs/progress") {
@@ -667,10 +761,10 @@ it("includes fallback and unknown notes but disables upgrades without local Olla
     }
     if (path === "/api/notes/provider-status") {
       return new Response(JSON.stringify({
-        ready: true,
+        ready: configured,
         ollama: { ready: false, model: "qwen3:8b" },
-        external: { configured: true, ready: true },
-        external_configured: true,
+        external: { configured, ready: configured },
+        external_configured: configured,
       }), { status: 200 })
     }
     return new Response(JSON.stringify({ status: "ok" }), { status: 200 })
@@ -680,7 +774,36 @@ it("includes fallback and unknown notes but disables upgrades without local Olla
 
   const button = await screen.findByRole("button", { name: "升级旧笔记" })
   expect(button).toBeDisabled()
+  fireEvent.click(button)
   expect(screen.getByText(/回退 1 · 旧 0 · 未知 1/)).toBeVisible()
   expect(screen.getByRole("progressbar", { name: "旧笔记语义升级进度" })).toHaveAttribute("aria-valuetext", "0 / 2，0%")
   expect(fetchMock).not.toHaveBeenCalledWith("/api/notes/generate", expect.anything())
+})
+
+it.each(["ollama", "external"])("uses only local readiness from the cached %s provider summary", async (provider) => {
+  const fetchMock = vi.spyOn(globalThis, "fetch").mockImplementation(async (input) => {
+    const path = String(input)
+    if (path === "/api/jobs/progress") return new Response(JSON.stringify({
+      works: { collected: 1, audio_ready: 1 },
+      audio_extraction: { total: 1, completed: 1, running: 0, pending: 0, failed: 0, not_queued: 0, percent: 100 },
+      transcription: { total: 1, completed: 1, running: 0, pending: 0, failed: 0, not_queued: 0, percent: 100 },
+    }), { status: 200 })
+    if (path === "/api/notes/provider-status") return new Response("unavailable", { status: 503 })
+    if (path === "/api/notes/progress") return new Response(JSON.stringify({
+      total: 1, completed: 1, running: 0, pending: 0, failed: 0, skipped: 1,
+      not_queued: 0, percent: 100, recent_aweme_id: null, failures: [],
+      upgrade: { eligible: 1 },
+      provider_summary: { provider, ready: true, external_configured: true },
+    }), { status: 200 })
+    return new Response(JSON.stringify({ status: "ok" }), { status: 200 })
+  })
+
+  render(<App />)
+  const button = await screen.findByRole("button", { name: "升级旧笔记" })
+  if (provider === "ollama") expect(button).toBeEnabled()
+  else {
+    expect(button).toBeDisabled()
+    fireEvent.click(button)
+    expect(fetchMock).not.toHaveBeenCalledWith("/api/notes/generate", expect.anything())
+  }
 })

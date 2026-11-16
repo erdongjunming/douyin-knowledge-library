@@ -44,6 +44,54 @@ class SubprocessResult:
     stderr: str
 
 
+@dataclass(frozen=True, slots=True)
+class _JobClaim:
+    job_id: int
+    worker_id: str | None
+    claim_fence: int | None
+
+    @classmethod
+    def capture(cls, job: Job) -> _JobClaim:
+        return cls(job.id, job.worker_id, getattr(job, "claim_fence", None))
+
+    def conditions(self) -> list[Any]:
+        conditions = [Job.id == self.job_id, Job.status == "running"]
+        conditions.append(Job.worker_id == self.worker_id)
+        if self.claim_fence is not None:
+            conditions.append(Job.claim_fence == self.claim_fence)
+        return conditions
+
+
+def _update_owned_job(session: Session, identity: _JobClaim, **values: Any) -> None:
+    # This update is also the write fence for pending transcript rows.  It
+    # must precede autoflush so a stale claim cannot flush data first.
+    with session.no_autoflush:
+        result = session.execute(update(Job).where(*identity.conditions()).values(**values))
+    if not result.rowcount:
+        status = session.scalar(
+            select(Job.status)
+            .where(Job.id == identity.job_id)
+            .execution_options(populate_existing=True)
+        )
+        raise JobCancelledError(
+            "cancelled_by_user" if status == "cancelled" else "job_claim_lost"
+        )
+
+
+def _assert_job_owned(session: Session, identity: _JobClaim) -> None:
+    with session.no_autoflush:
+        owned = session.scalar(select(Job.id).where(*identity.conditions()))
+    if owned is None:
+        status = session.scalar(
+            select(Job.status)
+            .where(Job.id == identity.job_id)
+            .execution_options(populate_existing=True)
+        )
+        raise JobCancelledError(
+            "cancelled_by_user" if status == "cancelled" else "job_claim_lost"
+        )
+
+
 class Transcriber(Protocol):
     async def run(
         self,
@@ -71,6 +119,11 @@ class QwenAsrSubprocess:
         self.model = model
         self.language = language
         self.chunk_seconds = chunk_seconds
+
+    def close(self) -> None:
+        """Keep the runner lifetime-compatible with resident providers."""
+
+        return None
 
     @classmethod
     def from_settings(cls, settings: Settings) -> QwenAsrSubprocess:
@@ -201,6 +254,8 @@ class TranscriptionService:
         *,
         cancel_event: asyncio.Event | None = None,
     ) -> Transcript:
+        identity = _JobClaim.capture(job)
+        _assert_job_owned(self.session, identity)
         self.layout.initialize()
         existing_raw = self._existing_raw_asr(work)
         if existing_raw is not None:
@@ -235,6 +290,7 @@ class TranscriptionService:
                     work,
                     subtitle,
                     cancel_event=cancel_event,
+                    identity=identity,
                 )
         audio = self.session.scalar(
             select(Asset).where(Asset.work_id == work.id, Asset.kind == "audio")
@@ -286,7 +342,7 @@ class TranscriptionService:
         published_snapshot: dict[Path, bytes | None] | None = None
         committed = False
         try:
-            lease_handle = await self._acquire_gpu(job, cancel_event)
+            lease_handle = await self._acquire_gpu(job, cancel_event, identity=identity)
             _raise_if_cancelled(cancel_event)
             transcriber_parameters = inspect.signature(self.transcriber.run).parameters
             transcriber_kwargs: dict[str, Any] = {
@@ -312,13 +368,14 @@ class TranscriptionService:
             await self._renew_lease(lease_handle)
             await self._assert_lease_owned(lease_handle)
             with note_publication_lock(self.settings.storage_root, work.aweme_id):
+                _assert_job_owned(self.session, identity)
                 # Publish the validated attempt only after parsing it.  The
                 # per-work lock covers publication through rollback/commit.
                 os.replace(attempt_result_path, result_path)
                 transcript = self._save_transcript(work, payload)
                 output_paths = self._write_outputs(work, payload)
                 published_snapshot = _snapshot_files((result_path, *output_paths))
-                await self._commit_if_owned(job, lease_handle)
+                await self._commit_if_owned(job, lease_handle, identity=identity)
                 committed = True
                 recorder.succeed(
                     audit,
@@ -332,9 +389,7 @@ class TranscriptionService:
             self.session.rollback()
             if not committed:
                 with note_publication_lock(self.settings.storage_root, work.aweme_id):
-                    if published_snapshot is None:
-                        _restore_files(output_snapshot)
-                    else:
+                    if published_snapshot is not None:
                         _restore_files(output_snapshot, expected=published_snapshot)
             recorder.cancel(
                 audit,
@@ -348,9 +403,7 @@ class TranscriptionService:
             self.session.rollback()
             if not committed:
                 with note_publication_lock(self.settings.storage_root, work.aweme_id):
-                    if published_snapshot is None:
-                        _restore_files(output_snapshot)
-                    else:
+                    if published_snapshot is not None:
                         _restore_files(output_snapshot, expected=published_snapshot)
             recorder.fail(
                 audit,
@@ -383,8 +436,15 @@ class TranscriptionService:
         raise RuntimeError("raw_transcript_inconsistent")
 
     async def _process_subtitle(
-        self, job: Job, work: Work, draft: Any, *, cancel_event: asyncio.Event | None
+        self,
+        job: Job,
+        work: Work,
+        draft: Any,
+        *,
+        cancel_event: asyncio.Event | None,
+        identity: _JobClaim | None = None,
     ) -> Transcript:
+        identity = identity or _JobClaim.capture(job)
         _raise_if_cancelled(cancel_event)
         existing = self.session.scalar(
             select(Transcript)
@@ -411,8 +471,14 @@ class TranscriptionService:
             job=job,
             request={"source_kind": "subtitle"},
         )
+        snapshot = _snapshot_files((
+            self.layout.transcript_text_path(work.aweme_id),
+            self.layout.transcript_segments_path(work.aweme_id),
+        ))
+        published_expected: dict[Path, bytes | None] | None = None
         try:
             with note_publication_lock(self.settings.storage_root, work.aweme_id):
+                _assert_job_owned(self.session, identity)
                 text_path = self.layout.transcript_text_path(work.aweme_id)
                 segments_path = self.layout.transcript_segments_path(work.aweme_id)
                 text_path.parent.mkdir(parents=True, exist_ok=True)
@@ -424,6 +490,7 @@ class TranscriptionService:
                 segments_path.write_text(
                     json.dumps(segments, ensure_ascii=False, indent=2), encoding="utf-8"
                 )
+                published_expected = _snapshot_files((text_path, segments_path))
                 transcript = Transcript(
                     work_id=work.id,
                     engine="subtitle-local",
@@ -441,7 +508,7 @@ class TranscriptionService:
                 self._upsert_asset(
                     work.id, "transcript_segments", segments_path, "application/json"
                 )
-                await self._commit_if_owned(job)
+                await self._commit_if_owned(job, identity=identity)
                 recorder.succeed(
                     audit,
                     response={"source_kind": "subtitle"},
@@ -450,6 +517,9 @@ class TranscriptionService:
                 return transcript
         except Exception as exc:
             self.session.rollback()
+            if published_expected is not None:
+                with note_publication_lock(self.settings.storage_root, work.aweme_id):
+                    _restore_files(snapshot, expected=published_expected)
             recorder.fail(audit, error=str(exc))
             raise
 
@@ -489,6 +559,8 @@ class TranscriptionService:
         self,
         job: Job,
         lease_handle: object | None = None,
+        *,
+        identity: _JobClaim | None = None,
     ) -> None:
         """Commit transcript rows only while job and lease ownership hold."""
 
@@ -497,24 +569,19 @@ class TranscriptionService:
         # fence for a takeover that happens during that window.
         await self._assert_lease_owned(lease_handle)
 
-        owner_worker_id = job.worker_id
-        statement = update(Job).where(
-            Job.id == job.id,
-            Job.status == "running",
+        _update_owned_job(
+            self.session,
+            identity or _JobClaim.capture(job),
+            heartbeat_at=datetime.now(UTC),
         )
-        if owner_worker_id is None:
-            statement = statement.where(Job.worker_id.is_(None))
-        else:
-            statement = statement.where(Job.worker_id == owner_worker_id)
-        result = self.session.execute(statement.values(heartbeat_at=datetime.now(UTC)))
-        if not result.rowcount:
-            raise JobCancelledError("cancelled_by_user")
         self.session.commit()
 
     async def _acquire_gpu(
         self,
         job: Job,
         cancel_event: asyncio.Event | None,
+        *,
+        identity: _JobClaim | None = None,
     ) -> object:
         """Wait for the shared GPU lease without holding a DB transaction."""
 
@@ -524,17 +591,12 @@ class TranscriptionService:
             0.01,
             float(getattr(self.settings, "gpu_lease_poll_seconds", 0.5)),
         )
-        owner_worker_id = job.worker_id or self.worker_id
+        identity = identity or _JobClaim.capture(job)
+        owner_worker_id = identity.worker_id or self.worker_id
         while True:
             _raise_if_cancelled(cancel_event)
-            self.session.expire(job)
-            current = self.session.get(Job, job.id)
-            if current is None or current.status != "running":
-                raise JobCancelledError("cancelled_by_user")
-            if current.stage != "waiting_gpu":
-                current.stage = "waiting_gpu"
-                self.session.commit()
-                job = current
+            _update_owned_job(self.session, identity, stage="waiting_gpu")
+            self.session.commit()
             handle = self.lease_store.try_acquire(
                 resource_name,
                 owner_worker_id,
@@ -542,11 +604,11 @@ class TranscriptionService:
                 ttl=lease_ttl,
             )
             if handle is not None:
-                current = self.session.get(Job, job.id)
-                if current is None or current.status != "running":
-                    self.lease_store.release(handle)
-                    raise JobCancelledError("cancelled_by_user")
-                current.stage = "transcribe"
+                try:
+                    _update_owned_job(self.session, identity, stage="transcribe")
+                except JobCancelledError:
+                    await self._release_gpu(handle)
+                    raise
                 self.session.commit()
                 return handle
             if cancel_event is None:
@@ -670,6 +732,8 @@ class TranscriptCleaningService:
         cleaner_model: str | None = None,
         prompt_version: str | None = None,
     ) -> Transcript:
+        identity = _JobClaim.capture(job)
+        _assert_job_owned(self.session, identity)
         self.layout.initialize()
         raw_query = select(Transcript).where(
             Transcript.work_id == work.id,
@@ -747,7 +811,7 @@ class TranscriptCleaningService:
         staged_paths: tuple[Path, ...] = ()
         committed = False
         try:
-            lease_handle = await self._acquire_gpu(job, cancel_event)
+            lease_handle = await self._acquire_gpu(job, cancel_event, identity=identity)
             _raise_if_cancelled(cancel_event)
             if getattr(self.cleaner, "_lease_checker", None) is None:
                 try:
@@ -763,6 +827,7 @@ class TranscriptCleaningService:
             cleaned = _validate_cleaner_result(result, draft)
             with note_publication_lock(self.settings.storage_root, work.aweme_id):
                 await self._assert_lease_owned(lease_handle)
+                _assert_job_owned(self.session, identity)
                 staged = tuple(_attempt_result_path(path) for path in output_paths)
                 staged_paths = staged
                 output_paths[0].parent.mkdir(parents=True, exist_ok=True)
@@ -808,7 +873,7 @@ class TranscriptCleaningService:
                     status="succeeded",
                 )
                 self.session.add(transcript)
-                await self._commit_if_owned(job, lease_handle)
+                await self._commit_if_owned(job, lease_handle, identity=identity)
                 committed = True
                 recorder.succeed(
                     audit,
@@ -820,9 +885,7 @@ class TranscriptCleaningService:
             self.session.rollback()
             if not committed:
                 with note_publication_lock(self.settings.storage_root, work.aweme_id):
-                    if published_expected is None:
-                        _restore_files(snapshot)
-                    else:
+                    if published_expected is not None:
                         _restore_files(snapshot, expected=published_expected)
             recorder.cancel(audit, error=str(exc), output_files=output_paths)
             raise
@@ -830,9 +893,7 @@ class TranscriptCleaningService:
             self.session.rollback()
             if not committed:
                 with note_publication_lock(self.settings.storage_root, work.aweme_id):
-                    if published_expected is None:
-                        _restore_files(snapshot)
-                    else:
+                    if published_expected is not None:
                         _restore_files(snapshot, expected=published_expected)
             recorder.fail(audit, error=str(exc), output_files=output_paths)
             raise
@@ -841,22 +902,29 @@ class TranscriptCleaningService:
                 staged_path.unlink(missing_ok=True)
             await self._release_gpu(lease_handle)
 
-    async def _acquire_gpu(self, job: Job, cancel_event: asyncio.Event | None) -> object:
+    async def _acquire_gpu(
+        self,
+        job: Job,
+        cancel_event: asyncio.Event | None,
+        *,
+        identity: _JobClaim | None = None,
+    ) -> object:
         resource = getattr(self.settings, "gpu_resource_name", "gpu:0")
         poll = max(0.01, float(getattr(self.settings, "gpu_lease_poll_seconds", 0.5)))
         ttl = float(getattr(self.settings, "gpu_lease_ttl_seconds", 120.0))
-        owner = job.worker_id or self.worker_id
+        identity = identity or _JobClaim.capture(job)
+        owner = identity.worker_id or self.worker_id
         while True:
             _raise_if_cancelled(cancel_event)
-            current = self.session.get(Job, job.id)
-            if current is None or current.status != "running":
-                raise JobCancelledError("cancelled_by_user")
-            if current.stage != "waiting_gpu":
-                current.stage = "waiting_gpu"
-                self.session.commit()
+            _update_owned_job(self.session, identity, stage="waiting_gpu")
+            self.session.commit()
             handle = self.lease_store.try_acquire(resource, owner, job.id, ttl=ttl)
             if handle is not None:
-                current.stage = "clean"
+                try:
+                    _update_owned_job(self.session, identity, stage="clean")
+                except JobCancelledError:
+                    await self._release_gpu(handle)
+                    raise
                 self.session.commit()
                 return handle
             await asyncio.sleep(poll)
@@ -865,15 +933,19 @@ class TranscriptCleaningService:
         if handle is not None and not self.lease_store.is_owned(handle):
             raise JobCancelledError("gpu_lease_lost")
 
-    async def _commit_if_owned(self, job: Job, handle: object | None) -> None:
+    async def _commit_if_owned(
+        self,
+        job: Job,
+        handle: object | None,
+        *,
+        identity: _JobClaim | None = None,
+    ) -> None:
         await self._assert_lease_owned(handle)
-        result = self.session.execute(
-            update(Job)
-            .where(Job.id == job.id, Job.status == "running", Job.worker_id == job.worker_id)
-            .values(heartbeat_at=datetime.now(UTC))
+        _update_owned_job(
+            self.session,
+            identity or _JobClaim.capture(job),
+            heartbeat_at=datetime.now(UTC),
         )
-        if not result.rowcount:
-            raise JobCancelledError("cancelled_by_user")
         self.session.commit()
 
     async def _release_gpu(self, handle: object | None) -> None:

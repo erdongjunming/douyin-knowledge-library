@@ -14,6 +14,7 @@ from douyin_library.config import Settings
 from douyin_library.media.service import WorkMediaService
 from douyin_library.media.storage import StorageLayout
 from douyin_library.models import Analysis, Asset, Creator, Job, Transcript, Work
+from douyin_library.notes.publisher import PublishError, bundle_hashes_match, note_read_lock
 from douyin_library.notes.state import NoteBundleState, classify_note_bundle
 from douyin_library.security.cookie_store import CookieStore
 from douyin_library.upstream.jiji_gateway import JijiGateway
@@ -222,10 +223,9 @@ def list_works(
     for work, nickname in rows:
         assets_for_work = sorted(set(assets_by_work.get(work.id, [])))
         transcript = transcript_by_work.get(work.id)
-        note_path = layout.note_dir(work.aweme_id) / "learning_note.md"
-        note_available = note_path.is_file()
-        note_text = _read_text(note_path) if note_available else None
-        note_state = classify_note_bundle(layout.note_dir(work.aweme_id))
+        note_dir = _safe_note_dir(layout, work.aweme_id)
+        note_text, note_state, note_metadata = _read_note_snapshot(note_dir)
+        note_available = bool(note_text and note_text.strip())
         state = _work_state(
             work.id,
             assets_for_work,
@@ -234,7 +234,6 @@ def list_works(
             latest_jobs,
             note_state,
         )
-        note_metadata = _note_generation_metadata(layout.note_dir(work.aweme_id), note_state)
         items.append(
             {
                 "id": work.id,
@@ -291,9 +290,9 @@ def get_work(
         except json.JSONDecodeError:
             segments = []
     layout = StorageLayout(Settings().storage_root)
-    note_path = layout.note_dir(work.aweme_id) / "learning_note.md"
-    note_text = _read_text(note_path) if note_path.is_file() else None
-    note_state = classify_note_bundle(layout.note_dir(work.aweme_id))
+    note_dir = _safe_note_dir(layout, work.aweme_id)
+    note_path = note_dir / "learning_note.md" if note_dir is not None else None
+    note_text, note_state, note_metadata = _read_note_snapshot(note_dir)
     assets = session.scalars(select(Asset).where(Asset.work_id == work.id)).all()
     jobs = session.scalars(
         select(Job)
@@ -316,13 +315,12 @@ def get_work(
         latest_jobs,
         note_state,
     )
-    note_metadata = _note_generation_metadata(layout.note_dir(work.aweme_id), note_state)
     return {
         "id": work.id,
         "aweme_id": work.aweme_id,
         "description": work.description,
         "note": {
-            "path": str(note_path),
+            "path": str(note_path) if note_path is not None else None,
             "text": note_text,
         } if note_text is not None else None,
         "note_status": state["note_status"],
@@ -423,11 +421,45 @@ def _preview(value: str | None, *, limit: int = 120) -> str | None:
 
 
 def _read_text(path: Any) -> str | None:
+    if path is None:
+        return None
     try:
         value = path.read_text(encoding="utf-8-sig")
     except (OSError, UnicodeError):
         return None
     return value.strip() or None
+
+
+def _read_note_snapshot(
+    note_dir: Path | None,
+) -> tuple[str | None, NoteBundleState, dict[str, Any]]:
+    if note_dir is None:
+        return None, NoteBundleState(quality_status="missing"), {}
+    try:
+        with note_read_lock(note_dir):
+            state = classify_note_bundle(note_dir)
+            manifest = _read_json_object(note_dir / "generation_manifest.json")
+            text = (
+                _read_text(note_dir / "learning_note.md")
+                if manifest is None or bundle_hashes_match(note_dir, manifest)
+                else None
+            )
+            return text, state, _note_generation_metadata(note_dir, state)
+    except (OSError, PublishError):
+        return None, NoteBundleState(quality_status="unknown"), {}
+
+
+def _safe_note_dir(layout: StorageLayout, aweme_id: str) -> Path | None:
+    """Return a note directory only when it stays inside the configured root."""
+
+    root = layout.dy_note.resolve()
+    candidate = layout.note_dir(aweme_id)
+    try:
+        resolved = candidate.resolve(strict=False)
+        resolved.relative_to(root)
+    except (OSError, ValueError):
+        return None
+    return resolved
 
 
 def _work_state(
@@ -545,9 +577,15 @@ def _coverage_pair(
 
 
 def _note_generation_metadata(
-    note_dir: Path,
+    note_dir: Path | None,
     note_state: NoteBundleState,
 ) -> dict[str, Any]:
+    if note_dir is None:
+        return {
+            "provider": note_state.provider,
+            "model": note_state.model,
+            "quality_gate": note_state.quality_gate,
+        }
     manifest = _read_json_object(note_dir / "generation_manifest.json")
     page = _read_json_object(note_dir / "page_metadata.json")
     audit = _read_json_object(note_dir / "generation_audit.json")

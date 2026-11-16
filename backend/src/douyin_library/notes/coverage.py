@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import re
 from collections import Counter, defaultdict
+from typing import Any
 
 from douyin_library.notes.contracts import (
     CoverageReport,
@@ -12,7 +13,52 @@ from douyin_library.notes.contracts import (
     ExtractionResult,
     SegmentDisposition,
     SynthesisResult,
+    TeachingOutline,
 )
+
+
+def _methods_section_suspicious(outline: TeachingOutline, source_text: str) -> bool:
+    methods = next(
+        (section for section in outline.sections if section.section_id == "methods_steps"),
+        None,
+    )
+    if methods is None or methods.atom_ids:
+        return False
+    signals = re.findall(
+        r"第[一二三四五]|第一步|第二步|然后|接着|最后|首先|之后|比如|例如", source_text
+    )
+    return len(signals) >= 4
+
+
+_READABILITY_VERBS = re.compile(
+    r"是|有|做|用|让|能|要|需|应|会|把|将|被|看|听|说|写|读|学|想|问|找|给|去|来|"
+    r"记录|整理|复述|验证|切换|检查|进行|建立|保持|避免|选择|提高|降低|练习|关注|领取|"
+    r"呼吸|放松|集中|帮助|改变|减少|增加|尝试|执行|完成|停止|开始|坚持"
+)
+
+
+def readability_report(markdown: str, core_points: list[str], atom_count: int) -> dict[str, Any]:
+    empty_sections = markdown.count("视频未提供这一类信息")
+    fragments = sum(
+        len(re.findall(r"[^\W_]", point)) <= 6 and not _READABILITY_VERBS.search(point)
+        for point in core_points
+    )
+    fragment_ratio = fragments / len(core_points) if core_points else 0.0
+    chars_per_atom = len(markdown) / atom_count if atom_count else None
+    checks = {
+        "empty_sections": empty_sections < 3,
+        "fragments": fragment_ratio <= 0.2,
+        "bloat": chars_per_atom is not None and chars_per_atom <= 900,
+    }
+    components = {name: 100 if passed else 0 for name, passed in checks.items()}
+    return {
+        "score": round(sum(components.values()) / len(components)),
+        "components": components,
+        "empty_sections": empty_sections,
+        "fragment_ratio": fragment_ratio,
+        "chars_per_atom": chars_per_atom,
+        "warnings": [f"readability_{name}" for name, passed in checks.items() if not passed],
+    }
 
 _COMMON_SENTENCE_OPENERS = {
     "A",
@@ -229,7 +275,11 @@ class CoverageValidator:
                 else "failed"
             ),
             repairable=(
-                not depth_non_repairable and not passed and not foundational_error and repair_issue
+                input_sufficient
+                and not depth_non_repairable
+                and not passed
+                and not foundational_error
+                and repair_issue
             ),
             depth_passed=depth_passed,
             input_sufficient=input_sufficient,
@@ -397,12 +447,12 @@ class CoverageValidator:
         )
         for sections in section_groups:
             for section in sections:
-                expected = Counter(
+                expected = {
                     atom.start
                     for atom_id in section.atom_ids
                     if (atom := atom_by_id.get(atom_id)) is not None and atom.start is not None
-                )
-                if Counter(section.timestamps) != expected:
+                }
+                if set(section.timestamps) != expected:
                     return False
         return True
 

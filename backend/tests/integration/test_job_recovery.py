@@ -27,6 +27,7 @@ def test_crashed_running_job_is_requeued(tmp_path: Path) -> None:
         )
         session.add(audit)
         job.started_at = datetime.now(UTC) - timedelta(hours=1)
+        job.heartbeat_at = datetime.now(UTC) - timedelta(hours=1)
         session.commit()
 
         recovered = queue.recover_stale_jobs(stale_after=timedelta(minutes=10))
@@ -38,3 +39,21 @@ def test_crashed_running_job_is_requeued(tmp_path: Path) -> None:
         assert audit.status == "failed"
         assert audit.error == "worker_stale_recovered"
         assert audit.finished_at is not None
+
+
+def test_fresh_heartbeat_prevents_running_job_recovery(tmp_path: Path) -> None:
+    engine = create_engine(f"sqlite:///{tmp_path / 'library.db'}")
+    create_schema(engine)
+
+    with Session(engine) as session:
+        queue = JobQueue(session)
+        job = queue.create(kind="transcribe_work")
+        claimed = queue.claim_next(worker_id="asr-1")
+        assert claimed is not None
+        claimed.started_at = datetime.now(UTC) - timedelta(hours=1)
+        session.commit()
+
+        recovered = queue.recover_stale_jobs(stale_after=timedelta(minutes=10))
+
+        assert recovered == 0
+        assert queue.get(job.id).status == "running"

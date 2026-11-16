@@ -21,7 +21,7 @@ def _settings(**overrides) -> Settings:
 def test_provider_policy_chains_are_explicit_and_keep_rule_fallback() -> None:
     settings = _settings()
 
-    assert select_provider_names(settings, "auto") == ["ollama", "external", "rule"]
+    assert select_provider_names(settings, "auto") == ["external", "ollama", "rule"]
     assert select_provider_names(settings, "local") == ["ollama", "rule"]
     assert select_provider_names(settings, "external") == ["external", "rule"]
     assert select_provider_names(settings, "rule") == ["rule"]
@@ -81,7 +81,7 @@ def test_external_configuration_uses_provider_url_safety_rule(
 
     assert external_is_configured(settings) is expected_configured
     expected_names = (
-        ["ollama", "external", "rule"]
+        ["external", "ollama", "rule"]
         if expected_configured
         else ["ollama", "rule"]
     )

@@ -79,6 +79,18 @@ _STRICT_MODEL_CONFIG = ConfigDict(
 )
 
 
+def _provider_schema_without_source_start(schema: dict[str, Any]) -> dict[str, Any]:
+    """Remove local fallback routing coordinates from provider-facing schemas."""
+
+    atom_schema = schema.get("$defs", {}).get("EvidenceAtom", {})
+    atom_schema.get("properties", {}).pop("source_start", None)
+    if "required" in atom_schema:
+        atom_schema["required"] = [
+            field for field in atom_schema["required"] if field != "source_start"
+        ]
+    return schema
+
+
 class EvidenceAtom(BaseModel):
     model_config = _STRICT_MODEL_CONFIG
 
@@ -90,6 +102,9 @@ class EvidenceAtom(BaseModel):
     start: float | None = Field(default=None, ge=0)
     end: float | None = Field(default=None, ge=0)
     source_excerpt: NonEmptyString
+    # Local fallback atoms retain their exact source character position for
+    # review-batch routing.  Provider-created atoms leave this unset.
+    source_start: int | None = Field(default=None, ge=0)
     relations: list[NonEmptyString] = Field(default_factory=list)
     sequence: int | None = Field(default=None, ge=1)
     is_promotional: bool = False
@@ -110,6 +125,12 @@ class ExtractionResult(BaseModel):
 
     atoms: list[EvidenceAtom]
     dispositions: list[SegmentDisposition]
+
+    @classmethod
+    def model_json_schema(cls, *args: Any, **kwargs: Any) -> dict[str, Any]:
+        return _provider_schema_without_source_start(
+            super().model_json_schema(*args, **kwargs)
+        )
 
 
 class ThemeSection(BaseModel):
@@ -161,6 +182,12 @@ class RepairResult(BaseModel):
     section_drafts: list[SectionDraft] = Field(default_factory=list)
     depth_review: DepthReview | None = None
 
+    @classmethod
+    def model_json_schema(cls, *args: Any, **kwargs: Any) -> dict[str, Any]:
+        return _provider_schema_without_source_start(
+            super().model_json_schema(*args, **kwargs)
+        )
+
 
 class DraftClaim(BaseModel):
     model_config = _STRICT_MODEL_CONFIG
@@ -174,7 +201,7 @@ class DraftClaim(BaseModel):
 class DraftClaimReview(BaseModel):
     model_config = _STRICT_MODEL_CONFIG
 
-    reviewed_claim_ids: list[NonEmptyString]
+    reviewed_claim_ids: list[NonEmptyString] = Field(default_factory=list)
     supported_claim_ids: list[NonEmptyString]
     contradicted_claim_ids: list[NonEmptyString]
 

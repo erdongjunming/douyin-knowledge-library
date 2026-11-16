@@ -15,6 +15,7 @@ from douyin_library.notes.providers.base import (
     NoteStage,
     ProviderResponse,
     load_json_object,
+    parse_base_url,
     request_or_cancel,
     sanitized_base_url,
 )
@@ -154,6 +155,11 @@ class OllamaNoteProvider:
         return httpx.AsyncClient(
             transport=self._transport,
             timeout=self._timeout if timeout is None else timeout,
+            # Keep loopback Ollama traffic local even when HTTP(S)_PROXY is
+            # configured; remote Ollama URLs retain normal proxy behavior.
+            trust_env=not bool(
+                (parsed := parse_base_url(self.base_url)) and parsed.is_loopback
+            ),
         )
 
 

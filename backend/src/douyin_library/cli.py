@@ -20,7 +20,7 @@ from douyin_library.media.storage import StorageLayout
 from douyin_library.models import Job, Transcript, Work
 from douyin_library.notes.input import NoteInputLoader
 from douyin_library.notes.providers.selector import ProviderPolicy
-from douyin_library.notes.service import NoteGenerationService
+from douyin_library.notes.service import LEGACY_UPGRADE_LIMIT, NoteGenerationService
 from douyin_library.runtime import initialize_runtime
 from douyin_library.transcription.inventory import (
     InventoryReport,
@@ -161,6 +161,16 @@ def main(argv: list[str] | None = None) -> int:
             parser.error("--limit must be at least 1")
         if args.force and args.legacy_only:
             parser.error("--force cannot be combined with --legacy-only")
+        if (
+            args.legacy_only
+            and args.limit is not None
+            and args.limit > LEGACY_UPGRADE_LIMIT
+        ):
+            parser.error(
+                f"--legacy-only allows at most {LEGACY_UPGRADE_LIMIT} works per request"
+            )
+        if args.legacy_only and args.provider not in (None, "local", "ollama"):
+            parser.error("--legacy-only requires the local Ollama provider")
         generate_kwargs = {
             "limit": args.limit,
             "force": args.force,
@@ -169,7 +179,9 @@ def main(argv: list[str] | None = None) -> int:
         }
         # Omit new default-valued arguments for old integrations that patch or
         # wrap this function with the original four-key call contract.
-        if args.provider is not None:
+        if args.legacy_only:
+            generate_kwargs["provider_policy"] = "local"
+        elif args.provider is not None:
             generate_kwargs["provider_policy"] = (
                 "local" if args.provider == "ollama" else args.provider
             )
@@ -576,7 +588,7 @@ def _has_valid_cleaned_variant(
         loaded = NoteInputLoader(StorageLayout(settings.storage_root), session).load(aweme_id)
     except (OSError, UnicodeError, ValueError, TypeError, json.JSONDecodeError):
         return False
-    return loaded.transcript_variant == "cleaned"
+    return loaded.cleaned_transcript is not None and loaded.cleaned_segments is not None
 
 
 async def _run_job(worker_runtime: object, job_id: int) -> None:

@@ -64,6 +64,12 @@ button:disabled { cursor: not-allowed; opacity: 0.55; }
 .form-panel, .action-panel, .diagnostics-panel, .table-panel { padding: 22px; }
 .panel-heading { display: flex; align-items: flex-start; justify-content: space-between; margin-bottom: 24px; color: #176b62; }
 .panel-heading h3 { margin: 4px 0 0; color: #17211e; font-size: 18px; }
+.jobs-toolbar { display: flex; align-items: center; gap: 7px; }
+.jobs-filters, .jobs-pagination { display: flex; align-items: center; gap: 12px; margin: 0 0 16px; color: #687771; font-size: 12px; }
+.jobs-filters label { display: inline-flex; align-items: center; gap: 6px; }
+.jobs-filters select { border: 1px solid #cdd9d4; border-radius: 5px; padding: 6px 8px; color: #394943; background: #fff; }
+.jobs-pagination { justify-content: center; margin: 16px 0 0; }
+.job-actions { display: flex; justify-content: flex-end; gap: 4px; }
 .form-panel label, .credential-panel label { display: block; margin-bottom: 8px; color: #4c5b56; font-size: 13px; font-weight: 650; }
 .input-row { display: flex; gap: 8px; }
 input { min-width: 0; border: 1px solid #cdd9d4; border-radius: 5px; padding: 11px 12px; color: #17211e; background: #fff; outline: none; }

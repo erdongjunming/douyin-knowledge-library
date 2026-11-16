@@ -46,6 +46,12 @@ def test_rule_fallback_accepts_note_input_and_contains_every_segment_in_source_o
     assert bundle.note_score["quality_gate"] == "fallback"
     assert bundle.note_budget["quality_gate"] == "fallback"
     assert bundle.coverage_report["quality_gate"] == "fallback"
+    assert bundle.parsed["semantic_complete"] is False
+    assert bundle.parsed["input_sufficient"] is False
+    assert bundle.parsed["section_drafts"] == []
+    assert bundle.parsed["evidence_map"]["section_ids"]
+    assert bundle.page_metadata["semantic_complete"] is False
+    assert bundle.note_budget["semantic_complete"] is False
     assert "未通过语义完整性审查" in bundle.learning_note
     assert "semantic coverage" not in bundle.learning_note.casefold()
 
@@ -72,3 +78,34 @@ def test_rule_fallback_keeps_existing_dict_call_compatible() -> None:
     assert len(bundle.parsed["timeline"]) == 15
     assert "## 核心观点" in bundle.learning_note
     assert "## 可执行行动" in bundle.learning_note
+
+
+def test_rule_fallback_details_preserve_every_sentence_in_each_segment() -> None:
+    segment_text = "第一句保留原文。第二句包含限定条件。第三句是具体例子。"
+    segment = InputSegment(
+        index=0,
+        start=0.0,
+        end=6.0,
+        text=segment_text,
+    )
+    note_input = NoteInput(
+        aweme_id="fallback-detail-731",
+        transcript=segment_text,
+        segments=[segment],
+        metadata={},
+        description="完整详细内容",
+        author=None,
+        author_unique_id=None,
+        published_at=None,
+        duration_ms=6_000,
+        source_url=None,
+        source_files={},
+        asset_records={},
+        warnings=[],
+    )
+
+    bundle = generate_rule_note(note_input, source_files={}, generated_at=NOW)
+
+    assert bundle.parsed["details"] == [
+        {"start": 0.0, "end": 6.0, "text": segment_text}
+    ]

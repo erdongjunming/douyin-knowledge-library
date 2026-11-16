@@ -98,5 +98,5 @@ def test_pipeline_repair_mapping_remains_legacy_compatible() -> None:
 def test_legacy_prompt_constants_remain_readable() -> None:
     assert "coverage-repair-v1" == LEGACY_REPAIR_PROMPT_VERSION
     assert "evidence-extract-v1" in PROMPT_VERSIONS.values()
-    assert "evidence-synthesize-v1" in PROMPT_VERSIONS.values()
-    assert "raw-source-review-v1" in PROMPT_VERSIONS.values()
+    assert "evidence-synthesize-v2" in PROMPT_VERSIONS.values()
+    assert "raw-source-review-v2" in PROMPT_VERSIONS.values()

@@ -7,6 +7,7 @@ import pytest
 from douyin_library.config import Settings
 from douyin_library.notes.ollama_runtime import (
     OllamaProcessManager,
+    ensure_ollama_ready,
     probe_ollama,
     resolve_ollama_executable,
 )
@@ -121,7 +122,7 @@ async def test_probe_reports_missing_executable_without_contacting_service(
     assert status.service_status == "missing"
     assert status.model_available is False
     assert status.ready is False
-    assert status.model == "qwen3:8b"
+    assert status.model == settings.note_ollama_model
     assert status.action_required
     assert requests == 0
     assert status.as_dict()["executable_found"] is False
@@ -218,24 +219,62 @@ async def test_probe_reports_model_missing_and_never_pulls(tmp_path: Path) -> No
     assert status.service_status == "ready"
     assert status.model_available is False
     assert status.ready is False
-    assert status.action_required == "ollama pull qwen3:8b"
+    assert status.action_required == "ollama pull qwen3:4b"
     assert paths == ["/api/tags"]
     assert "/api/pull" not in paths
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("model_record", [{"name": "qwen3:8b"}, {"model": "qwen3:8b"}])
-async def test_probe_matches_exact_name_or_model_field(
+async def test_probe_bypasses_environment_proxy_for_local_ollama(
+    monkeypatch,
     tmp_path: Path,
-    model_record: dict[str, str],
 ) -> None:
     executable = _executable(tmp_path)
+    captured: dict[str, object] = {}
+
+    class FakeClient:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, traceback):
+            return None
+
+        async def get(self, url):
+            assert url.endswith("/api/tags")
+            return httpx.Response(
+                200,
+                json={"models": [{"name": "qwen3:4b"}]},
+                request=httpx.Request("GET", url),
+            )
+
+    monkeypatch.setattr("douyin_library.notes.ollama_runtime.httpx.AsyncClient", FakeClient)
+
+    status = await probe_ollama(
+        Settings(note_ollama_executable=executable),
+    )
+
+    assert status.ready is True
+    assert captured["trust_env"] is False
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("model_field", ["name", "model"])
+async def test_probe_matches_exact_name_or_model_field(
+    tmp_path: Path,
+    model_field: str,
+) -> None:
+    executable = _executable(tmp_path)
+    settings = Settings(note_ollama_executable=executable, note_ollama_url="http://ollama.test")
+    model_record = {model_field: settings.note_ollama_model}
 
     async def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(200, json={"models": [model_record]})
 
     status = await probe_ollama(
-        Settings(note_ollama_executable=executable, note_ollama_url="http://ollama.test"),
+        settings,
         transport=httpx.MockTransport(handler),
     )
 
@@ -243,6 +282,79 @@ async def test_probe_matches_exact_name_or_model_field(
     assert status.model_available is True
     assert status.ready is True
     assert status.action_required is None
+
+
+@pytest.mark.asyncio
+async def test_ensure_ollama_starts_stopped_service_and_waits_for_model(
+    monkeypatch, tmp_path: Path,
+) -> None:
+    from douyin_library.notes import ollama_runtime
+
+    settings = Settings(note_ollama_executable=_executable(tmp_path))
+    manager = OllamaProcessManager(settings)
+    starts = 0
+    statuses = iter([
+        ollama_runtime.OllamaStatus(
+            executable_found=True, executable_path="ollama.exe", service_status="stopped",
+            model_available=False, ready=False, model="qwen3:4b", action_required="start",
+        ),
+        ollama_runtime.OllamaStatus(
+            executable_found=True, executable_path="ollama.exe", service_status="ready",
+            model_available=True, ready=True, model="qwen3:4b", action_required=None,
+        ),
+    ])
+
+    async def fake_probe(current_settings):
+        return next(statuses)
+
+    def fake_start():
+        nonlocal starts
+        starts += 1
+        return True
+
+    monkeypatch.setattr(ollama_runtime, "probe_ollama", fake_probe)
+    monkeypatch.setattr(manager, "start_if_installed", fake_start)
+
+    status = await ensure_ollama_ready(
+        settings, manager=manager, timeout_seconds=1, poll_interval_seconds=0,
+    )
+
+    assert status.ready is True
+    assert starts == 1
+
+
+@pytest.mark.asyncio
+async def test_ensure_ollama_stops_before_upgrade_when_model_is_missing(
+    monkeypatch, tmp_path: Path,
+) -> None:
+    from douyin_library.notes import ollama_runtime
+
+    settings = Settings(note_ollama_executable=_executable(tmp_path))
+    manager = OllamaProcessManager(settings)
+    starts = 0
+
+    async def fake_probe(current_settings):
+        return ollama_runtime.OllamaStatus(
+            executable_found=True, executable_path="ollama.exe", service_status="ready",
+            model_available=False, ready=False, model="qwen3:4b",
+            action_required="ollama pull qwen3:4b",
+        )
+
+    def fake_start():
+        nonlocal starts
+        starts += 1
+        return True
+
+    monkeypatch.setattr(ollama_runtime, "probe_ollama", fake_probe)
+    monkeypatch.setattr(manager, "start_if_installed", fake_start)
+
+    status = await ensure_ollama_ready(
+        settings, manager=manager, timeout_seconds=1, poll_interval_seconds=0,
+    )
+
+    assert status.ready is False
+    assert status.action_required == "ollama pull qwen3:4b"
+    assert starts == 0
 
 
 def test_process_manager_starts_only_hidden_ollama_serve(tmp_path: Path) -> None:

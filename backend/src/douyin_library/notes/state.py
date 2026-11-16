@@ -5,6 +5,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal
 
+from douyin_library.notes.publisher import PublishError, bundle_hashes_match, note_read_lock
+
 NoteQualityStatus = Literal[
     "semantic_complete",
     "fallback",
@@ -37,7 +39,33 @@ class NoteBundleState:
         return self.quality_status in {"legacy", "fallback", "unknown"}
 
 
-def classify_note_bundle(note_dir: Path) -> NoteBundleState:
+def classify_note_bundle(
+    note_dir: Path, *, read_only: bool = False,
+) -> NoteBundleState:
+    try:
+        # A missing result is already a complete snapshot.  Avoid creating note
+        # directories during inventory/dry-run discovery; multi-file readers hold
+        # note_read_lock themselves even if a publisher has not created them yet.
+        if not note_dir.is_dir():
+            return NoteBundleState(quality_status="missing")
+        if read_only:
+            # Dry-run discovery is advisory: it must not create a lock or
+            # recover/clean up a writer's journal. A pending publication is
+            # conservatively unknown and actual generation rechecks under lock.
+            journal = note_dir / ".publication.json"
+            if journal.exists():
+                return NoteBundleState(quality_status="unknown")
+            state = _classify_note_bundle(note_dir)
+            if journal.exists():
+                return NoteBundleState(quality_status="unknown")
+            return state
+        with note_read_lock(note_dir):
+            return _classify_note_bundle(note_dir)
+    except (OSError, PublishError):
+        return NoteBundleState(quality_status="unknown")
+
+
+def _classify_note_bundle(note_dir: Path) -> NoteBundleState:
     if not (note_dir / "learning_note.md").is_file():
         return NoteBundleState(quality_status="missing")
 
@@ -51,6 +79,9 @@ def classify_note_bundle(note_dir: Path) -> NoteBundleState:
         None,
     )
     if metadata is None:
+        return NoteBundleState(quality_status="unknown", coverage=coverage)
+    manifest = _read_json_object(note_dir / "generation_manifest.json")
+    if manifest is not None and not bundle_hashes_match(note_dir, manifest):
         return NoteBundleState(quality_status="unknown", coverage=coverage)
 
     provider = _string_value(metadata, "provider", "provider_name")
@@ -90,7 +121,7 @@ def classify_note_bundle(note_dir: Path) -> NoteBundleState:
     )
     rule_identity = any(_is_rule_identity(value) for value in (provider, model, *identities))
     if (
-        normalized_gate == "passed"
+        normalized_gate in {"passed", "passed_with_warnings"}
         and semantic_identity
         and not rule_identity
         and semantic_complete is True

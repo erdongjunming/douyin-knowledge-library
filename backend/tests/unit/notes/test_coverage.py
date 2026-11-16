@@ -287,6 +287,25 @@ def test_atom_missing_from_synthesis_is_reported_as_repairable() -> None:
     assert report.repairable is True
 
 
+def test_insufficient_input_disables_repair_for_an_otherwise_repairable_failure() -> None:
+    extraction = _complete_extraction()
+    report = CoverageValidator().validate(
+        segment_count=4,
+        extraction=extraction,
+        synthesis=_synthesis(
+            (atom.id for atom in extraction.atoms if atom.id != "A-example"),
+            extraction=extraction,
+        ),
+        review=_review(range(4)),
+        semantic_generator="ollama/qwen3:8b",
+        input_sufficient=False,
+    )
+
+    assert report.quality_gate == "failed"
+    assert report.input_sufficient is False
+    assert report.repairable is False
+
+
 def test_missing_synthesis_atom_with_bad_traceability_is_nonrepairable() -> None:
     atom = _atom("A-1", 0)
     atom.source_excerpt = ""
@@ -621,6 +640,27 @@ def test_theme_requires_timestamps_for_each_referenced_known_start() -> None:
 
     assert report.quality_gate == "failed"
     assert report.repairable is True
+
+
+def test_theme_allows_multiple_atoms_with_the_same_known_start() -> None:
+    extraction = ExtractionResult(
+        atoms=[
+            _atom("A-1", 0, start=2.0),
+            _atom("A-2", 0, start=2.0),
+        ],
+        dispositions=[_disposition(0, ["A-1", "A-2"])],
+    )
+    synthesis = _synthesis(["A-1", "A-2"], extraction=extraction)
+    synthesis.themes[0].timestamps = [2.0]
+
+    report = _validate(
+        extraction,
+        segment_count=1,
+        review=_review([0]),
+        synthesis=synthesis,
+    )
+
+    assert report.quality_gate == "passed"
 
 
 def test_theme_does_not_fabricate_a_timestamp_for_unknown_atom_start() -> None:

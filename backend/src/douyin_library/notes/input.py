@@ -20,6 +20,10 @@ class InputSegment:
     end: float | None
     text: str
     segment_id: str | None = None
+    # ``source_offset`` is internal batching metadata.  It keeps lossless
+    # fragments of one ASR segment distinguishable when their text repeats.
+    # It is intentionally absent from persisted transcript payloads.
+    source_offset: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -41,6 +45,8 @@ class NoteInput:
     transcript_source_kind: str = "asr"
     cleaning_fallback: str | None = None
     note_budget: dict[str, Any] | None = None
+    cleaned_transcript: str | None = None
+    cleaned_segments: list[InputSegment] | None = None
 
 
 class NoteInputLoader:
@@ -54,11 +60,16 @@ class NoteInputLoader:
         warnings: list[str] = []
         metadata = self._load_metadata(aweme_id, warnings)
         raw_segments = self._load_segments(aweme_id, raw_transcript, warnings)
+        # Raw transcript and segments remain the factual input. A cleaned
+        # variant is useful for reading assistance, but it must never replace
+        # source evidence before extraction or source review.
         transcript = raw_transcript
         segments = raw_segments
         transcript_variant = "raw"
         transcript_source_kind = self._source_kind(aweme_id)
         cleaning_fallback: str | None = None
+        cleaned_transcript: str | None = None
+        cleaned_segments: list[InputSegment] | None = None
         cleaned = self._load_cleaned(
             aweme_id,
             raw_transcript,
@@ -67,8 +78,7 @@ class NoteInputLoader:
             warnings,
         )
         if cleaned is not None:
-            transcript, segments, transcript_source_kind = cleaned
-            transcript_variant = "cleaned"
+            cleaned_transcript, cleaned_segments, _ = cleaned
         else:
             cleaning_fallback = self._cleaning_fallback
         author_value = metadata.get("author")
@@ -107,6 +117,8 @@ class NoteInputLoader:
             transcript_source_kind=transcript_source_kind,
             cleaning_fallback=cleaning_fallback,
             note_budget=note_budget,
+            cleaned_transcript=cleaned_transcript,
+            cleaned_segments=cleaned_segments,
         )
 
     _cleaning_fallback: str | None = None

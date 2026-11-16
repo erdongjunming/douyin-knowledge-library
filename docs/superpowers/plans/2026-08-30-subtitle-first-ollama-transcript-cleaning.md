@@ -38,13 +38,13 @@ Modify existing responsibilities:
 
 ## Task 1: Define Contracts and Storage Paths
 
-**Files:** Create `backend/src/douyin_library/transcription/contracts.py`; modify `backend/src/douyin_library/media/storage.py`; create `backend/tests/unit/transcription/test_contracts.py`.
+**Files:** Create `backend/src/douyin_library/transcription/contracts.py`; modify `backend/src/douyin_library/media/storage.py`; create `backend/tests/unit/transcription/test_transcription_contracts.py`.
 
 - [ ] **Step 1: Write failing contract tests.** Add tests asserting `TranscriptSegment`, `TranscriptDraft`, `CleanedTranscript`, and `CleanerResult` are immutable dataclasses and that `StorageLayout` returns `subtitle/<id>/`, `transcript.cleaned.md`, and `transcript.cleaned.json` paths.
 
 - [ ] **Step 2: Run the focused tests.**
 
-  Run: `uv run --group dev pytest backend/tests/unit/transcription/test_contracts.py -q`
+  Run: `uv run --group dev pytest backend/tests/unit/transcription/test_transcription_contracts.py -q`
 
   Expected: FAIL because the contract module and path methods do not exist.
 
@@ -75,7 +75,7 @@ Modify existing responsibilities:
 - [ ] **Step 5: Commit.**
 
   ```bash
-  git add backend/src/douyin_library/transcription/contracts.py backend/src/douyin_library/media/storage.py backend/tests/unit/transcription/test_contracts.py
+  git add backend/src/douyin_library/transcription/contracts.py backend/src/douyin_library/media/storage.py backend/tests/unit/transcription/test_transcription_contracts.py
   git commit -m "feat: define transcript provider contracts and paths"
   ```
 

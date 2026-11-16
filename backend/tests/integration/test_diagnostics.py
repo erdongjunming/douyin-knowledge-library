@@ -65,4 +65,9 @@ async def test_diagnostics_reports_shared_qwen_asr_environment(
         "status": "ok",
         "path": str(qwen_python),
         "model": "Qwen/Qwen3-ASR-0.6B",
+        "runtime": "resident",
+        "server_script": {
+            "status": "ok",
+            "path": str(Path(__file__).parents[3] / "scripts" / "qwen_asr_server.py"),
+        },
     }

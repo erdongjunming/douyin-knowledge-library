@@ -68,7 +68,7 @@ def get_cookie_store() -> CookieStore:
 
 
 @router.get("/diagnostics")
-async def get_diagnostics() -> dict[str, dict[str, str]]:
+async def get_diagnostics() -> dict[str, object]:
     return diagnostics(Settings())
 
 

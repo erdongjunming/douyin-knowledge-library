@@ -8,6 +8,8 @@ from typing import Literal
 from pydantic import Field, SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+DEFAULT_QWEN_SERVER_SCRIPT = Path(__file__).resolve().parents[3] / "scripts" / "qwen_asr_server.py"
+
 
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_prefix="DKL_", extra="ignore")
@@ -39,8 +41,12 @@ class Settings(BaseSettings):
     transcription_model: str = "Qwen/Qwen3-ASR-0.6B"
     transcription_language: str = "Chinese"
     qwen_chunk_seconds: float = 60.0
+    transcription_runtime: Literal["resident", "subprocess"] = "resident"
     qwen_python_path: Path | None = None
     qwen_asr_script_path: Path | None = None
+    qwen_server_script_path: Path = DEFAULT_QWEN_SERVER_SCRIPT
+    qwen_runtime_start_timeout_seconds: float = Field(default=120.0, ge=5.0, le=600.0)
+    qwen_offline: bool = True
     ffmpeg_path: Path | None = None
     ffprobe_path: Path | None = None
     audit_inline_max_bytes: int = Field(default=64 * 1024, ge=4096)
@@ -114,7 +120,7 @@ def resolve_tool(settings: Settings, name: str) -> Path | None:
     return candidates[0] if candidates else None
 
 
-def diagnostics(settings: Settings) -> dict[str, dict[str, str]]:
+def diagnostics(settings: Settings) -> dict[str, object]:
     storage_status = "ok" if settings.storage_root.exists() else "missing"
     storage_detail = str(settings.storage_root)
     ffmpeg = resolve_tool(settings, "ffmpeg")
@@ -126,6 +132,7 @@ def diagnostics(settings: Settings) -> dict[str, dict[str, str]]:
         Path.home() / ".codex" / "skills" / "dy-note" / "scripts" / "run_qwen_asr.py"
     )
     qwen_ready = qwen_python.is_file() and qwen_script.is_file()
+    qwen_server = settings.qwen_server_script_path
 
     return {
         "ffmpeg": {
@@ -144,5 +151,10 @@ def diagnostics(settings: Settings) -> dict[str, dict[str, str]]:
             "status": "ok" if qwen_ready else "missing",
             **({"path": str(qwen_python)} if qwen_python.is_file() else {}),
             "model": settings.transcription_model,
+            "runtime": settings.transcription_runtime,
+            "server_script": {
+                "status": "ok" if qwen_server.is_file() else "missing",
+                **({"path": str(qwen_server)} if qwen_server.is_file() else {}),
+            },
         },
     }

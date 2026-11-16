@@ -200,6 +200,24 @@ class Analysis(Base):
 
 class Job(Base):
     __tablename__ = "job"
+    __table_args__ = (
+        Index(
+            "uq_job_active_note_dedupe",
+            "dedupe_key",
+            unique=True,
+            sqlite_where=text(
+                "dedupe_key IS NOT NULL AND status IN ('pending', 'running', 'paused')"
+            ),
+        ),
+        Index(
+            "uq_job_running_legacy",
+            "queue_lane",
+            unique=True,
+            sqlite_where=text(
+                "queue_lane = 'legacy_upgrade' AND status = 'running'"
+            ),
+        ),
+    )
 
     id: Mapped[int] = mapped_column(primary_key=True)
     kind: Mapped[str] = mapped_column(String(64), index=True)
@@ -215,7 +233,42 @@ class Job(Base):
     error_detail: Mapped[str | None] = mapped_column(Text)
     created_at: Mapped[datetime] = mapped_column(default=utc_now)
     started_at: Mapped[datetime | None]
+    heartbeat_at: Mapped[datetime | None] = mapped_column(index=True)
+    worker_id: Mapped[str | None] = mapped_column(String(120))
+    # ``queue_lane`` and ``dedupe_key`` were introduced after the original
+    # job table.  They remain nullable so an older database can be upgraded
+    # in place before the backfill migration runs.
+    queue_lane: Mapped[str | None] = mapped_column(
+        String(24), default="pipeline", server_default="pipeline", index=True
+    )
+    dedupe_key: Mapped[str | None] = mapped_column(String(200), index=True)
+    # A monotonically increasing claim fence prevents a worker that lost its
+    # lease from completing or publishing after another worker reclaimed the
+    # same row.
+    claim_fence: Mapped[int] = mapped_column(
+        Integer, default=0, server_default=text("0"), nullable=False
+    )
     finished_at: Mapped[datetime | None]
+
+
+class ResourceLease(Base):
+    """A process-shared, expiring ownership record for a scarce resource.
+
+    The resource name is the primary key so that acquisition can use one
+    SQLite ``ON CONFLICT`` statement.  ``lease_token`` is intentionally
+    unique and is used as a fencing token: an old worker cannot renew or
+    release a lease after another worker has taken the expired row.
+    """
+
+    __tablename__ = "resource_lease"
+
+    resource_name: Mapped[str] = mapped_column(String(80), primary_key=True)
+    lease_token: Mapped[str] = mapped_column(String(64), unique=True)
+    owner_worker_id: Mapped[str] = mapped_column(String(120), index=True)
+    owner_job_id: Mapped[int | None] = mapped_column(ForeignKey("job.id"), index=True)
+    acquired_at: Mapped[datetime] = mapped_column(default=utc_now)
+    heartbeat_at: Mapped[datetime] = mapped_column(default=utc_now, index=True)
+    expires_at: Mapped[datetime] = mapped_column(index=True)
 
 
 class ProcessingAudit(Base):

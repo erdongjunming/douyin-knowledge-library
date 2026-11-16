@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 EXTRACT_PROMPT_VERSION = "evidence-extract-v1"
-OUTLINE_PROMPT_VERSION = "teaching-outline-v1"
-SYNTHESIZE_PROMPT_VERSION = "evidence-synthesize-v1"
-SECTION_PROMPT_VERSION = "teaching-section-v1"
-REVIEW_PROMPT_VERSION = "raw-source-review-v1"
+EXTRACT_RETRY_PROMPT_VERSION = "evidence-extract-retry-v1"
+OUTLINE_PROMPT_VERSION = "teaching-outline-v2"
+SYNTHESIZE_PROMPT_VERSION = "evidence-synthesize-v2"
+SECTION_PROMPT_VERSION = "teaching-section-v2"
+REVIEW_PROMPT_VERSION = "raw-source-review-v2"
+REVIEW_RETRY_PROMPT_VERSION = "raw-source-review-retry-v1"
 DEPTH_REVIEW_PROMPT_VERSION = "teaching-depth-review-v1"
 LEGACY_REPAIR_PROMPT_VERSION = "coverage-repair-v1"
 REPAIR_PROMPT_VERSION = LEGACY_REPAIR_PROMPT_VERSION
@@ -29,12 +31,24 @@ payload.prior_evidence_atoms 包含前序批次已进入全局命名空间的 at
 跨批 relations 必须直接引用其中的全局 ID，不得重新创建或猜测前序 atom。
 例子与条件必须用 relations 指向相关 atom；无法理解的 ASR 只能标为 unintelligible_asr，不得猜测。"""
 
+EXTRACT_RETRY_SYSTEM_PROMPT = f"""你正在修复一次证据抽取响应。
+{_COMMON_RULES}
+必须逐一处理 payload.segments 中的每个源段，并返回恰好一个 disposition；
+included 或 promotion 段必须列出至少一个 atom_id，且每个 atom_id 必须真实存在。
+每个 atom 的 source_excerpt 必须是对应 source segment text 的连续原文子串，不能改写、截断、
+补写或包含时间戳。多个 atom 可以覆盖同一源段，但必须合计覆盖该段全部原文事实；不要只返回
+一个标题、一个主题或一句缩写。source_segment、start、end 和 atom relations 必须使用输入中的值，
+不得引用不存在的 ID。只输出 JSON，不要输出 Markdown、解释或代码围栏。
+上一次响应未通过本地 source coverage 校验；严格按 payload.validation_feedback 修复。"""
+
 SYNTHESIZE_SYSTEM_PROMPT = f"""你是证据链接学习笔记合成器。
 {_COMMON_RULES}
 完整使用全部 evidence atoms 和 segment dispositions。
 若 atom 带有 source_excerpt_is_statement=true，则 statement 字段有意省略，
 source_excerpt 就是完整 statement；这只是去重，不是截断。
-每个纳入 atom 必须同时出现在主题结构和源顺序时间线中。
+每个纳入 atom 必须出现在源顺序时间线中（时间线是全量事实的载体）。
+主题结构只做归类与提炼：每个主题项给出 atom_ids、timestamps 和一句不超过 30 字的概括，
+不得在主题结构中重复 atom 的完整原文。
 payload.slice 表示完整分层合成中的当前 evidence slice；只合成本 slice，
 pipeline 会按全局 atom ID 和 segment_index 确定性合并所有 slice，不得引用 slice 外未知 atom。
 主题项必须给出 atom_ids 与 timestamps；时间线必须按 segment_index 严格递增并忠实保留每段含义。
@@ -53,9 +67,25 @@ REVIEW_SYSTEM_PROMPT = f"""你是独立的原始来源覆盖审查器。
 draft 的 section/timeline 若带 content_from_atom_ids，表示正文与所列 atom 原文完全相同。
 payload.source_segments 可能是同一原 segment 的无损片段；只审查本 payload，
 pipeline 会按原 segment_index 合并独立审查结果，禁止猜测未提供的片段。
-按源顺序恰好审查每个 segment 一次。
+按 payload.review_mode 选择输出；不要在本阶段改写 draft。
+source_coverage：按源顺序恰好审查每个 segment 一次，返回 reviewed_segment_indexes、
+source_omission_candidates、unsupported_draft_claims 和 disposition_corrections。
 报告 draft 遗漏的例子、结果、条件、步骤、风险/警告、数字、专名和推广，
-并报告 draft 中没有来源支持的主张及错误 disposition。不要在本阶段改写 draft。"""
+以及没有来源支持的主张及错误 disposition。
+draft_claims：直接核对 payload.draft_claims 的每个 claim，仅返回以下三个 ID 列表：
+reviewed_claim_ids 填入实际核对过的全部 claim.id，每个 claim 都必须得到审查；
+supported_claim_ids 只填本批 source_segments 明确支持的已审查 ID；
+contradicted_claim_ids 只填与来源明确冲突的已审查 ID，与 supported_claim_ids 不得重叠。
+来源未提及或证据不足时，仍记为已审查，但不得记入支持或冲突列表。
+三个列表只能使用本批 draft_claims 中的 ID，不得发明 ID 或把未审查内容标为支持。"""
+
+REVIEW_RETRY_SYSTEM_PROMPT = f"""你正在修复一次原始来源审查响应。
+{REVIEW_SYSTEM_PROMPT}
+严格只使用本次 payload 中的 ID；不得返回 atom ID、段落标题或自己生成的 ID 作为 draft claim ID。
+source_coverage 模式必须 reviewed_segment_indexes 覆盖 payload.source_segments 的 index，各段一次。
+draft_claims 模式必须 reviewed_claim_ids 恰好覆盖 payload.draft_claims 的 id，各 ID 一次；
+supported_claim_ids 和 contradicted_claim_ids 只能是 reviewed_claim_ids 的子集且不能冲突。
+只输出 JSON，不要输出 Markdown、解释或代码围栏。此前失败原因见 payload.validation_feedback。"""
 
 REPAIR_SYSTEM_PROMPT = f"""你是一次性语义覆盖修复器。
 {_COMMON_RULES}
@@ -74,6 +104,8 @@ OUTLINE_SYSTEM_PROMPT = """你是教学笔记结构规划器。
 5. boundaries_risks，6. actions，7. timeline，8. evidence_limits。
 每个 section 必须有稳定 title、order、atom_ids、required_evidence_types、timestamps，
 并使用固定缺失文案“视频未提供这一类信息。”作为 missing_evidence_policy。
+有序流程、做法、'怎么做'类内容必须分入 methods_steps；
+只有当源材料完全没有此类内容时才允许使用缺失文案。
 每个 evidence atom 至少分配到一个 section；atom_ids 只能引用输入 atom，且按源顺序去重。
 必须保留例子与结果、条件与风险、数字与专名、推广内容和 ASR uncertainty 标记。
 明确区分作者原话与生成理解；生成理解不得冒充作者原话。不得发明或补写输入没有的信息。
@@ -86,6 +118,7 @@ SECTION_SYSTEM_PROMPT = """你是单个教学 section 的证据写作者。
 每个例子必须和对应结果放在一起；每个条件和风险必须紧邻其关联 claim 或 step。
 保留数字、专名、推广、警告及 ASR uncertainty，并明确区分作者原话与生成理解。
 没有某类证据时，使用固定文案“视频未提供这一类信息。”，不得用常识补齐。
+unprovided_items 仅允许在源材料确实没有对应类别时使用；源材料含有序步骤或做法时不得声明缺失。
 included_atom_ids 只能来自 payload，unprovided_items 必须明确缺失类别。
 只能输出 JSON-only 的 JSON 对象，不得输出 Markdown、解释或代码围栏。"""
 
@@ -133,7 +166,9 @@ LEGACY_SYSTEM_PROMPTS = {"repair": REPAIR_SYSTEM_PROMPT}
 
 __all__ = [
     "EXTRACT_PROMPT_VERSION",
+    "EXTRACT_RETRY_PROMPT_VERSION",
     "EXTRACT_SYSTEM_PROMPT",
+    "EXTRACT_RETRY_SYSTEM_PROMPT",
     "DEPTH_REVIEW_PROMPT_VERSION",
     "DEPTH_REVIEW_SYSTEM_PROMPT",
     "LEGACY_PROMPT_VERSIONS",
@@ -145,7 +180,9 @@ __all__ = [
     "REPAIR_PROMPT_VERSION",
     "REPAIR_SYSTEM_PROMPT",
     "REVIEW_PROMPT_VERSION",
+    "REVIEW_RETRY_PROMPT_VERSION",
     "REVIEW_SYSTEM_PROMPT",
+    "REVIEW_RETRY_SYSTEM_PROMPT",
     "SECTION_PROMPT_VERSION",
     "SECTION_SYSTEM_PROMPT",
     "SYNTHESIZE_PROMPT_VERSION",

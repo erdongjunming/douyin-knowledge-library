@@ -88,6 +88,42 @@ async def test_ollama_sends_complete_payload_schema_and_local_options() -> None:
 
 
 @pytest.mark.asyncio
+async def test_ollama_requests_bypass_environment_proxy_for_local_service(
+    monkeypatch,
+) -> None:
+    captured: dict[str, object] = {}
+
+    class FakeClient:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, traceback):
+            return None
+
+        async def post(self, url, json):
+            assert url.endswith("/api/chat")
+            return httpx.Response(
+                200,
+                json={
+                    "message": {"role": "assistant", "content": '{"answer":"完成"}'},
+                },
+                request=httpx.Request("POST", url),
+            )
+
+    monkeypatch.setattr("douyin_library.notes.providers.ollama.httpx.AsyncClient", FakeClient)
+    provider = OllamaNoteProvider(
+        _settings(note_ollama_url="http://127.0.0.1:11434")
+    )
+
+    await _complete(provider)
+
+    assert captured["trust_env"] is False
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("response", "code"),
     [

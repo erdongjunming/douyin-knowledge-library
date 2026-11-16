@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import inspect
 import json
 from collections.abc import Awaitable, Callable, Mapping
@@ -33,8 +34,9 @@ from douyin_library.notes.pipeline import (
     SemanticGeneration,
     SemanticNotePipeline,
     StageRecord,
+    _input_is_sufficient,
 )
-from douyin_library.notes.providers.base import NoteProvider
+from douyin_library.notes.providers.base import NoteProvider, request_or_cancel
 from douyin_library.notes.providers.external import ExternalNoteProvider
 from douyin_library.notes.providers.ollama import OllamaNoteProvider
 from douyin_library.notes.providers.selector import (
@@ -42,11 +44,17 @@ from douyin_library.notes.providers.selector import (
     ProviderPolicy,
     select_provider_names,
 )
-from douyin_library.notes.publisher import NoteBundlePublisher, publish_with_guard
+from douyin_library.notes.publisher import (
+    GENERATED_FILES,
+    NoteBundlePublisher,
+    PublishResult,
+    publish_with_guard,
+)
 from douyin_library.notes.render import render_semantic_note
 from douyin_library.notes.state import classify_note_bundle
 
 ProviderFactory = Callable[[ProviderName], NoteProvider]
+LEGACY_UPGRADE_LIMIT = 3
 
 
 @dataclass(frozen=True, slots=True)
@@ -70,6 +78,7 @@ class GenerationResult:
     provider: str | None = None
     model: str | None = None
     quality_gate: str | None = None
+    semantic_complete: bool | None = None
 
 
 @dataclass(slots=True)
@@ -131,6 +140,7 @@ class NoteGenerationService:
         force: bool = False,
         aweme_ids: set[str] | None = None,
         legacy_only: bool = False,
+        read_only: bool = False,
     ) -> list[NoteCandidate]:
         if force and legacy_only:
             raise ValueError("force_and_legacy_only_are_mutually_exclusive")
@@ -156,10 +166,17 @@ class NoteGenerationService:
         for transcript_path in transcript_paths:
             aweme_id = transcript_path.parent.name
             note_dir = self.layout.note_dir(aweme_id)
-            state = classify_note_bundle(note_dir)
+            state = classify_note_bundle(note_dir, read_only=read_only)
             completed = (note_dir / "learning_note.md").is_file()
             if legacy_only and not state.upgrade_eligible:
-                continue
+                # Re-audit current source evidence; a stale semantic manifest
+                # must not permanently hide a later sparse transcript.
+                try:
+                    note_input = NoteInputLoader(self.layout, self.session).load(aweme_id)
+                except (OSError, UnicodeError, TypeError, ValueError):
+                    continue
+                if _input_is_sufficient(note_input):
+                    continue
             if not legacy_only and completed and not force:
                 continue
             work = works.get(aweme_id)
@@ -223,8 +240,18 @@ class NoteGenerationService:
             force=force,
             aweme_ids=aweme_ids,
             legacy_only=legacy_only,
+            read_only=dry_run,
         )
-        selected = candidates[:limit] if limit is not None else candidates
+        effective_limit = limit
+        if legacy_only:
+            if limit is not None and limit > LEGACY_UPGRADE_LIMIT:
+                raise ValueError("legacy_upgrade_limit_exceeded")
+            effective_limit = LEGACY_UPGRADE_LIMIT if limit is None else limit
+        selected = (
+            candidates[:effective_limit]
+            if effective_limit is not None
+            else candidates
+        )
         result = BatchGenerationResult(
             total_transcripts=total,
             completed_before=completed,
@@ -328,21 +355,41 @@ class NoteGenerationService:
         note_dir = self.layout.note_dir(aweme_id)
         current_state = classify_note_bundle(note_dir)
         learning_note = note_dir / "learning_note.md"
-        if legacy_only and not current_state.upgrade_eligible:
-            return GenerationResult(aweme_id, "skipped", str(note_dir))
         if learning_note.is_file() and not force and not legacy_only:
             return GenerationResult(aweme_id, "skipped", str(note_dir))
         transcript_path = self.layout.transcript_text_path(aweme_id)
         if not transcript_path.is_file():
             raise FileNotFoundError(f"transcript_not_found:{aweme_id}")
 
+        # Capture the durable claim identity before any provider call or ORM
+        # refresh.  A stale worker may still hold this object after another
+        # worker reclaims the same row; publication must validate this exact
+        # snapshot instead of reading the refreshed owner.
+        job_owner_worker_id = getattr(job, "worker_id", None) if job is not None else None
+        job_claim_fence = getattr(job, "claim_fence", None) if job is not None else None
+
         work = self.session.scalar(select(Work).where(Work.aweme_id == aweme_id))
         note_input = NoteInputLoader(self.layout, self.session).load(aweme_id)
+        if legacy_only and not _input_is_sufficient(note_input):
+            return GenerationResult(
+                aweme_id,
+                "preserved_existing" if learning_note.is_file() else "failed",
+                str(note_dir),
+                error="legacy_upgrade_input_insufficient",
+            )
+        if legacy_only and not current_state.upgrade_eligible:
+            return GenerationResult(aweme_id, "skipped", str(note_dir))
         source_files = dict(note_input.source_files)
-        # Existing-note upgrades are intentionally Ollama-only.  In
-        # particular, do not let an old ``auto`` payload fall through to an
-        # external provider or the deterministic rule generator.
-        policy = "local" if legacy_only else (provider_policy or self.settings.note_provider_policy)
+        source_fingerprints = _file_fingerprints(source_files.values())
+        old_bundle_fingerprints = _file_fingerprints(
+            note_dir / path for path in GENERATED_FILES
+        )
+        policy = provider_policy or self.settings.note_provider_policy
+        if legacy_only:
+            # Historical upgrades are fail-closed to the local semantic model;
+            # normalize stale queue payloads instead of allowing an external or
+            # rule provider to participate.
+            policy = "local"
         provider_names = ["ollama"] if legacy_only else select_provider_names(self.settings, policy)
         recorder = ProcessingAuditRecorder(
             self.session,
@@ -375,11 +422,20 @@ class NoteGenerationService:
         selected_quality_gate = "fallback"
         lease_handle: Any | None = None
         selected_lease_handle: Any | None = None
+        lease_lost_event: asyncio.Event | None = None
+        lease_heartbeat_task: asyncio.Task[None] | None = None
         try:
             for provider_name in provider_names:
                 _raise_if_cancelled(cancel_event)
                 attempt: dict[str, Any] = {"provider": provider_name, "status": "started"}
                 if provider_name == "rule":
+                    if legacy_only:
+                        attempt.update({
+                            "status": "skipped",
+                            "error": "legacy_upgrade_requires_semantic_provider",
+                        })
+                        attempts.append(attempt)
+                        continue
                     try:
                         selected_bundle = generate_rule_note(
                             note_input,
@@ -401,32 +457,52 @@ class NoteGenerationService:
                 provider: NoteProvider | None = None
                 try:
                     provider = await self._make_provider(provider_name)
-                    if legacy_only and getattr(provider, "name", None) != "ollama":
-                        raise RuntimeError("legacy_upgrade_provider_not_ollama")
+                    if legacy_only and getattr(provider, "name", None) != provider_name:
+                        raise RuntimeError("legacy_upgrade_provider_mismatch")
                     lease_handle = await self._acquire_gpu_if_needed(
                         provider,
                         job=job,
                         cancel_event=cancel_event,
+                        expected_worker_id=job_owner_worker_id,
+                        expected_fence=job_claim_fence,
                     )
+                    if lease_handle is not None and job is None:
+                        lease_lost_event = asyncio.Event()
+                        lease_heartbeat_task = asyncio.create_task(
+                            self._standalone_lease_heartbeat(
+                                lease_handle, lease_lost_event, cancel_event
+                            ),
+                            name=f"note-lease-heartbeat-{aweme_id}",
+                        )
                     if job is not None:
-                        job.stage = "analyze"
-                        job.progress = 0.15
-                        self.session.commit()
-                    generation = await SemanticNotePipeline(provider).generate(
+                        self._update_owned_progress(
+                            job.id,
+                            job_owner_worker_id,
+                            job_claim_fence,
+                            stage="analyze",
+                            progress=0.15,
+                        )
+                    generation = await self._generate_with_lease_guard(
+                        provider,
                         note_input,
                         cancel_event,
                         collector,
+                        lease_lost_event,
                     )
                     publishable_degraded = (
                         not legacy_only
                         and not learning_note.is_file()
                         and _degraded_generation_is_publishable(generation, note_input)
                     )
+                    accepted_semantic = bool(
+                        generation.coverage.quality_gate == "passed"
+                        and (not legacy_only or generation.coverage.semantic_complete)
+                    )
                     attempt.update(
                         {
                             "status": (
                                 "succeeded"
-                                if generation.coverage.quality_gate == "passed"
+                                if accepted_semantic
                                 else "degraded"
                                 if publishable_degraded
                                 else "failed"
@@ -436,27 +512,27 @@ class NoteGenerationService:
                             "repair_count": generation.repair_count,
                         }
                     )
-                    accepted_semantic = bool(
-                        generation.coverage.quality_gate == "passed"
-                        and (not legacy_only or generation.coverage.semantic_complete)
-                    )
+                    if legacy_only and not accepted_semantic:
+                        attempt["error"] = "legacy_upgrade_semantic_incomplete"
                     if accepted_semantic or publishable_degraded:
                         selected_generation = generation
                         selected_provider = provider.name
                         selected_model = provider.model
                         selected_prompt_versions = dict(generation.prompt_versions)
-                        selected_quality_gate = generation.coverage.quality_gate
                         selected_bundle = render_semantic_note(
                             note_input,
                             generation,
                             generated_at=datetime.now(UTC).isoformat(),
                         )
+                        selected_quality_gate = selected_bundle.note_score["quality_gate"]
+                        attempt["quality_gate"] = selected_quality_gate
+                        attempt["warnings"] = selected_bundle.note_score.get("warnings", [])
                         # Keep the local lease through provider unload and the
                         # publisher's final ownership fence.  Failed attempts
                         # still release their lease in the usual finally path.
                         selected_lease_handle = lease_handle
                         lease_handle = None
-                except JobCancelledError:
+                except (JobCancelledError, asyncio.CancelledError):
                     attempt["status"] = "cancelled"
                     raise
                 except Exception as exc:  # noqa: BLE001
@@ -470,17 +546,39 @@ class NoteGenerationService:
                     # Keep the provider's unload inside the lease window.  A
                     # provider may be unavailable before construction, hence
                     # the defensive local lookup.
-                    if provider is not None:
+                    current_lease = selected_lease_handle or lease_handle
+                    if provider is not None and (
+                        not provider.is_local
+                        or (
+                            current_lease is not None
+                            and not (lease_lost_event and lease_lost_event.is_set())
+                            and self._owns_generation(None, current_lease)
+                        )
+                    ):
                         with suppress(Exception):
-                            await provider.unload()
+                            await request_or_cancel(
+                                provider.unload(), lease_lost_event or asyncio.Event()
+                            )
+                    if selected_lease_handle is None and lease_heartbeat_task is not None:
+                        lease_heartbeat_task.cancel()
+                        with suppress(asyncio.CancelledError):
+                            await lease_heartbeat_task
+                        lease_heartbeat_task = None
                     await self._release_gpu(lease_handle)
                     lease_handle = None
                     attempts.append(attempt)
                 if selected_bundle is not None:
                     break
 
+            if lease_lost_event is not None and lease_lost_event.is_set():
+                raise JobCancelledError("resource_lease_lost")
+            _raise_if_cancelled(cancel_event)
             if selected_bundle is None:
-                raise RuntimeError("note_generation_no_provider_available")
+                raise RuntimeError(
+                    "legacy_upgrade_no_semantic_provider_succeeded"
+                    if legacy_only
+                    else "note_generation_no_provider_available"
+                )
 
             audit.processor = f"{selected_provider}-note-generator"
             audit.model = selected_model
@@ -524,24 +622,44 @@ class NoteGenerationService:
                 # ``finally`` blocks; a late-bound closure can otherwise lose
                 # the lease token on Python 3.14.
                 "ownership_check": (
-                    lambda current_job=job, current_lease=selected_lease_handle: (
-                        self._owns_generation(current_job, current_lease)
+                    lambda current_job=job,
+                    current_lease=selected_lease_handle,
+                    expected_worker_id=job_owner_worker_id,
+                    expected_fence=job_claim_fence: (
+                        not cancel_event.is_set()
+                        and self._owns_generation(
+                            current_job,
+                            current_lease,
+                            expected_worker_id=expected_worker_id,
+                            expected_fence=expected_fence,
+                        )
                     )
                 ),
             }
             if legacy_only:
                 publish_kwargs["publish_guard"] = (
                     lambda expected_state=current_state, current_dir=note_dir: (
-                        _legacy_state_unchanged(current_dir, expected_state)
+                        _legacy_state_unchanged(
+                            current_dir,
+                            expected_state,
+                            old_bundle_fingerprints,
+                            source_files,
+                            source_fingerprints,
+                        )
                     )
                 )
-            publish_result = publish_with_guard(
-                self.publisher,
-                self.layout.root,
-                aweme_id,
-                outputs,
-                **publish_kwargs,
-            )
+            if job is None:
+                publish_result = await self._publish_standalone(
+                    aweme_id, outputs, publish_kwargs, cancel_event, lease_lost_event
+                )
+            else:
+                publish_result = publish_with_guard(
+                    self.publisher,
+                    self.layout.root,
+                    aweme_id,
+                    outputs,
+                    **publish_kwargs,
+                )
             if publish_result.status == "published":
                 # A generation is only successful once the validated bundle has
                 # made it through publication.  This keeps a failed atomic
@@ -575,6 +693,11 @@ class NoteGenerationService:
                     provider=selected_provider,
                     model=selected_model,
                     quality_gate=selected_quality_gate,
+                    semantic_complete=(
+                        selected_generation.coverage.semantic_complete
+                        if selected_generation is not None
+                        else False
+                    ),
                 )
             recorder.skip(
                 audit,
@@ -589,10 +712,12 @@ class NoteGenerationService:
                 model=selected_model,
                 quality_gate=selected_quality_gate,
             )
-        except JobCancelledError as exc:
+        except (JobCancelledError, asyncio.CancelledError) as exc:
+            cancel_event.set()
+            error = str(exc) or "cancelled_by_user"
             await self._release_gpu(lease_handle)
             if audit.status == "running":
-                recorder.cancel(audit, error=str(exc))
+                recorder.cancel(audit, error=error)
             self._write_attempt_audit(
                 note_dir,
                 aweme_id=aweme_id,
@@ -602,7 +727,7 @@ class NoteGenerationService:
                 provider=selected_provider,
                 model=selected_model,
                 attempts=attempts,
-                error=str(exc),
+                error=error,
                 status="cancelled",
             )
             raise
@@ -638,7 +763,110 @@ class NoteGenerationService:
                 )
             raise
         finally:
+            if lease_heartbeat_task is not None:
+                lease_heartbeat_task.cancel()
+                with suppress(asyncio.CancelledError):
+                    await lease_heartbeat_task
+            await self._release_gpu(lease_handle)
             await self._release_gpu(selected_lease_handle)
+
+    async def _publish_standalone(
+        self,
+        aweme_id: str,
+        outputs: dict[str, str],
+        publish_kwargs: dict[str, Any],
+        cancel_event: asyncio.Event,
+        lease_lost_event: asyncio.Event | None,
+    ) -> PublishResult:
+        loop = asyncio.get_running_loop()
+        ownership_check = publish_kwargs["ownership_check"]
+
+        async def check_ownership() -> bool:
+            return bool(ownership_check())
+
+        def check_from_publication_thread() -> bool:
+            # Lease stores may hold a Session; keep database and cancellation
+            # checks on their original event loop while file I/O runs elsewhere.
+            return asyncio.run_coroutine_threadsafe(check_ownership(), loop).result()
+
+        publication_task = asyncio.create_task(
+            asyncio.to_thread(
+                publish_with_guard,
+                self.publisher,
+                self.layout.root,
+                aweme_id,
+                outputs,
+                **{**publish_kwargs, "ownership_check": check_from_publication_thread},
+            ),
+            name=f"note-publication-{aweme_id}",
+        )
+        try:
+            await asyncio.wait({publication_task})
+            return publication_task.result()
+        except asyncio.CancelledError:
+            cancel_event.set()
+            # A running thread cannot be cancelled. Keep renewing its lease
+            # until either rollback or an already-fenced commit finishes.
+            while not publication_task.done():
+                try:
+                    await asyncio.wait({publication_task})
+                except asyncio.CancelledError:
+                    continue
+            with suppress(asyncio.CancelledError, Exception):
+                result = publication_task.result()
+                if result.status == "published":
+                    # A completed commit is irrevocable. Finish its success
+                    # audit and analysis instead of reporting a cancelled write.
+                    return result
+            raise
+        except Exception as exc:
+            if cancel_event.is_set():
+                reason = (
+                    "resource_lease_lost"
+                    if lease_lost_event is not None and lease_lost_event.is_set()
+                    else "cancelled_by_user"
+                )
+                raise JobCancelledError(reason) from exc
+            raise
+
+    async def _generate_with_lease_guard(
+        self,
+        provider: NoteProvider,
+        note_input: NoteInput,
+        cancel_event: asyncio.Event,
+        collector: _StageCollector,
+        lease_lost_event: asyncio.Event | None,
+    ) -> SemanticGeneration:
+        generation = SemanticNotePipeline(provider).generate(note_input, cancel_event, collector)
+        if lease_lost_event is None:
+            return await generation
+        try:
+            return await request_or_cancel(generation, cancel_event)
+        except JobCancelledError as exc:
+            if lease_lost_event.is_set():
+                raise JobCancelledError("resource_lease_lost") from exc
+            raise
+
+    async def _standalone_lease_heartbeat(
+        self,
+        handle: Any,
+        lease_lost_event: asyncio.Event,
+        cancel_event: asyncio.Event,
+    ) -> None:
+        ttl = float(getattr(self.settings, "gpu_lease_ttl_seconds", 120.0))
+        interval = min(float(getattr(self.settings, "job_heartbeat_seconds", 10.0)), ttl / 3)
+        while True:
+            await asyncio.sleep(interval)
+            try:
+                result = self.lease_store.renew(handle, ttl=ttl)
+                if inspect.isawaitable(result):
+                    result = await result
+            except Exception:
+                result = False
+            if not result:
+                lease_lost_event.set()
+                cancel_event.set()
+                return
 
     async def _make_provider(self, provider_name: ProviderName) -> NoteProvider:
         if self.provider_factory is not None:
@@ -663,6 +891,8 @@ class NoteGenerationService:
         *,
         job: Job | None,
         cancel_event: asyncio.Event,
+        expected_worker_id: str | None = None,
+        expected_fence: int | None = None,
     ) -> Any | None:
         if not provider.is_local or self.lease_store is None:
             return None
@@ -672,20 +902,26 @@ class NoteGenerationService:
             0.01,
             float(getattr(self.settings, "gpu_lease_poll_seconds", 0.5)),
         )
-        owner_worker_id = (
-            job.worker_id if job is not None and job.worker_id else self.worker_id
+        job_owner_worker_id = (
+            expected_worker_id
+            if expected_worker_id is not None
+            else getattr(job, "worker_id", None)
+        )
+        owner_worker_id = job_owner_worker_id or self.worker_id
+        owner_fence = (
+            expected_fence
+            if expected_fence is not None
+            else getattr(job, "claim_fence", None)
         )
         while True:
             _raise_if_cancelled(cancel_event)
             if job is not None:
-                self.session.expire(job)
-                current = self.session.get(Job, job.id)
-                if current is None or current.status != "running":
-                    raise JobCancelledError("cancelled_by_user")
-                if current.stage != "waiting_gpu":
-                    current.stage = "waiting_gpu"
-                    self.session.commit()
-                    job = current
+                self._update_owned_progress(
+                    job.id,
+                    job_owner_worker_id,
+                    owner_fence,
+                    stage="waiting_gpu",
+                )
             handle = self.lease_store.try_acquire(
                 resource_name,
                 owner_worker_id,
@@ -695,13 +931,20 @@ class NoteGenerationService:
             if inspect.isawaitable(handle):
                 handle = await handle
             if handle is not None:
+                if cancel_event.is_set():
+                    await self._release_gpu(handle)
+                    raise JobCancelledError("cancelled_by_user")
                 if job is not None:
-                    current = self.session.get(Job, job.id)
-                    if current is None or current.status != "running":
-                        self.lease_store.release(handle)
-                        raise JobCancelledError("cancelled_by_user")
-                    current.stage = "analyze"
-                    self.session.commit()
+                    try:
+                        self._update_owned_progress(
+                            job.id,
+                            job_owner_worker_id,
+                            owner_fence,
+                            stage="analyze",
+                        )
+                    except JobCancelledError:
+                        await self._release_gpu(handle)
+                        raise
                 return handle
             if cancel_event is None:
                 await asyncio.sleep(interval)
@@ -720,6 +963,27 @@ class NoteGenerationService:
             if cancel_task in done and cancel_event.is_set():
                 raise JobCancelledError("cancelled_by_user")
 
+    def _update_owned_progress(
+        self,
+        job_id: int,
+        worker_id: str | None,
+        claim_fence: int | None,
+        *,
+        stage: str,
+        progress: float | None = None,
+    ) -> None:
+        conditions = [Job.id == job_id, Job.status == "running", Job.worker_id == worker_id]
+        if claim_fence is not None:
+            conditions.append(Job.claim_fence == claim_fence)
+        values: dict[str, Any] = {"stage": stage}
+        if progress is not None:
+            values["progress"] = progress
+        with self.session.no_autoflush:
+            result = self.session.execute(update(Job).where(*conditions).values(**values))
+        self.session.commit()
+        if not result.rowcount:
+            raise JobCancelledError("job_claim_lost")
+
     async def _release_gpu(self, handle: Any | None) -> None:
         if handle is None or self.lease_store is None:
             return
@@ -730,9 +994,36 @@ class NoteGenerationService:
         if inspect.isawaitable(result):
             await result
 
-    def _owns_generation(self, job: Job | None, lease_handle: Any | None) -> bool:
-        if job is not None and not _job_is_running(self.session, job.id):
-            return False
+    def _owns_generation(
+        self,
+        job: Job | None,
+        lease_handle: Any | None,
+        *,
+        expected_worker_id: str | None = None,
+        expected_fence: int | None = None,
+    ) -> bool:
+        if job is not None:
+            # Select scalar columns instead of ``Session.get`` so a competing
+            # session's reclaim is observed even when this session's identity
+            # map still contains the original ORM object.  The object itself
+            # remains untouched, preserving the immutable snapshot above.
+            claim_fence_column = getattr(Job, "claim_fence", None)
+            statement = select(Job.status, Job.worker_id)
+            if claim_fence_column is not None:
+                statement = select(Job.status, Job.worker_id, claim_fence_column)
+            row = self.session.execute(statement.where(Job.id == job.id)).one_or_none()
+            if row is None or row.status != "running":
+                return False
+            owner_worker_id = (
+                expected_worker_id
+                if expected_fence is not None or expected_worker_id is not None
+                else getattr(job, "worker_id", None)
+            )
+            if row.worker_id != owner_worker_id:
+                return False
+            durable_fence = row[2] if claim_fence_column is not None else None
+            if expected_fence is not None and durable_fence != expected_fence:
+                return False
         if lease_handle is None or self.lease_store is None:
             return True
         checker = getattr(self.lease_store, "is_owned", None)
@@ -827,6 +1118,12 @@ class NoteGenerationService:
                 else None
             ),
             "quality_gate": quality_gate,
+            "warnings": list(dict.fromkeys(
+                warning
+                for attempt in attempts
+                if attempt.get("status") == "succeeded"
+                for warning in attempt.get("warnings", [])
+            )),
             "semantic_complete": bool(
                 generation.coverage.semantic_complete if generation else False
             ),
@@ -904,10 +1201,10 @@ def _degraded_generation_is_publishable(
         return False
     if not generation.extraction.dispositions:
         return False
-    expected_segments = {segment.index for segment in note_input.segments}
-    actual_segments = {
+    expected_segments = [segment.index for segment in note_input.segments]
+    actual_segments = [
         entry.segment_index for entry in generation.synthesis.timeline
-    }
+    ]
     if actual_segments != expected_segments:
         return False
     return generation.coverage.segment_disposition_count == len(expected_segments)
@@ -949,7 +1246,7 @@ def _bundle_outputs(
                     bundle.page_metadata.get("input_sufficient", False)
                 ),
                 "generator_version": (
-                    "semantic-v2" if quality_gate == "passed" else GENERATOR_VERSION
+                    "semantic-v2" if quality_gate in {"passed", "passed_with_warnings"} else GENERATOR_VERSION
                 ),
                 "generated_files": [
                     "learning_note.md",
@@ -1019,7 +1316,32 @@ def _append_item(result: BatchGenerationResult, item: dict[str, Any]) -> None:
         result.items_truncated += 1
 
 
-def _legacy_state_unchanged(note_dir: Path, expected_state: Any) -> bool:
+def _file_fingerprints(paths: Any) -> dict[str, str]:
+    result: dict[str, str] = {}
+    for raw_path in paths:
+        path = Path(raw_path)
+        if not path.is_file():
+            result[str(path)] = "<missing>"
+            continue
+        digest = hashlib.sha256()
+        try:
+            with path.open("rb") as stream:
+                for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                    digest.update(chunk)
+        except OSError:
+            result[str(path)] = "<unreadable>"
+        else:
+            result[str(path)] = digest.hexdigest()
+    return result
+
+
+def _legacy_state_unchanged(
+    note_dir: Path,
+    expected_state: Any,
+    old_bundle_fingerprints: dict[str, str],
+    source_files: dict[str, str],
+    source_fingerprints: dict[str, str],
+) -> bool:
     """Keep a legacy-only upgrade from replacing a newer protected bundle."""
 
     current = classify_note_bundle(note_dir)
@@ -1027,10 +1349,14 @@ def _legacy_state_unchanged(note_dir: Path, expected_state: Any) -> bool:
         return False
     if current.quality_status != expected_state.quality_status:
         return False
-    return all(
+    if not all(
         getattr(current, field) == getattr(expected_state, field)
         for field in ("provider", "model", "quality_gate", "generator_version")
-    )
+    ):
+        return False
+    if _file_fingerprints(note_dir / path for path in GENERATED_FILES) != old_bundle_fingerprints:
+        return False
+    return _file_fingerprints(source_files.values()) == source_fingerprints
 
 
 __all__ = [

@@ -12,6 +12,8 @@ import {
   LoaderCircle,
   Radio,
   RefreshCw,
+  Pause,
+  Play,
   Search,
   Settings,
   Square,
@@ -21,6 +23,7 @@ import { useEffect, useState } from "react"
 
 import "./styles.css"
 import { NoteReader } from "./NoteReader"
+import { usePolling } from "./usePolling"
 
 type ViewKey = "creator" | "favorites" | "jobs" | "library" | "settings"
 type ConnectionState = "connecting" | "connected" | "degraded" | "disconnected"
@@ -42,7 +45,15 @@ type Job = {
   progress: number
   attempts: number
   error_code: string | null
+  error_detail?: string | null
+  queue_lane?: "pipeline" | "new_note" | "legacy_upgrade"
+  lane_label?: string
+  next_retry_at?: string | null
 }
+
+type JobListResult = { items: Job[]; lane_counts?: Record<string, Record<string, number>>; total?: number; has_more?: boolean }
+type JobRefreshResult = JobListResult & { recovered?: number; recovered_by_lane?: Record<string, number>; legacy_refill?: { queued?: number; reason?: string } }
+type JobBulkResult = { items: Job[]; paused?: number; resumed?: number; skipped?: number; results?: Array<{ id: number; status: string; reason: string | null }> }
 
 type Work = {
   id: number
@@ -164,6 +175,7 @@ type NoteProgress = {
   recent_aweme_id: string | null
   failures: Array<{ aweme_id: string; reason: string }>
   quality_counts?: Record<string, number>
+  lanes?: { new_note?: NoteLaneProgress; legacy_upgrade?: NoteLaneProgress }
   upgrade?: {
     total?: number
     completed?: number
@@ -180,7 +192,22 @@ type NoteProgress = {
     percent?: number
     failures?: Array<{ aweme_id: string; reason: string }>
   }
-  provider_summary?: { provider?: string | null; model?: string | null; ready?: boolean; external_configured?: boolean }
+  provider_summary?: { provider?: string | null; model?: string | null; ready?: boolean | null; external_configured?: boolean }
+}
+
+type NoteLaneProgress = {
+  total?: number
+  completed?: number
+  remaining?: number
+  active?: number
+  pending?: number
+  running?: number
+  failed?: number
+  not_queued?: number
+  depth_failed?: number
+  input_insufficient?: number
+  percent?: number
+  failures?: Array<{ aweme_id: string; reason: string }>
 }
 
 type NoteQueueResult = {
@@ -189,15 +216,17 @@ type NoteQueueResult = {
   skipped: number
   eligible?: number
   selected?: number
+  blocked_failed?: number
+  legacy_scheduler?: { reason?: string; queued?: number; skipped?: number; blocked_failed?: number }
 }
 
 type ProviderStatus = {
-  ready?: boolean
+  ready?: boolean | null
   provider?: string | null
   model?: string | null
   external_configured?: boolean
   ollama?: { ready?: boolean; model?: string | null; service_status?: string; model_available?: boolean; action_required?: string | null }
-  external?: { ready?: boolean; configured?: boolean; model?: string | null }
+  external?: { ready?: boolean | null; configured?: boolean; model?: string | null }
 }
 
 const navigation: Array<{ key: ViewKey; label: string; icon: typeof Radio }> = [
@@ -284,7 +313,7 @@ function GlobalProgress({
   const { works, audio_extraction: extraction, transcription } = progress
   const audioPercent = Math.max(0, Math.min(100, extraction?.percent ?? (works.collected ? works.audio_ready / works.collected * 100 : 0)))
   const transcriptionPercent = Math.max(0, Math.min(100, transcription.percent))
-  const upgrade = notes?.upgrade
+  const upgrade = notes?.lanes?.legacy_upgrade || notes?.upgrade
   const upgradeCandidates = (notes?.quality_counts?.legacy ?? 0) + (notes?.quality_counts?.fallback ?? 0) + (notes?.quality_counts?.unknown ?? 0)
   const upgradeRemaining = notes?.upgrade?.remaining ?? notes?.upgrade?.eligible ?? upgradeCandidates
   const upgradeTotal = notes?.upgrade?.total ?? notes?.upgrade?.eligible ?? upgradeCandidates
@@ -468,47 +497,133 @@ const stageLabels: Record<string, string> = {
   complete: "已完成",
 }
 
+const jobStatusLabels: Record<string, string> = {
+  pending: "排队中",
+  running: "处理中",
+  paused: "已暂停",
+  succeeded: "已完成",
+  failed: "失败",
+  cancelled: "已取消",
+}
+
+function bulkSkipReason(reason: string | null) {
+  if (reason?.startsWith("job_not_found:")) return "任务已不存在"
+  if (reason?.startsWith("invalid_transition:")) {
+    const currentStatus = reason.slice("invalid_transition:".length).split("->")[0]
+    return jobStatusLabels[currentStatus] || currentStatus
+  }
+  return reason || "状态已变化"
+}
+
 function JobsView() {
   const [jobs, setJobs] = useState<Job[]>([])
   const [error, setError] = useState<string | null>(null)
   const [cancelBusy, setCancelBusy] = useState<number | null>(null)
-  useEffect(() => {
-    let active = true
-    const load = async () => {
-      try {
-        const result = await apiJson<{ items: Job[] }>("/api/jobs")
-        if (active) { setJobs(result.items); setError(null) }
-      } catch (reason) {
-        if (active) setError(reason instanceof Error ? reason.message : "无法读取任务")
-      }
+  const [retryBusy, setRetryBusy] = useState<number | null>(null)
+  const [pauseBusy, setPauseBusy] = useState(false)
+  const [refreshBusy, setRefreshBusy] = useState(false)
+  const [multiSelect, setMultiSelect] = useState(false)
+  const [selectedIds, setSelectedIds] = useState<number[]>([])
+  const [message, setMessage] = useState<{ tone: "success" | "error"; text: string } | null>(null)
+  const [laneCounts, setLaneCounts] = useState<Record<string, Record<string, number>> | null>(null)
+  const [statusFilter, setStatusFilter] = useState("")
+  const [laneFilter, setLaneFilter] = useState("")
+  const [page, setPage] = useState(0)
+  const [total, setTotal] = useState(0)
+  const params = new URLSearchParams()
+  if (statusFilter) params.set("status", statusFilter)
+  if (laneFilter) params.set("queue_lane", laneFilter)
+  if (page > 0) { params.set("limit", "100"); params.set("offset", String(page * 100)) }
+  const jobsPath = `/api/jobs${params.size ? `?${params}` : ""}`
+  const pollJobs = usePolling(async (signal) => {
+    try {
+      const result = await apiJson<JobListResult>(jobsPath, { signal })
+      if (signal.aborted) return
+      setJobs(result.items)
+      setTotal(result.total ?? result.items.length)
+      setLaneCounts(result.lane_counts || null)
+      setSelectedIds((current) => current.filter((id) => result.items.some((job) => job.id === id)))
+      setError(null)
+      if (page > 0 && page * 100 >= (result.total ?? 0)) setPage(Math.max(0, Math.ceil((result.total ?? 0) / 100) - 1))
+    } catch (reason) {
+      if (!signal.aborted) setError(reason instanceof Error ? reason.message : "无法读取任务")
     }
-    void load()
-    const timer = window.setInterval(() => void load(), 5000)
-    return () => { active = false; window.clearInterval(timer) }
-  }, [])
+  }, { key: jobsPath })
+  const refreshJobs = async () => {
+    setRefreshBusy(true)
+    try {
+      const result = await apiJson<JobRefreshResult>("/api/jobs/refresh", { method: "POST" })
+      await pollJobs()
+      setMessage({ tone: "success", text: result.legacy_refill
+        ? `已刷新：恢复 ${result.recovered ?? 0} 个卡住任务，旧升级补入 ${result.legacy_refill.queued ?? 0} 条。`
+        : result.recovered ? `已刷新任务，并重新排队 ${result.recovered} 个卡住任务。` : "任务已刷新。" })
+      window.dispatchEvent(new Event("dkl:refresh-progress"))
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : "无法刷新任务")
+    } finally { setRefreshBusy(false) }
+  }
+  const pauseSelected = async () => {
+    if (!selectedIds.length) return
+    setPauseBusy(true)
+    try {
+      const selectedJobs = jobs.filter((job) => selectedIds.includes(job.id))
+      const shouldResume = selectedJobs.length > 0 && selectedJobs.every((job) => job.status === "paused")
+      const result = await apiJson<JobBulkResult>(shouldResume ? "/api/jobs/bulk-resume" : "/api/jobs/bulk-pause", { method: "POST", body: JSON.stringify({ job_ids: selectedIds }) })
+      setJobs((current) => current.map((job) => result.items.find((item) => item.id === job.id) || job))
+      const skippedItems = result.results?.filter((item) => item.status === "skipped") || []
+      setSelectedIds(skippedItems.map((item) => item.id))
+      const changed = shouldResume ? result.resumed ?? result.items.length : result.paused ?? result.items.length
+      const skipped = result.skipped ?? skippedItems.length
+      const details = skippedItems.map((item) => `#${item.id}：${bulkSkipReason(item.reason)}`).join("；")
+      setMessage({ tone: skipped ? "error" : "success", text: `已${shouldResume ? "恢复" : "暂停"} ${changed} 个任务${skipped ? `，跳过 ${skipped} 个` : ""}。${details}` })
+      setError(null)
+      window.dispatchEvent(new Event("dkl:refresh-progress"))
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : "无法暂停任务")
+    } finally {
+      setPauseBusy(false)
+    }
+  }
   const cancelJob = async (jobId: number) => {
     setCancelBusy(jobId)
     try {
       const cancelled = await apiJson<Job>(`/api/jobs/${jobId}/cancel`, { method: "POST" })
       setJobs((current) => current.map((job) => job.id === jobId ? cancelled : job))
       setError(null)
+      window.dispatchEvent(new Event("dkl:refresh-progress"))
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : "无法取消任务")
     } finally {
       setCancelBusy(null)
     }
   }
+  const retryJob = async (job: Job) => {
+    setRetryBusy(job.id)
+    try {
+      const resumed = await apiJson<Job>(`/api/jobs/${job.id}/retry`, { method: "POST" })
+      setJobs((current) => current.map((item) => item.id === job.id ? resumed : item))
+      setMessage({ tone: "success", text: `任务 #${job.id} 已${job.status === "paused" ? "恢复" : "重新排队"}。` })
+      setError(null)
+      window.dispatchEvent(new Event("dkl:refresh-progress"))
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : "无法恢复任务")
+    } finally { setRetryBusy(null) }
+  }
   return (
     <div className="content-grid wide-grid">
-      <section className="intro-panel compact-intro"><p className="section-kicker">PROCESSING</p><h2>每一步都留下可追踪状态。</h2><p className="muted-copy">下载、抽取、转写和知识笔记生成在同一个任务队列里串联。</p></section>
+      <section className="intro-panel compact-intro"><p className="section-kicker">PROCESSING</p><h2>任务中心</h2></section>
       <section className="panel table-panel" aria-labelledby="jobs-title">
-        <div className="panel-heading"><div><p className="eyebrow">实时队列</p><h3 id="jobs-title">最近任务</h3></div><ListChecks size={20} aria-hidden="true" /></div>
+        <div className="panel-heading"><div><p className="eyebrow">实时队列</p><h3 id="jobs-title">最近任务</h3></div><div className="jobs-toolbar"><button className={multiSelect ? "button subtle is-active" : "button subtle"} type="button" onClick={() => { setMultiSelect((current) => !current); setSelectedIds([]) }}><ListChecks size={15} aria-hidden="true" />{multiSelect ? "完成多选" : "多选"}</button><button className="icon-button" type="button" aria-label="刷新任务" title="刷新任务并恢复卡住任务" disabled={refreshBusy} onClick={() => void refreshJobs()}>{refreshBusy ? <LoaderCircle className="spin" size={16} aria-hidden="true" /> : <RefreshCw size={16} aria-hidden="true" />}</button><button className="button subtle" type="button" disabled={!selectedIds.length || pauseBusy} onClick={() => void pauseSelected()}>{pauseBusy ? <LoaderCircle className="spin" size={15} aria-hidden="true" /> : jobs.filter((job) => selectedIds.includes(job.id)).every((job) => job.status === "paused") ? <Play size={15} aria-hidden="true" /> : <Pause size={15} aria-hidden="true" />}{jobs.filter((job) => selectedIds.includes(job.id)).every((job) => job.status === "paused") ? "恢复" : "暂停"}{selectedIds.length ? ` (${selectedIds.length})` : ""}</button></div></div>
+        <div className="jobs-filters" aria-label="任务筛选"><label>状态<select aria-label="任务状态" value={statusFilter} onChange={(event) => { setStatusFilter(event.target.value); setPage(0); setSelectedIds([]) }}><option value="">全部状态</option><option value="active">活动任务</option><option value="paused">已暂停</option><option value="failed">失败</option><option value="succeeded">已完成</option><option value="cancelled">已取消</option></select></label><label>队列<select aria-label="任务队列" value={laneFilter} onChange={(event) => { setLaneFilter(event.target.value); setPage(0); setSelectedIds([]) }}><option value="">全部队列</option><option value="new_note">新笔记录入</option><option value="legacy_upgrade">升级队列</option><option value="pipeline">视频录入</option></select></label><span className="cell-sub">共 {total} 条</span></div>
         {error && <StatusMessage tone="error">{error}</StatusMessage>}
+        {message && <StatusMessage tone={message.tone}>{message.text}</StatusMessage>}
+        {laneCounts && <div className="progress-meta" aria-label="分队列任务数">{Object.entries({ pipeline: "视频录入", new_note: "新笔记录入", legacy_upgrade: "旧笔记升级" }).map(([lane, label]) => <span key={lane}>{label}：运行 {laneCounts[lane]?.running ?? 0} · 排队 {laneCounts[lane]?.pending ?? 0} · 暂停 {laneCounts[lane]?.paused ?? 0}</span>)}</div>}
         {jobs.length === 0 && !error ? <p className="empty-copy">还没有处理任务。同步主播或收藏后，任务会显示在这里。</p> : (
-          <div className="table-scroll"><table><thead><tr><th>任务</th><th>作品</th><th>阶段</th><th>进度</th><th>状态</th><th aria-label="操作" /></tr></thead><tbody>
-            {jobs.map((job) => <tr key={job.id}><td><strong>{job.kind}</strong><span className="cell-sub">#{job.id}</span></td><td>{job.work_id ?? "批量同步"}</td><td>{stageLabels[job.stage] || job.stage}</td><td><div className="progress-wrap"><div className="progress-track"><span style={{ width: `${Math.max(0, Math.min(100, job.progress * 100))}%` }} /></div><span>{Math.round(job.progress * 100)}%</span></div></td><td><span className={`state state-${job.status}`}>{job.status}</span></td><td>{job.status === "running" || job.status === "pending" ? <button className="icon-button danger-button" type="button" aria-label={`取消任务 ${job.id}`} title="取消任务" disabled={cancelBusy === job.id} onClick={() => void cancelJob(job.id)}>{cancelBusy === job.id ? <LoaderCircle className="spin" size={15} aria-hidden="true" /> : <Square size={14} aria-hidden="true" />}</button> : null}</td></tr>)}
+          <div className="table-scroll"><table><thead><tr>{multiSelect && <th><input aria-label="全选任务" type="checkbox" checked={jobs.some((job) => job.status === "running" || job.status === "pending" || job.status === "paused") && selectedIds.length === jobs.filter((job) => job.status === "running" || job.status === "pending" || job.status === "paused").length} onChange={(event) => setSelectedIds(event.target.checked ? jobs.filter((job) => job.status === "running" || job.status === "pending" || job.status === "paused").map((job) => job.id) : [])} /></th>}<th>任务</th><th>作品</th><th>阶段</th><th>进度</th><th>状态</th><th aria-label="操作" /></tr></thead><tbody>
+            {jobs.map((job) => <tr key={job.id}>{multiSelect && <td><input aria-label={`选择任务 ${job.id}`} type="checkbox" disabled={job.status !== "running" && job.status !== "pending" && job.status !== "paused"} checked={selectedIds.includes(job.id)} onChange={(event) => setSelectedIds((current) => event.target.checked ? [...current, job.id] : current.filter((id) => id !== job.id))} /></td>}<td><strong>{job.kind}</strong><span className="cell-sub">#{job.id}</span>{job.lane_label && <span className="cell-sub">{job.lane_label}</span>}</td><td>{job.work_id ?? "批量同步"}</td><td>{stageLabels[job.stage] || job.stage}</td><td><div className="progress-wrap"><div className="progress-track"><span style={{ width: `${Math.max(0, Math.min(100, job.progress * 100))}%` }} /></div><span>{Math.round(job.progress * 100)}%</span></div></td><td><span className={`state state-${job.status}`}>{jobStatusLabels[job.status] || job.status}</span>{job.status === "pending" && job.next_retry_at && <span className="cell-sub">等待重试</span>}{job.error_detail && job.status === "failed" && <span className="failure-reason">{job.error_detail}</span>}</td><td className="job-actions">{job.status === "running" || job.status === "pending" ? <button className="icon-button danger-button" type="button" aria-label={`取消任务 ${job.id}`} title="取消任务" disabled={cancelBusy === job.id} onClick={() => void cancelJob(job.id)}>{cancelBusy === job.id ? <LoaderCircle className="spin" size={15} aria-hidden="true" /> : <Square size={14} aria-hidden="true" />}</button> : null}{job.status === "paused" || (job.status === "failed" && job.queue_lane === "legacy_upgrade") ? <button className="icon-button" type="button" aria-label={`${job.status === "paused" ? "恢复" : "重试"}任务 ${job.id}`} title={job.status === "paused" ? "恢复任务" : "重试任务"} disabled={retryBusy === job.id} onClick={() => void retryJob(job)}>{retryBusy === job.id ? <LoaderCircle className="spin" size={15} aria-hidden="true" /> : <Play size={15} aria-hidden="true" />}</button> : null}{job.status === "paused" ? <button className="icon-button danger-button" type="button" aria-label={`取消任务 ${job.id}`} title="取消任务" onClick={() => void cancelJob(job.id)}><Square size={14} aria-hidden="true" /></button> : null}</td></tr>)}
           </tbody></table></div>
         )}
+        {total > 100 && <div className="jobs-pagination"><button className="icon-button" type="button" aria-label="上一页任务" disabled={page === 0} onClick={() => setPage((current) => Math.max(0, current - 1))}><ChevronLeft size={16} aria-hidden="true" /></button><span>{page + 1} / {Math.max(1, Math.ceil(total / 100))}</span><button className="icon-button" type="button" aria-label="下一页任务" disabled={(page + 1) * 100 >= total} onClick={() => setPage((current) => current + 1)}><ChevronRight size={16} aria-hidden="true" /></button></div>}
       </section>
     </div>
   )
@@ -525,27 +640,36 @@ function LibraryView() {
   const [selected, setSelected] = useState<WorkDetail | null>(null)
   const [detailBusy, setDetailBusy] = useState(false)
   const [generateBusy, setGenerateBusy] = useState<number | null>(null)
+  const [generateMessage, setGenerateMessage] = useState<{ tone: "success" | "error"; text: string } | null>(null)
   useEffect(() => {
     const controller = new AbortController()
     let active = true
+    let loaded = false
+    let timer: number | undefined
     const params = new URLSearchParams({ limit: "100" })
     if (page > 0) params.set("offset", String(page * 100))
     if (query.trim()) params.set("query", query.trim())
     if (failedOnly) params.set("failed_only", "true")
-    void apiJson<WorkListResponse>(`/api/works?${params.toString()}`, { signal: controller.signal })
-      .then((result) => {
+    const loadWorks = async () => {
+      try {
+        const result = await apiJson<WorkListResponse>(`/api/works?${params.toString()}`, { signal: controller.signal })
         if (!active) return
         setWorks(result.items)
         setTotal(result.total ?? result.items.length)
         setFailedTotal(result.failed_total ?? 0)
         setError(null)
-      })
-      .catch((reason) => {
-        if (active) setError(reason instanceof Error ? reason.message : "无法读取资料库")
-      })
+        loaded = true
+      } catch (reason) {
+        if (active && !loaded) setError(reason instanceof Error ? reason.message : "无法读取资料库")
+      } finally {
+        if (active) timer = window.setTimeout(() => void loadWorks(), 5000)
+      }
+    }
+    void loadWorks()
     return () => {
       active = false
       controller.abort()
+      if (timer !== undefined) window.clearTimeout(timer)
     }
   }, [failedOnly, page, query])
   const openWork = async (work: Work) => {
@@ -561,15 +685,59 @@ function LibraryView() {
   }
   const generateWorkNote = async (work: Work) => {
     setGenerateBusy(work.id)
+    setGenerateMessage(null)
     try {
-      await apiJson<NoteQueueResult>("/api/notes/generate", { method: "POST", body: JSON.stringify({ aweme_ids: [work.aweme_id], provider_policy: "auto", force: false }) })
+      const result = await apiJson<NoteQueueResult>("/api/notes/generate", { method: "POST", body: JSON.stringify({ aweme_ids: [work.aweme_id], provider_policy: "local", force: false, legacy_only: work.note_available && work.note_quality_status !== "semantic_complete" }) })
       setError(null)
+      const blockedFailed = result.blocked_failed ?? result.legacy_scheduler?.blocked_failed ?? 0
+      setGenerateMessage({
+        tone: blockedFailed > 0 && !result.queued && !result.already_queued ? "error" : "success",
+        text: result.queued > 0
+          ? "完整笔记任务已加入队列，任务中心可查看进度。"
+          : result.already_queued > 0
+            ? "完整笔记任务已经在队列中，刷新任务中心可恢复卡住任务。"
+            : blockedFailed > 0
+              ? "该笔记的旧升级曾失败，请在任务中心查看原因并重试。"
+              : "当前没有可生成的完整笔记。",
+      })
+      window.dispatchEvent(new Event("dkl:refresh-progress"))
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : "无法创建笔记任务")
+      setGenerateMessage({ tone: "error", text: reason instanceof Error ? reason.message : "无法创建笔记任务" })
     } finally {
       setGenerateBusy(null)
     }
   }
+  const selectedId = selected?.id
+  useEffect(() => {
+    if (selectedId === undefined) return
+    const controller = new AbortController()
+    let active = true
+    let timer: number | undefined
+    const refreshSelected = async () => {
+      try {
+        const result = await apiJson<WorkDetail>(`/api/works/${selectedId}`, { signal: controller.signal })
+        if (active) {
+          setSelected((current) => {
+            if (current?.id !== selectedId) return current
+            const hadReadableNote = Boolean(current.note?.text?.trim())
+            const refreshedNote = result.note?.text?.trim()
+            return hadReadableNote && !refreshedNote ? current : result
+          })
+        }
+      } catch {
+        // Keep the last readable content through a transient publication or service interruption.
+      } finally {
+        if (active) timer = window.setTimeout(() => void refreshSelected(), 5000)
+      }
+    }
+    timer = window.setTimeout(() => void refreshSelected(), 5000)
+    return () => {
+      active = false
+      controller.abort()
+      if (timer !== undefined) window.clearTimeout(timer)
+    }
+  }, [selectedId])
   useEffect(() => {
     if (!selected) return undefined
     const closeOnEscape = (event: KeyboardEvent) => {
@@ -603,7 +771,7 @@ function LibraryView() {
   return (
     <div className="content-grid wide-grid">
       <section className="library-toolbar"><div><p className="section-kicker">LIBRARY</p><h2>从转写里找到知识。</h2><p className="library-count">{total} 条资料 · 第 {page + 1} / {pageCount} 页</p></div><div className="library-controls"><label className="search-field"><Search size={17} aria-hidden="true" /><input aria-label="筛选资料" value={query} onChange={(event) => { setQuery(event.target.value); setPage(0) }} placeholder="筛选主播或关键词" /></label><button className={failedOnly ? "button subtle is-active" : "button subtle"} type="button" onClick={() => { setFailedOnly((current) => !current); setPage(0) }}><CircleAlert size={15} aria-hidden="true" />仅看提取失败 ({failedTotal})</button></div></section>
-      <section className="panel table-panel"><div className="panel-heading"><div><p className="eyebrow">已收集作品</p><h3>{works.length} 条当前页资料</h3></div><BookOpenText size={20} aria-hidden="true" /></div>{error ? <StatusMessage tone="error">{error}</StatusMessage> : works.length === 0 ? <p className="empty-copy">还没有匹配的资料。先同步主播或收藏，再回来筛选。</p> : <div className="table-scroll"><table><thead><tr><th>内容</th><th>主播</th><th>主题</th><th>处理状态</th><th aria-label="操作" /></tr></thead><tbody>{works.map((work) => <tr key={work.id}><td><strong>{work.description || "无标题作品"}</strong><span className="cell-sub">{work.note_preview || work.transcript_preview || `aweme ${work.aweme_id}`}</span>{work.failure && <span className="failure-reason">{stageLabels[work.failure.stage] || work.failure.stage}：{work.failure.reason}</span>}</td><td>{work.creator_nickname || "未知主播"}</td><td><div className="topic-list">{work.topics.slice(0, 3).map((topic) => <span key={topic}>{topic}</span>)}</div></td><td><span className={`state state-${work.extraction_status}`}>{statusLabels[work.extraction_status] || work.extraction_status}</span><span className="cell-sub">笔记：{statusLabels[work.note_status] || work.note_status}</span></td><td className="library-actions">{work.note_available ? <button className="icon-button" type="button" aria-label={`阅读${work.description || "无标题作品"}的学习笔记`} title="阅读学习笔记" disabled={detailBusy} onClick={() => void openWork(work)}><FileText size={16} aria-hidden="true" /></button> : work.transcript_status === "succeeded" ? <button className="icon-button" type="button" aria-label={`阅读${work.description || "无标题作品"}的转写`} title="阅读转写" disabled={detailBusy} onClick={() => void openWork(work)}><BookOpenText size={16} aria-hidden="true" /></button> : <span className="cell-sub">无可读内容</span>}{work.transcript_status === "succeeded" && <button className="button subtle single-note-button" type="button" aria-label={`生成${work.description || "无标题作品"}的完整笔记`} disabled={generateBusy === work.id} onClick={() => void generateWorkNote(work)}>{generateBusy === work.id ? <LoaderCircle className="spin" size={14} aria-hidden="true" /> : <FileText size={14} aria-hidden="true" />}生成完整笔记</button>}</td></tr>)}</tbody></table></div>}<div className="pagination" aria-label="资料分页"><button className="icon-button" type="button" aria-label="上一页" title="上一页" disabled={page === 0} onClick={() => setPage((current) => Math.max(0, current - 1))}><ChevronLeft size={17} aria-hidden="true" /></button><span>第 {page + 1} / {pageCount} 页</span><button className="icon-button" type="button" aria-label="下一页" title="下一页" disabled={page + 1 >= pageCount} onClick={() => setPage((current) => current + 1)}><ChevronRight size={17} aria-hidden="true" /></button></div></section>
+      <section className="panel table-panel"><div className="panel-heading"><div><p className="eyebrow">已收集作品</p><h3>{works.length} 条当前页资料</h3></div><BookOpenText size={20} aria-hidden="true" /></div>{error ? <StatusMessage tone="error">{error}</StatusMessage> : generateMessage ? <StatusMessage tone={generateMessage.tone}>{generateMessage.text}</StatusMessage> : null}{works.length === 0 ? <p className="empty-copy">还没有匹配的资料。先同步主播或收藏，再回来筛选。</p> : <div className="table-scroll"><table><thead><tr><th>内容</th><th>主播</th><th>主题</th><th>处理状态</th><th aria-label="操作" /></tr></thead><tbody>{works.map((work) => <tr key={work.id}><td><strong>{work.description || "无标题作品"}</strong><span className="cell-sub">{work.note_preview || work.transcript_preview || `aweme ${work.aweme_id}`}</span>{work.failure && <span className="failure-reason">{stageLabels[work.failure.stage] || work.failure.stage}：{work.failure.reason}</span>}</td><td>{work.creator_nickname || "未知主播"}</td><td><div className="topic-list">{work.topics.slice(0, 3).map((topic) => <span key={topic}>{topic}</span>)}</div></td><td><span className={`state state-${work.extraction_status}`}>{statusLabels[work.extraction_status] || work.extraction_status}</span><span className="cell-sub">笔记：{statusLabels[work.note_status] || work.note_status}</span></td><td className="library-actions">{work.note_available ? <button className="icon-button" type="button" aria-label={`阅读${work.description || "无标题作品"}的学习笔记`} title="阅读学习笔记" disabled={detailBusy} onClick={() => void openWork(work)}><FileText size={16} aria-hidden="true" /></button> : work.transcript_status === "succeeded" ? <button className="icon-button" type="button" aria-label={`阅读${work.description || "无标题作品"}的转写`} title="阅读转写" disabled={detailBusy} onClick={() => void openWork(work)}><BookOpenText size={16} aria-hidden="true" /></button> : <span className="cell-sub">无可读内容</span>}{work.transcript_status === "succeeded" && <button className="button subtle single-note-button" type="button" aria-label={`生成${work.description || "无标题作品"}的完整笔记`} disabled={generateBusy === work.id} onClick={() => void generateWorkNote(work)}>{generateBusy === work.id ? <LoaderCircle className="spin" size={14} aria-hidden="true" /> : <FileText size={14} aria-hidden="true" />}生成完整笔记</button>}</td></tr>)}</tbody></table></div>}<div className="pagination" aria-label="资料分页"><button className="icon-button" type="button" aria-label="上一页" title="上一页" disabled={page === 0} onClick={() => setPage((current) => Math.max(0, current - 1))}><ChevronLeft size={17} aria-hidden="true" /></button><span>第 {page + 1} / {pageCount} 页</span><button className="icon-button" type="button" aria-label="下一页" title="下一页" disabled={page + 1 >= pageCount} onClick={() => setPage((current) => current + 1)}><ChevronRight size={17} aria-hidden="true" /></button></div></section>
       {selected && <div className="note-modal-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) setSelected(null) }}><section className="note-modal" role="dialog" aria-modal="true" aria-labelledby="note-modal-title"><NoteReader title={selected.description || (selectedIsNote ? "学习笔记" : "作品转写")} markdown={selectedContent || ""} onClose={() => setSelected(null)} subtitle={selectedIsNote ? "learning_note.md · 基于 ASR 转写生成" : selected.transcript?.model || "尚无转写"} provenance={selectedIsNote ? { variant: selected.transcript_variant, sourceKind: selected.transcript_source_kind, cleanerModel: selected.cleaner_model, fallback: selected.cleaning_fallback } : selected.transcript ? { variant: selected.transcript.variant, sourceKind: selected.transcript.source_kind, cleanerModel: selected.transcript.cleaner_model, fallback: selected.transcript.cleaning_fallback } : null} provider={selected.note_provider} model={selected.note_model} qualityStatus={selected.note_quality_status} coverage={selected.note_coverage} segmentCoverage={selected.note_segment_coverage} atomCoverage={selected.note_atom_coverage} warning={selected.note_quality_status === "fallback" ? "这是规则回退笔记，未通过语义完整性审查。" : selected.failure ? `处理失败：${stageLabels[selected.failure.stage] || selected.failure.stage}：${selected.failure.reason}` : !selectedContent ? "这条作品尚无可读内容。" : null} /></section></div>}
     </div>
   )
@@ -727,51 +895,28 @@ export function App() {
   const [noteMessage, setNoteMessage] = useState<{ tone: "success" | "error"; text: string } | null>(null)
   const [providerStatus, setProviderStatus] = useState<ProviderStatus | null>(null)
 
-  useEffect(() => {
-    let active = true
-    let timer: number | undefined
-    const checkHealth = async () => {
-      try {
-        const result = await apiJson<{ status: string }>("/api/health")
-        if (active) {
-          setConnectionState(result.status === "ok" ? "connected" : result.status === "degraded" ? "degraded" : "disconnected")
-        }
-      } catch {
-        if (active) setConnectionState("disconnected")
-      } finally {
-        if (active) timer = window.setTimeout(() => void checkHealth(), 5000)
-      }
+  usePolling(async (signal) => {
+    try {
+      const result = await apiJson<{ status: string }>("/api/health", { signal })
+      if (!signal.aborted) setConnectionState(result.status === "ok" ? "connected" : result.status === "degraded" ? "degraded" : "disconnected")
+    } catch {
+      if (!signal.aborted) setConnectionState("disconnected")
     }
-    void checkHealth()
-    return () => {
-      active = false
-      if (timer !== undefined) window.clearTimeout(timer)
-    }
-  }, [])
+  })
 
-  useEffect(() => {
-    void apiJson<ProviderStatus>("/api/notes/provider-status").then(setProviderStatus).catch(() => setProviderStatus(null))
-  }, [])
+  usePolling(async (signal) => {
+    try {
+      const result = await apiJson<ProviderStatus>("/api/notes/provider-status", { signal })
+      if (!signal.aborted) setProviderStatus(result)
+    } catch {
+      if (!signal.aborted) setProviderStatus(null)
+    }
+  }, { interval: 30000, refreshEvent: "dkl:refresh-progress" })
 
-  useEffect(() => {
-    let active = true
-    let timer: number | undefined
-    const loadNoteProgress = async () => {
-      try {
-        const result = await apiJson<NoteProgress>("/api/notes/progress")
-        if (active && typeof result?.total === "number") setNoteProgress(result)
-      } catch {
-        // Keep the latest valid snapshot visible during a brief service interruption.
-      } finally {
-        if (active) timer = window.setTimeout(() => void loadNoteProgress(), 5000)
-      }
-    }
-    void loadNoteProgress()
-    return () => {
-      active = false
-      if (timer !== undefined) window.clearTimeout(timer)
-    }
-  }, [])
+  usePolling(async (signal, { refresh }) => {
+    const result = await apiJson<NoteProgress>(refresh ? "/api/notes/progress?refresh=true" : "/api/notes/progress", { signal })
+    if (!signal.aborted && typeof result?.total === "number") setNoteProgress(result)
+  }, { refreshEvent: "dkl:refresh-progress" })
 
   const generateMissingNotes = async () => {
     setNoteBusy(true)
@@ -806,13 +951,23 @@ export function App() {
     setNoteMessage(null)
     try {
       const result = await apiJson<NoteQueueResult>("/api/notes/generate", { method: "POST", body: JSON.stringify({ legacy_only: true, limit: 3, provider_policy: "local" }) })
+      const deferredReason = result.legacy_scheduler?.reason
+      const blockedFailed = result.blocked_failed ?? result.legacy_scheduler?.blocked_failed ?? 0
+      const blockedText = blockedFailed > 0 ? `${blockedFailed} 条旧升级曾失败，请在任务中心查看原因并重试。` : null
+      const deferredText = deferredReason === "new_note_runnable"
+        ? "新笔记队列有任务，旧升级已延后。"
+        : deferredReason === "batch_active"
+          ? "已有旧笔记批次处理中，等待本批完成。"
+          : deferredReason === "refresh_in_progress"
+            ? "已有刷新正在进行，请稍候。"
+            : null
       setNoteMessage({
-        tone: "success",
+        tone: blockedFailed > 0 && !result.queued ? "error" : "success",
         text: result.queued > 0
-          ? `新加入 ${result.queued} 条${result.already_queued > 0 ? `，已有 ${result.already_queued} 条在队列中` : ""}。`
+          ? `新加入 ${result.queued} 条${result.already_queued > 0 ? `，已有 ${result.already_queued} 条在队列中` : ""}。${blockedText || ""}`
           : result.already_queued > 0
             ? `已有 ${result.already_queued} 条在队列中。`
-            : "当前没有可升级的旧笔记。",
+            : deferredText || blockedText || "当前没有可升级的旧笔记。",
       })
       setNoteProgress((current) => {
         if (!current) return current
@@ -844,33 +999,22 @@ export function App() {
     }
   }
 
-  useEffect(() => {
-    let active = true
-    let timer: number | undefined
-    const loadProgress = async () => {
-      try {
-        const result = await apiJson<ProcessingProgress>("/api/jobs/progress")
-        if (active && result?.works && result?.transcription) setProcessingProgress(result)
-      } catch {
-        // Keep the latest valid snapshot visible during a brief service interruption.
-      } finally {
-        if (active) timer = window.setTimeout(() => void loadProgress(), 5000)
-      }
-    }
-    void loadProgress()
-    return () => {
-      active = false
-      if (timer !== undefined) window.clearTimeout(timer)
-    }
-  }, [])
+  usePolling(async (signal) => {
+    const result = await apiJson<ProcessingProgress>("/api/jobs/progress", { signal })
+    if (!signal.aborted && result?.works && result?.transcription) setProcessingProgress(result)
+  }, { refreshEvent: "dkl:refresh-progress" })
 
   const content = { creator: <CreatorView />, favorites: <FavoritesView />, jobs: <JobsView />, library: <LibraryView />, settings: <SettingsView /> }[activeView]
   const connectionLabel = {
     connecting: "正在连接本地服务",
     connected: "本地服务已连接",
-    degraded: "本地服务已连接（存储暂不可用）",
+    degraded: "本地服务已连接（部分服务异常）",
     disconnected: "本地服务未连接",
   }[connectionState]
-  const semanticProviderReady = Boolean(providerStatus?.ollama?.ready || (noteProgress?.provider_summary?.provider === "ollama" && noteProgress.provider_summary.ready))
+  const semanticProviderReady = Boolean(
+    providerStatus
+      ? providerStatus.ollama?.ready
+      : noteProgress?.provider_summary?.provider === "ollama" && noteProgress.provider_summary.ready,
+  )
   return <div className="app-shell"><aside className="sidebar"><div className="brand-mark" aria-hidden="true">知</div><nav aria-label="主要导航">{navigation.map(({ key, label, icon: Icon }) => <button className={activeView === key ? "nav-item is-active" : "nav-item"} key={key} type="button" onClick={() => setActiveView(key)}><Icon aria-hidden="true" size={18} /><span>{label}</span></button>)}</nav></aside><main className="workspace"><header className="topbar"><div><p className="topbar-kicker">{viewTitles[activeView]}</p><h1>抖音知识资料库</h1></div><span className={`connection-status is-${connectionState}`} aria-live="polite"><span aria-hidden="true" className="status-dot" />{connectionLabel}</span></header><GlobalProgress progress={processingProgress} notes={noteProgress} noteBusy={noteBusy} noteMessage={noteMessage} onGenerateNotes={() => void generateMissingNotes()} onUpgradeNotes={() => void upgradeLegacyNotes()} providerReady={semanticProviderReady} providerStatus={providerStatus} /><div className="page-content">{content}</div></main></div>
 }

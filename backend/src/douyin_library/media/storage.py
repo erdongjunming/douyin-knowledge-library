@@ -2,11 +2,13 @@ from __future__ import annotations
 
 import json
 import shutil
+import threading
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Protocol
 
+from .ffmpeg import MediaExtractionError
 from .metadata import can_delete_source_video, duration_seconds, file_sha256, first_audio_stream
 
 
@@ -35,6 +37,7 @@ class MediaProcessResult:
     audio: StoredAsset
     cover: Path
     metadata: Path
+    source_to_delete: Path | None = None
 
 
 class StorageLayout:
@@ -121,15 +124,25 @@ class MediaPipeline:
         source: Path,
         *,
         cover_source: Path | None = None,
+        cancel_event: threading.Event | None = None,
+        defer_source_deletion: bool = False,
     ) -> MediaProcessResult:
+        def check_cancelled() -> None:
+            if cancel_event is not None and cancel_event.is_set():
+                raise MediaExtractionError("media processing cancelled")
+
+        check_cancelled()
         self.layout.initialize()
         source_probe = self.tool.probe(source)
+        check_cancelled()
         audio_path = self.layout.audio_path(aweme_id)
         cover_path = self.layout.cover_path(aweme_id)
         metadata_path = self.layout.metadata_path(aweme_id)
 
         self.tool.extract_audio(source, audio_path)
+        check_cancelled()
         audio_probe = self.tool.probe(audio_path)
+        check_cancelled()
         audio_stream = first_audio_stream(audio_probe)
         audio_bytes = audio_path.stat().st_size if audio_path.exists() else 0
         digest = file_sha256(audio_path) if audio_bytes else ""
@@ -149,6 +162,7 @@ class MediaPipeline:
         else:
             self.tool.extract_cover(source, cover_path)
         loudness = self.tool.analyze_loudness(audio_path)
+        check_cancelled()
         metadata = {
             "aweme_id": aweme_id,
             "source": str(source),
@@ -162,14 +176,17 @@ class MediaPipeline:
         metadata_path.write_text(
             json.dumps(metadata, ensure_ascii=False, indent=2), encoding="utf-8"
         )
+        check_cancelled()
 
-        if can_delete_source_video(
+        deletable = can_delete_source_video(
             source_duration=source_duration,
             audio_duration=audio_duration,
             audio_bytes=audio_bytes,
             sha256=digest,
             verified=verified,
-        ):
+        )
+        check_cancelled()
+        if deletable and not defer_source_deletion:
             source.unlink()
 
         return MediaProcessResult(
@@ -183,4 +200,5 @@ class MediaPipeline:
             ),
             cover=cover_path,
             metadata=metadata_path,
+            source_to_delete=source if deletable and defer_source_deletion else None,
         )
