@@ -77,6 +77,33 @@ The launcher (`scripts\dev.ps1`) imports provider configuration from Windows
 user environment variables via `scripts\local-runtime.ps1` without printing
 the API key.
 
+## Quickstart: from collection to your first note
+
+**Models and keys at a glance**:
+
+| Requirement | Needed for | Mandatory? |
+|---|---|---|
+| Ollama `qwen3:4b` | Note generation (and optional transcript cleaning) | Yes |
+| Qwen3-ASR-0.6B | Speech transcription (skipped when the video has usable subtitles) | Yes, for audio without subtitles |
+| API keys | — | **None. The core pipeline is 100% local.** |
+| External note provider (base URL + model + API key) | Higher-quality notes via a cloud model | Optional |
+| Douyin cookie | Collection flows (favorites sync, downloads, creator sync) | Only for collection — it is a login credential stored in the Windows keyring, not an API key |
+
+**Steps**:
+
+1. `.\start-local.cmd`, wait for readiness, open `http://127.0.0.1:5175/`.
+2. In 设置, paste a Douyin cookie once (a throwaway account is safer) so
+   collection endpoints work.
+3. Collect videos — either paste a creator profile URL
+   (`https://www.douyin.com/user/...`) and confirm the sync, or sync your
+   favorites. Both queue background jobs.
+4. The pipeline then runs on its own: audio extraction → ASR transcription →
+   note generation, with live progress bars in the dashboard. Failed jobs can
+   be retried from the job list or `POST /api/jobs/bulk-resume`.
+5. Read notes in the library: click any work to open the full note with
+   主题复盘 and 完整逐段时间线, or read the files under
+   `D:\DouyinKnowledgeLibrary\dy-note\<aweme_id>\learning_note.md`.
+
 ## Start locally
 
 Double-click `start-local.cmd`, or run:
